@@ -1,0 +1,7 @@
+node_modules/
+dist/
+coverage/
+memory.sqlite
+memory.sqlite-*
+.playwright-mcp/
+.DS_Store
