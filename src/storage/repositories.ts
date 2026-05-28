@@ -10,6 +10,7 @@ import type {
   RelationType,
   Scope
 } from "../domain/types.js";
+import type { MemoryPatch, MemoryStore } from "./store.js";
 
 type TurnRow = {
   id: string;
@@ -54,7 +55,7 @@ type RelationRow = {
   created_at: string;
 };
 
-export class MemoryRepository {
+export class MemoryRepository implements MemoryStore {
   constructor(private readonly db: Database.Database) {}
 
   createTurn(input: CreateTurnInput): ConversationTurn {
@@ -127,7 +128,7 @@ export class MemoryRepository {
     return memory;
   }
 
-  updateMemory(id: string, patch: Partial<Omit<Memory, "id" | "createdAt">>): Memory {
+  updateMemory(id: string, patch: MemoryPatch): Memory {
     const current = this.getMemory(id);
     if (!current) {
       throw new Error(`Memory not found: ${id}`);

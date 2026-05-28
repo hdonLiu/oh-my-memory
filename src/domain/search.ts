@@ -1,6 +1,6 @@
 import type { Memory, Scope } from "./types.js";
 import { jaccard } from "./text.js";
-import { MemoryRepository } from "../storage/repositories.js";
+import type { MemoryStore } from "../storage/store.js";
 
 export interface SearchInput extends Scope {
   query: string;
@@ -19,7 +19,7 @@ const LEVEL_WEIGHT: Record<Memory["level"], number> = {
   L1: 0.15
 };
 
-export function searchMemories(repo: MemoryRepository, input: SearchInput): SearchResult[] {
+export function searchMemories(repo: MemoryStore, input: SearchInput): SearchResult[] {
   const limit = input.limit ?? 10;
   return repo
     .listMemories(input)

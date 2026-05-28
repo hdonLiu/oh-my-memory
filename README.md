@@ -1,22 +1,24 @@
 # oh-my-memory
 
-一个本地 Memory 服务原型。
+A local Memory service prototype.
 
-它不是简单的向量检索库，而是尝试把记忆建模成会演化的事实系统：写入时抽取和演化，离线时压缩和晋升，检索时多级召回并过滤旧事实。
+oh-my-memory treats memory as an evolving fact system, not just a vector search index. On write, it extracts and evolves memories. Offline, it compresses and promotes stable knowledge. On search, it performs multi-level retrieval and filters stale facts.
 
-## 功能
+## Features
 
-- L0：保存原始对话 turn
-- L1：抽取最小记忆单元
-- L2：按项目/主题聚合记忆
-- L3：Dreaming 生成长期画像
-- 支持 `active / superseded / deleted` 状态
-- 支持 `supersedesId` 版本链
-- 支持记忆关系：`duplicate / update / contradict / support / related`
-- 支持按 `mis / source / agent / channel / metadata` 隔离
-- 提供本地 HTTP API
+- L0: stores raw conversation turns
+- L1: extracts atomic memory units
+- L2: aggregates project/topic memories
+- L3: promotes long-term profile memories through Dreaming
+- Supports `active / superseded / deleted` memory states
+- Supports `supersedesId` version chains
+- Supports memory relations: `duplicate / update / contradict / support / related`
+- Supports scope isolation by `mis / source / agent / channel / metadata`
+- Provides a `MemoryStore` database abstraction for SQLite, PostgreSQL, or other storage backends
+- Provides Embedding and Vector Index abstractions for future SQLite vector search integration
+- Provides a local HTTP API
 
-## 架构
+## Architecture
 
 ```mermaid
 flowchart TD
@@ -25,7 +27,7 @@ flowchart TD
   API --> Extractor["Extractor"]
   Extractor --> L1["L1 Memory Unit"]
   L1 --> Resolver["Relation Resolver"]
-  Resolver --> Store["SQLite Store"]
+  Resolver --> Store["Memory Store"]
   Store --> L2["L2 Project Memory"]
   Store --> L3["L3 Global Memory"]
   Store --> Search["Multi-level Search"]
@@ -34,34 +36,34 @@ flowchart TD
   Store --> Dreaming
 ```
 
-## 快速开始
+## Quick Start
 
 ```bash
 npm install
 npm run dev
 ```
 
-默认启动：
+Default URL:
 
 ```text
 http://localhost:3000
 ```
 
-可通过环境变量修改：
+Environment variables:
 
 ```bash
 PORT=3001 MEMORY_DB_PATH=memory.sqlite npm run dev
 ```
 
-## API 示例
+## API Examples
 
-### 健康检查
+### Health Check
 
 ```bash
 curl -s http://localhost:3000/health
 ```
 
-### 写入对话
+### Write a Turn
 
 ```bash
 curl -s http://localhost:3000/turns \
@@ -69,7 +71,7 @@ curl -s http://localhost:3000/turns \
   -d '{
     "sessionId": "s1",
     "role": "user",
-    "content": "项目 A 使用 MySQL",
+    "content": "Project A uses MySQL",
     "mis": "u1",
     "source": "local",
     "agent": "demo",
@@ -78,7 +80,7 @@ curl -s http://localhost:3000/turns \
   }'
 ```
 
-再次写入更新事实：
+Write an updated fact:
 
 ```bash
 curl -s http://localhost:3000/turns \
@@ -95,9 +97,9 @@ curl -s http://localhost:3000/turns \
   }'
 ```
 
-此时旧的 `MySQL` 记忆会变成 `superseded`，新的 `PostgreSQL` 记忆保持 `active`。
+The old `MySQL` memory becomes `superseded`; the new `PostgreSQL` memory stays `active`.
 
-### 检索记忆
+### Search Memories
 
 ```bash
 curl -s http://localhost:3000/search \
@@ -112,15 +114,15 @@ curl -s http://localhost:3000/search \
   }'
 ```
 
-默认只返回 `active` 记忆。
+By default, search only returns `active` memories.
 
-### 查看记忆
+### List Memories
 
 ```bash
 curl -s 'http://localhost:3000/memories?mis=u1&source=local&agent=demo&channel=default'
 ```
 
-### 修改记忆状态
+### Update Memory Status
 
 ```bash
 curl -s -X PATCH http://localhost:3000/memories/<memory-id> \
@@ -128,13 +130,13 @@ curl -s -X PATCH http://localhost:3000/memories/<memory-id> \
   -d '{ "status": "deleted" }'
 ```
 
-### 查看记忆关系
+### List Memory Relations
 
 ```bash
 curl -s http://localhost:3000/memories/<memory-id>/relations
 ```
 
-### 运行 Dreaming
+### Run Dreaming
 
 ```bash
 curl -s -X POST http://localhost:3000/dreaming/run \
@@ -148,9 +150,9 @@ curl -s -X POST http://localhost:3000/dreaming/run \
   }'
 ```
 
-## 当前抽取规则
+## Current Extraction Rules
 
-MVP 暂不接真实模型，使用规则抽取：
+The MVP does not use a real model yet. It uses rule-based extraction:
 
 ```text
 项目 X 使用 Y
@@ -162,7 +164,7 @@ MVP 暂不接真实模型，使用规则抽取：
 决策 X
 ```
 
-噪音示例：
+Noise examples:
 
 ```text
 你好
@@ -171,58 +173,130 @@ MVP 暂不接真实模型，使用规则抽取：
 ok
 ```
 
-## 开发命令
+## Embedding and Vector Storage
+
+The project currently abstracts two interfaces:
+
+```text
+EmbeddingProvider
+  embed(text) -> vector
+  embedMany(texts) -> vector[]
+
+EmbeddingIndex
+  upsert(record)
+  delete(id)
+  search(vector, options) -> results
+```
+
+Built-in implementations:
+
+```text
+DeterministicEmbeddingProvider
+InMemoryEmbeddingIndex
+```
+
+These implementations are only for local tests and interface validation. They are not intended to provide real semantic quality.
+
+Future SQLite vector backends can implement the same `EmbeddingIndex` interface. Candidate backends:
+
+```text
+sqlite-vec: a lightweight SQLite vector search extension, suitable for the next integration target
+vec1: SQLite's official ANN vector extension, worth tracking as the official path evolves
+```
+
+## Database Storage Abstraction
+
+Database access is isolated behind the `MemoryStore` interface:
+
+```text
+createTurn
+listTurns
+recentTurns
+createMemory
+updateMemory
+getMemory
+listMemories
+createRelation
+listRelations
+```
+
+Current implementation:
+
+```text
+SqliteMemoryStore
+```
+
+For compatibility, `MemoryRepository` is still available and points to the current SQLite-backed implementation.
+
+To switch databases later, add a new implementation:
+
+```text
+PostgresMemoryStore
+MysqlMemoryStore
+SqliteVecMemoryStore
+```
+
+Each implementation only needs to satisfy the same `MemoryStore` interface. Domain logic, search, Dreaming, and API routes should not depend on a concrete database.
+
+## Development
 
 ```bash
 npm test
 npm run typecheck
 ```
 
-## 项目结构
+## Project Structure
 
 ```text
 src/domain/
-  extractor.ts       规则抽取
-  resolver.ts        去重、更新、关系判定
-  project-memory.ts  L2 聚合
-  dreaming.ts        L3 晋升
-  search.ts          多级检索
-  text.ts            文本相似度工具
-  types.ts           领域类型
+  extractor.ts       Rule-based extraction
+  resolver.ts        Deduplication, updates, relation resolution
+  project-memory.ts  L2 project aggregation
+  dreaming.ts        L3 promotion
+  search.ts          Multi-level search
+  embedding.ts       Embedding and Vector Index abstractions
+  text.ts            Text similarity helpers
+  types.ts           Domain types
 
 src/storage/
   database.ts        SQLite schema
-  repositories.ts    存储访问
+  repositories.ts    Backward-compatible SQLite repository
+  sqlite-store.ts    SQLite store export
+  store.ts           Database storage abstraction
 
 src/server.ts        Fastify API
-src/index.ts         服务入口
-tests/               行为测试
+src/index.ts         Service entrypoint
+tests/               Behavior tests
 ```
 
-## MVP 边界
+## MVP Scope
 
-已做：
+Implemented:
 
-- L0/L1/L2/L3 数据结构
-- 规则抽取
-- 价值筛选
-- supersede 演化
-- memory relation
-- project 聚合
-- Dreaming 晋升
-- 多级检索 API
-- 单元测试
+- L0/L1/L2/L3 data model
+- Rule-based extraction
+- Value filtering
+- Supersede evolution
+- Memory relations
+- `MemoryStore` database abstraction
+- Embedding and Vector Index abstractions
+- Project aggregation
+- Dreaming promotion
+- Multi-level search API
+- Unit tests
 
-暂不做：
+Not implemented yet:
 
 - Time Memory
-- 真实 Embedding
-- 真实 LLM 抽取
+- Real embedding model
+- SQLite vector extension persistence
+- PostgreSQL/MySQL implementations
+- Real LLM extraction
 - Reranker
-- 前端管理页
-- 复杂知识图谱
+- Frontend memory management UI
+- Complex knowledge graph
 
-## 设计文档
+## Design Docs
 
-- [设计文档](docs/superpowers/specs/2026-05-27-oh-my-memory-design.md)
-- [实现计划](docs/superpowers/plans/2026-05-27-oh-my-memory.md)
+- [Design doc](docs/superpowers/specs/2026-05-27-oh-my-memory-design.md)
+- [Implementation plan](docs/superpowers/plans/2026-05-27-oh-my-memory.md)

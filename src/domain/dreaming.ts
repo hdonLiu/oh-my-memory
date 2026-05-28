@@ -1,11 +1,11 @@
 import type { Memory, Scope } from "./types.js";
-import { MemoryRepository } from "../storage/repositories.js";
+import type { MemoryStore } from "../storage/store.js";
 
 export interface DreamingResult {
   createdOrUpdated: Memory[];
 }
 
-export function runDreaming(repo: MemoryRepository, scope: Scope): DreamingResult {
+export function runDreaming(repo: MemoryStore, scope: Scope): DreamingResult {
   const candidates = repo
     .listMemories(scope)
     .filter((memory) => memory.status === "active" && (memory.level === "L1" || memory.level === "L2"));

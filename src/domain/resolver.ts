@@ -1,9 +1,10 @@
 import type { MemoryDraft } from "./extractor.js";
 import type { Memory } from "./types.js";
 import { jaccard } from "./text.js";
-import { MemoryRepository, sameScope } from "../storage/repositories.js";
+import { sameScope } from "../storage/repositories.js";
+import type { MemoryStore } from "../storage/store.js";
 
-export function resolveMemory(repo: MemoryRepository, draft: MemoryDraft): Memory {
+export function resolveMemory(repo: MemoryStore, draft: MemoryDraft): Memory {
   const candidates = repo
     .listMemories(draft)
     .filter((memory) => memory.status === "active" && memory.level === draft.level && sameScope(memory, draft));

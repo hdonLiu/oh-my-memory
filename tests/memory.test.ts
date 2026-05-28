@@ -1,4 +1,9 @@
 import { describe, expect, it } from "vitest";
+import {
+  DeterministicEmbeddingProvider,
+  InMemoryEmbeddingIndex,
+  cosineSimilarity
+} from "../src/domain/embedding.js";
 import { extractMemories } from "../src/domain/extractor.js";
 import { runDreaming } from "../src/domain/dreaming.js";
 import { rebuildProjectMemories } from "../src/domain/project-memory.js";
@@ -7,8 +12,81 @@ import { searchMemories } from "../src/domain/search.js";
 import { buildServer } from "../src/server.js";
 import { createDatabase } from "../src/storage/database.js";
 import { MemoryRepository } from "../src/storage/repositories.js";
+import { SqliteMemoryStore } from "../src/storage/sqlite-store.js";
+import type { MemoryStore } from "../src/storage/store.js";
+
+describe("embedding abstraction", () => {
+  it("creates deterministic vectors and compares them with cosine similarity", async () => {
+    const provider = new DeterministicEmbeddingProvider(16);
+
+    const first = await provider.embed("项目 A 使用 PostgreSQL");
+    const same = await provider.embed("项目 A 使用 PostgreSQL");
+    const different = await provider.embed("用户偏好 TypeScript");
+
+    expect(first).toEqual(same);
+    expect(first).toHaveLength(16);
+    expect(cosineSimilarity(first, same)).toBeCloseTo(1);
+    expect(cosineSimilarity(first, different)).toBeLessThan(1);
+  });
+
+  it("keeps vector search behind a replaceable index interface", async () => {
+    const provider = new DeterministicEmbeddingProvider(16);
+    const index = new InMemoryEmbeddingIndex();
+
+    await index.upsert({
+      id: "m1",
+      vector: await provider.embed("项目 A 使用 PostgreSQL"),
+      metadata: { level: "L1" }
+    });
+    await index.upsert({
+      id: "m2",
+      vector: await provider.embed("用户偏好 TypeScript"),
+      metadata: { level: "L3" }
+    });
+
+    const results = await index.search(await provider.embed("项目 A 数据库 PostgreSQL"), { limit: 1 });
+
+    expect(results).toEqual([expect.objectContaining({ id: "m1" })]);
+  });
+});
 
 describe("memory storage", () => {
+  it("keeps persistence behind a replaceable MemoryStore interface", () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+
+    const turn = store.createTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 使用 PostgreSQL",
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+
+    const memory = store.createMemory({
+      level: "L1",
+      type: "fact",
+      subject: "项目 A",
+      predicate: "使用",
+      object: "PostgreSQL",
+      summary: "项目 A 使用 PostgreSQL",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: [turn.id],
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+
+    expect(store.getMemory(memory.id)).toEqual(memory);
+    expect(store.listMemories({ mis: "u1" })).toEqual([memory]);
+  });
+
   it("persists turns, memories, and relations", () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);

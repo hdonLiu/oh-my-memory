@@ -9,6 +9,7 @@ import { resolveMemory } from "./domain/resolver.js";
 import { searchMemories } from "./domain/search.js";
 import type { MemoryStatus, Role, Scope } from "./domain/types.js";
 import { MemoryRepository } from "./storage/repositories.js";
+import type { MemoryStore } from "./storage/store.js";
 
 const scopeSchema = z.object({
   mis: z.string().min(1),
@@ -36,9 +37,9 @@ const patchSchema = z.object({
   confidence: z.number().min(0).max(1).optional()
 });
 
-export function buildServer(db: Database.Database) {
+export function buildServer(storage: Database.Database | MemoryStore) {
   const app = Fastify({ logger: false });
-  const repo = new MemoryRepository(db);
+  const repo = isMemoryStore(storage) ? storage : new MemoryRepository(storage);
 
   app.register(cors);
 
@@ -112,6 +113,14 @@ export function buildServer(db: Database.Database) {
   });
 
   return app;
+}
+
+function isMemoryStore(value: Database.Database | MemoryStore): value is MemoryStore {
+  return (
+    typeof (value as MemoryStore).createTurn === "function" &&
+    typeof (value as MemoryStore).listMemories === "function" &&
+    typeof (value as MemoryStore).createRelation === "function"
+  );
 }
 
 function toScope(input: z.infer<typeof scopeSchema>): Scope {
