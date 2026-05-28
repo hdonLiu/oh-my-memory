@@ -1,7 +1,7 @@
-import { runDreaming, type DreamingResult } from "../domain/dreaming.js";
-import { extractMemories } from "../domain/extractor.js";
-import { rebuildProjectMemories } from "../domain/project-memory.js";
-import { resolveMemory } from "../domain/resolver.js";
+import { RuleBasedMemoryCompressor, type DreamingResult, type MemoryCompressor } from "../domain/dreaming.js";
+import { RuleBasedMemoryExtractor, type MemoryExtractor } from "../domain/extractors.js";
+import { RuleBasedProjectMemoryBuilder, type ProjectMemoryBuilder } from "../domain/project-memory.js";
+import { RuleBasedMemoryResolver, type MemoryResolver } from "../domain/resolver.js";
 import { searchMemories, type SearchInput, type SearchResult } from "../domain/search.js";
 import type { ConversationTurn, CreateTurnInput, Memory, MemoryStatus, Scope } from "../domain/types.js";
 import type { MemoryStore } from "../storage/store.js";
@@ -12,7 +12,7 @@ export interface IngestTurnResult {
 }
 
 export interface MemoryService {
-  ingestTurn(input: CreateTurnInput): IngestTurnResult;
+  ingestTurn(input: CreateTurnInput): Promise<IngestTurnResult>;
   search(input: SearchInput): { results: SearchResult[] };
   listMemories(scope: Partial<Scope>): { memories: Memory[] };
   updateMemory(id: string, patch: { status?: MemoryStatus; summary?: string; confidence?: number }): { memory: Memory };
@@ -20,15 +20,28 @@ export interface MemoryService {
   runDreaming(scope: Scope): DreamingResult;
 }
 
-export function createMemoryService(store: MemoryStore): MemoryService {
+export interface MemoryServiceOptions {
+  extractor?: MemoryExtractor;
+  resolver?: MemoryResolver;
+  projectMemoryBuilder?: ProjectMemoryBuilder;
+  compressor?: MemoryCompressor;
+}
+
+export function createMemoryService(store: MemoryStore, options: MemoryServiceOptions = {}): MemoryService {
+  const extractor = options.extractor ?? new RuleBasedMemoryExtractor();
+  const resolver = options.resolver ?? new RuleBasedMemoryResolver();
+  const projectMemoryBuilder = options.projectMemoryBuilder ?? new RuleBasedProjectMemoryBuilder();
+  const compressor = options.compressor ?? new RuleBasedMemoryCompressor();
+
   return {
-    ingestTurn(input) {
+    async ingestTurn(input) {
       const turn = store.createTurn(input);
       const scope = toScope(input);
       const window = store.recentTurns(scope, 8);
-      const memories = extractMemories(turn, window).map((draft) => resolveMemory(store, draft));
+      const drafts = await extractor.extract(turn, window);
+      const memories = drafts.map((draft) => resolver.resolve(store, draft));
       if (memories.length > 0) {
-        rebuildProjectMemories(store, scope);
+        projectMemoryBuilder.rebuild(store, scope);
       }
       return { turn, memories };
     },
@@ -50,7 +63,7 @@ export function createMemoryService(store: MemoryStore): MemoryService {
     },
 
     runDreaming(scope) {
-      return runDreaming(store, scope);
+      return compressor.compress(store, scope);
     }
   };
 }

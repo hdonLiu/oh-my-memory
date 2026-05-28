@@ -1,15 +1,23 @@
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, expect, it } from "vitest";
+import { createMemoryService } from "../src/application/memory-service.js";
+import { runCli } from "../src/cli.js";
 import {
   DeterministicEmbeddingProvider,
   InMemoryEmbeddingIndex,
+  OpenAICompatibleEmbeddingProvider,
+  SqliteVectorIndex,
   cosineSimilarity
 } from "../src/domain/embedding.js";
 import { extractMemories } from "../src/domain/extractor.js";
+import { HybridMemoryExtractor, LlmMemoryExtractor, RuleBasedMemoryExtractor } from "../src/domain/extractors.js";
 import { runDreaming } from "../src/domain/dreaming.js";
-import { rebuildProjectMemories } from "../src/domain/project-memory.js";
-import { resolveMemory } from "../src/domain/resolver.js";
+import { RuleBasedProjectMemoryBuilder, rebuildProjectMemories } from "../src/domain/project-memory.js";
+import { RuleBasedMemoryResolver, resolveMemory } from "../src/domain/resolver.js";
 import { searchMemories } from "../src/domain/search.js";
-import { createMemoryService } from "../src/application/memory-service.js";
+import { RuleBasedMemoryCompressor } from "../src/domain/dreaming.js";
 import { buildServer } from "../src/server.js";
 import { createDatabase } from "../src/storage/database.js";
 import { MemoryRepository } from "../src/storage/repositories.js";
@@ -48,6 +56,68 @@ describe("embedding abstraction", () => {
     const results = await index.search(await provider.embed("项目 A 数据库 PostgreSQL"), { limit: 1 });
 
     expect(results).toEqual([expect.objectContaining({ id: "m1" })]);
+  });
+
+  it("persists vector records in SQLite with scope filtering", async () => {
+    const db = createDatabase(":memory:");
+    const index = new SqliteVectorIndex(db);
+
+    await index.upsert({
+      id: "m1",
+      vector: [1, 0, 0],
+      metadata: { mis: "u1", level: "L1" }
+    });
+    await index.upsert({
+      id: "m2",
+      vector: [0, 1, 0],
+      metadata: { mis: "u2", level: "L1" }
+    });
+
+    const scoped = await index.search([1, 0, 0], { limit: 3, filter: { mis: "u1" } });
+    expect(scoped).toEqual([expect.objectContaining({ id: "m1", metadata: { mis: "u1", level: "L1" } })]);
+
+    await index.delete("m1");
+    expect(await index.search([1, 0, 0], { filter: { mis: "u1" } })).toEqual([]);
+  });
+
+  it("validates OpenAI-compatible embedding dimensions and reports provider failures", async () => {
+    const okProvider = new OpenAICompatibleEmbeddingProvider({
+      baseUrl: "https://embedding.local",
+      apiKey: "test-key",
+      model: "test-model",
+      dimensions: 3,
+      fetch: async () =>
+        new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2, 0.3] }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        })
+    });
+
+    await expect(okProvider.embed("hello")).resolves.toEqual([0.1, 0.2, 0.3]);
+
+    const badProvider = new OpenAICompatibleEmbeddingProvider({
+      baseUrl: "https://embedding.local",
+      apiKey: "test-key",
+      model: "test-model",
+      dimensions: 3,
+      fetch: async () =>
+        new Response(JSON.stringify({ data: [{ embedding: [0.1, 0.2] }] }), {
+          status: 200,
+          headers: { "content-type": "application/json" }
+        })
+    });
+
+    await expect(badProvider.embed("hello")).rejects.toThrow("dimension");
+
+    const failingProvider = new OpenAICompatibleEmbeddingProvider({
+      baseUrl: "https://embedding.local",
+      apiKey: "test-key",
+      model: "test-model",
+      dimensions: 3,
+      fetch: async () => new Response("bad gateway", { status: 502 })
+    });
+
+    await expect(failingProvider.embed("hello")).rejects.toThrow("Embedding provider request failed");
   });
 });
 
@@ -130,18 +200,18 @@ describe("memory storage", () => {
 });
 
 describe("memory application service", () => {
-  it("ingests turns without depending on HTTP transport", () => {
+  it("ingests turns without depending on HTTP transport", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
     const service = createMemoryService(store);
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
-    const first = service.ingestTurn({
+    const first = await service.ingestTurn({
       sessionId: "s1",
       role: "user",
       content: "项目 A 使用 MySQL",
       ...scope
     });
-    const second = service.ingestTurn({
+    const second = await service.ingestTurn({
       sessionId: "s1",
       role: "user",
       content: "项目 A 已迁移到 PostgreSQL",
@@ -153,6 +223,112 @@ describe("memory application service", () => {
     expect(service.search({ query: "项目 A 数据库", ...scope }).results.map((result) => result.memory.object)).toContain(
       "PostgreSQL"
     );
+  });
+
+  it("supports custom extractor injection", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const service = createMemoryService(store, {
+      extractor: {
+        extract(turn) {
+          return [
+            {
+              level: "L1",
+              type: "fact",
+              subject: "custom",
+              predicate: "saw",
+              object: turn.content,
+              summary: `custom saw ${turn.content}`,
+              confidence: 0.7,
+              status: "active",
+              supersedesId: null,
+              sourceTurnIds: [turn.id],
+              mis: turn.mis,
+              source: turn.source,
+              agent: turn.agent,
+              channel: turn.channel,
+              metadata: turn.metadata
+            }
+          ];
+        }
+      }
+    });
+
+    const result = await service.ingestTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "hello",
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+
+    expect(result.memories[0]).toMatchObject({ subject: "custom", object: "hello" });
+  });
+
+  it("supports custom resolver, project builder, and compressor strategies", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const service = createMemoryService(store, {
+      resolver: {
+        resolve(memoryStore, draft) {
+          return memoryStore.createMemory({ ...draft, summary: `resolved:${draft.summary}` });
+        }
+      },
+      projectMemoryBuilder: {
+        rebuild(memoryStore, scope) {
+          return [
+            memoryStore.createMemory({
+              level: "L2",
+              type: "project",
+              subject: "custom-project",
+              predicate: "聚合",
+              object: "custom",
+              summary: "custom project",
+              confidence: 0.5,
+              status: "active",
+              supersedesId: null,
+              sourceTurnIds: [],
+              ...scope
+            })
+          ];
+        }
+      },
+      compressor: {
+        compress(memoryStore, scope) {
+          return {
+            createdOrUpdated: [
+              memoryStore.createMemory({
+                level: "L3",
+                type: "profile",
+                subject: "custom-profile",
+                predicate: "exists",
+                object: "yes",
+                summary: "custom profile exists",
+                confidence: 0.5,
+                status: "active",
+                supersedesId: null,
+                sourceTurnIds: [],
+                ...scope
+              })
+            ]
+          };
+        }
+      }
+    });
+
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const result = await service.ingestTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 使用 SQLite",
+      ...scope
+    });
+    const dreaming = service.runDreaming(scope);
+
+    expect(result.memories[0].summary).toContain("resolved:");
+    expect(store.listMemories(scope).map((memory) => memory.subject)).toContain("custom-project");
+    expect(dreaming.createdOrUpdated[0]).toMatchObject({ subject: "custom-profile" });
   });
 });
 
@@ -231,6 +407,130 @@ describe("memory api", () => {
 
     expect(response.statusCode).toBe(400);
     await app.close();
+  });
+});
+
+describe("extractor strategies", () => {
+  it("keeps rule-based extractor compatible with extractMemories", () => {
+    const store = new SqliteMemoryStore(createDatabase(":memory:"));
+    const turn = store.createTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 使用 PostgreSQL",
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+
+    expect(new RuleBasedMemoryExtractor().extract(turn, [])).toEqual(extractMemories(turn, []));
+  });
+
+  it("validates LLM extractor JSON and falls back through hybrid extractor", async () => {
+    const store = new SqliteMemoryStore(createDatabase(":memory:"));
+    const turn = store.createTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 使用 PostgreSQL",
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+
+    const invalid = new LlmMemoryExtractor({
+      complete: async () => "not-json"
+    });
+    await expect(invalid.extract(turn, [])).rejects.toThrow("Invalid LLM memory extraction response");
+
+    const hybrid = new HybridMemoryExtractor(invalid, new RuleBasedMemoryExtractor());
+    await expect(hybrid.extract(turn, [])).resolves.toEqual(extractMemories(turn, []));
+  });
+});
+
+describe("strategy compatibility", () => {
+  it("keeps default rule-based strategies compatible with existing functions", () => {
+    const store = new SqliteMemoryStore(createDatabase(":memory:"));
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const turn = store.createTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 使用 PostgreSQL",
+      ...scope
+    });
+    const draft = extractMemories(turn, [])[0];
+
+    const resolved = new RuleBasedMemoryResolver().resolve(store, draft);
+    const projects = new RuleBasedProjectMemoryBuilder().rebuild(store, scope);
+    const compressed = new RuleBasedMemoryCompressor().compress(store, scope);
+
+    expect(resolved).toMatchObject({ subject: "项目 A", predicate: "使用", object: "PostgreSQL" });
+    expect(projects[0]).toMatchObject({ level: "L2", subject: "项目 A" });
+    expect(compressed).toEqual(runDreaming(store, scope));
+  });
+});
+
+describe("cli ingestion", () => {
+  it("ingests one turn and imports a batch through MemoryService", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "oh-my-memory-"));
+    const dbPath = join(dir, "memory.sqlite");
+    const batchPath = join(dir, "batch.json");
+
+    const single = await runCli([
+      "ingest",
+      "--db",
+      dbPath,
+      "--session-id",
+      "s1",
+      "--role",
+      "user",
+      "--content",
+      "项目 A 使用 MySQL",
+      "--mis",
+      "u1",
+      "--source",
+      "cli",
+      "--agent",
+      "demo",
+      "--channel",
+      "default"
+    ]);
+    expect(single.exitCode).toBe(0);
+
+    writeFileSync(
+      batchPath,
+      JSON.stringify([
+        {
+          sessionId: "s1",
+          role: "user",
+          content: "项目 A 已迁移到 PostgreSQL",
+          mis: "u1",
+          source: "cli",
+          agent: "demo",
+          channel: "default",
+          metadata: {}
+        },
+        {
+          role: "user",
+          content: "missing session id",
+          mis: "u1",
+          source: "cli",
+          agent: "demo",
+          channel: "default",
+          metadata: {}
+        }
+      ])
+    );
+
+    const imported = await runCli(["import", "--db", dbPath, batchPath]);
+    expect(imported.exitCode).toBe(1);
+    expect(imported.stdout).toContain('"success":1');
+    expect(imported.stdout).toContain('"failed":1');
+
+    const store = new SqliteMemoryStore(createDatabase(dbPath));
+    expect(store.listMemories({ mis: "u1" }).map((memory) => memory.object)).toContain("PostgreSQL");
   });
 });
 

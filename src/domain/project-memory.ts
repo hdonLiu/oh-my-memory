@@ -2,6 +2,15 @@ import type { Memory, Scope } from "./types.js";
 import type { MemoryStore } from "../storage/store.js";
 
 export function rebuildProjectMemories(repo: MemoryStore, scope: Scope): Memory[] {
+  return new RuleBasedProjectMemoryBuilder().rebuild(repo, scope);
+}
+
+export interface ProjectMemoryBuilder {
+  rebuild(repo: MemoryStore, scope: Scope): Memory[];
+}
+
+export class RuleBasedProjectMemoryBuilder implements ProjectMemoryBuilder {
+  rebuild(repo: MemoryStore, scope: Scope): Memory[] {
   const activeL1 = repo
     .listMemories(scope)
     .filter((memory) => memory.level === "L1" && memory.status === "active" && memory.subject.startsWith("项目"));
@@ -44,6 +53,7 @@ export function rebuildProjectMemories(repo: MemoryStore, scope: Scope): Memory[
     }
   }
   return results;
+  }
 }
 
 function average(values: number[]): number {

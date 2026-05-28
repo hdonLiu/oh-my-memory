@@ -15,9 +15,10 @@ oh-my-memory treats memory as an evolving fact system, not just a vector search 
 - Supports memory relations: `duplicate / update / contradict / support / related`
 - Supports scope isolation by `mis / source / agent / channel / metadata`
 - Provides a `MemoryStore` database abstraction for SQLite, PostgreSQL, or other storage backends
-- Provides Embedding and Vector Index abstractions for future SQLite vector search integration
+- Provides strategy abstractions for extraction, relation resolution, project aggregation, and compression
+- Provides Embedding and Vector Index abstractions with in-memory and SQLite-backed implementations
 - Provides a `MemoryService` application layer so HTTP, CLI, SDK, MCP, or background jobs can ingest through the same API
-- Provides a local HTTP API
+- Provides a local HTTP API and CLI ingestion entrypoint
 
 ## Architecture
 
@@ -26,9 +27,9 @@ flowchart TD
   Client["Client / Agent"] --> Transport["HTTP / CLI / SDK / MCP"]
   Transport --> Service["MemoryService"]
   Service --> L0["L0 Conversation"]
-  Service --> Extractor["Extractor"]
+  Service --> Extractor["MemoryExtractor"]
   Extractor --> L1["L1 Memory Unit"]
-  L1 --> Resolver["Relation Resolver"]
+  L1 --> Resolver["MemoryResolver"]
   Resolver --> Store["Memory Store"]
   Store --> L2["L2 Project Memory"]
   Store --> L3["L3 Global Memory"]
@@ -55,6 +56,15 @@ Environment variables:
 
 ```bash
 PORT=3001 MEMORY_DB_PATH=memory.sqlite npm run dev
+```
+
+Embedding provider variables:
+
+```bash
+EMBEDDING_BASE_URL=https://api.openai.com/v1
+EMBEDDING_API_KEY=...
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIMENSIONS=1536
 ```
 
 ## API Examples
@@ -152,6 +162,45 @@ curl -s -X POST http://localhost:3000/dreaming/run \
   }'
 ```
 
+## CLI Examples
+
+### Ingest One Turn
+
+```bash
+oh-my-memory ingest \
+  --db memory.sqlite \
+  --session-id s1 \
+  --role user \
+  --content "项目 A 使用 MySQL" \
+  --mis u1 \
+  --source cli \
+  --agent demo \
+  --channel default
+```
+
+### Import a Batch
+
+```bash
+oh-my-memory import --db memory.sqlite conversations.json
+```
+
+Input file shape:
+
+```json
+[
+  {
+    "sessionId": "s1",
+    "role": "user",
+    "content": "项目 A 已迁移到 PostgreSQL",
+    "mis": "u1",
+    "source": "cli",
+    "agent": "demo",
+    "channel": "default",
+    "metadata": {}
+  }
+]
+```
+
 ## Current Extraction Rules
 
 The MVP does not use a real model yet. It uses rule-based extraction:
@@ -195,9 +244,11 @@ Built-in implementations:
 ```text
 DeterministicEmbeddingProvider
 InMemoryEmbeddingIndex
+SqliteVectorIndex
+OpenAICompatibleEmbeddingProvider
 ```
 
-These implementations are only for local tests and interface validation. They are not intended to provide real semantic quality.
+`DeterministicEmbeddingProvider` and `InMemoryEmbeddingIndex` are only for local tests and interface validation. `OpenAICompatibleEmbeddingProvider` can call OpenAI-compatible embedding endpoints. `SqliteVectorIndex` persists vectors in SQLite while keeping the same `EmbeddingIndex` interface.
 
 Future SQLite vector backends can implement the same `EmbeddingIndex` interface. Candidate backends:
 
@@ -205,6 +256,35 @@ Future SQLite vector backends can implement the same `EmbeddingIndex` interface.
 sqlite-vec: a lightweight SQLite vector search extension, suitable for the next integration target
 vec1: SQLite's official ANN vector extension, worth tracking as the official path evolves
 ```
+
+## Strategy Abstractions
+
+Memory behavior is split behind replaceable interfaces:
+
+```text
+MemoryExtractor
+MemoryResolver
+ProjectMemoryBuilder
+MemoryCompressor
+```
+
+Default implementations preserve current deterministic behavior:
+
+```text
+RuleBasedMemoryExtractor
+RuleBasedMemoryResolver
+RuleBasedProjectMemoryBuilder
+RuleBasedMemoryCompressor
+```
+
+LLM-ready implementations:
+
+```text
+LlmMemoryExtractor
+HybridMemoryExtractor
+```
+
+`HybridMemoryExtractor` tries the primary extractor first and falls back to rule-based extraction if the primary extractor fails.
 
 ## Database Storage Abstraction
 
@@ -280,6 +360,7 @@ npm run typecheck
 ```text
 src/domain/
   extractor.ts       Rule-based extraction
+  extractors.ts      Extractor strategies
   resolver.ts        Deduplication, updates, relation resolution
   project-memory.ts  L2 project aggregation
   dreaming.ts        L3 promotion
@@ -299,6 +380,7 @@ src/storage/
 
 src/server.ts        Fastify API
 src/index.ts         Service entrypoint
+src/cli.ts           CLI ingestion entrypoint
 tests/               Behavior tests
 ```
 
@@ -311,9 +393,14 @@ Implemented:
 - Value filtering
 - Supersede evolution
 - Memory relations
+- Strategy abstractions for extractor/resolver/project builder/compressor
 - `MemoryService` application API abstraction
 - `MemoryStore` database abstraction
 - Embedding and Vector Index abstractions
+- SQLite vector persistence
+- OpenAI-compatible embedding provider
+- LLM and hybrid extractor scaffolding
+- CLI ingest/import
 - Project aggregation
 - Dreaming promotion
 - Multi-level search API
@@ -322,10 +409,8 @@ Implemented:
 Not implemented yet:
 
 - Time Memory
-- Real embedding model
-- SQLite vector extension persistence
 - PostgreSQL/MySQL implementations
-- Real LLM extraction
+- Production LLM prompt tuning/evaluation
 - Reranker
 - Frontend memory management UI
 - Complex knowledge graph
@@ -334,3 +419,4 @@ Not implemented yet:
 
 - [Design doc](docs/superpowers/specs/2026-05-27-oh-my-memory-design.md)
 - [Implementation plan](docs/superpowers/plans/2026-05-27-oh-my-memory.md)
+- [Next steps roadmap](docs/roadmaps/2026-05-28-next-steps.md)

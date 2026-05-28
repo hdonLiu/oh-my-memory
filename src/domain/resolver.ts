@@ -5,6 +5,15 @@ import { sameScope } from "../storage/repositories.js";
 import type { MemoryStore } from "../storage/store.js";
 
 export function resolveMemory(repo: MemoryStore, draft: MemoryDraft): Memory {
+  return new RuleBasedMemoryResolver().resolve(repo, draft);
+}
+
+export interface MemoryResolver {
+  resolve(repo: MemoryStore, draft: MemoryDraft): Memory;
+}
+
+export class RuleBasedMemoryResolver implements MemoryResolver {
+  resolve(repo: MemoryStore, draft: MemoryDraft): Memory {
   const candidates = repo
     .listMemories(draft)
     .filter((memory) => memory.status === "active" && memory.level === draft.level && sameScope(memory, draft));
@@ -46,4 +55,5 @@ export function resolveMemory(repo: MemoryStore, draft: MemoryDraft): Memory {
     repo.createRelation(related.id, created.id, related.subject === created.subject ? "support" : "related", 0.6);
   }
   return created;
+  }
 }

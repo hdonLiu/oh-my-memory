@@ -6,6 +6,15 @@ export interface DreamingResult {
 }
 
 export function runDreaming(repo: MemoryStore, scope: Scope): DreamingResult {
+  return new RuleBasedMemoryCompressor().compress(repo, scope);
+}
+
+export interface MemoryCompressor {
+  compress(repo: MemoryStore, scope: Scope): DreamingResult;
+}
+
+export class RuleBasedMemoryCompressor implements MemoryCompressor {
+  compress(repo: MemoryStore, scope: Scope): DreamingResult {
   const candidates = repo
     .listMemories(scope)
     .filter((memory) => memory.status === "active" && (memory.level === "L1" || memory.level === "L2"));
@@ -55,4 +64,5 @@ export function runDreaming(repo: MemoryStore, scope: Scope): DreamingResult {
   }
 
   return { createdOrUpdated };
+  }
 }
