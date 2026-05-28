@@ -17,6 +17,7 @@ oh-my-memory treats memory as an evolving fact system, not just a vector search 
 - Provides a `MemoryStore` database abstraction for SQLite, PostgreSQL, or other storage backends
 - Provides strategy abstractions for extraction, relation resolution, project aggregation, and compression
 - Provides Embedding and Vector Index abstractions with in-memory and SQLite-backed implementations
+- Supports hybrid search when `MemoryService` is configured with an `EmbeddingProvider` and `EmbeddingIndex`
 - Provides a `MemoryService` application layer so HTTP, CLI, SDK, MCP, or background jobs can ingest through the same API
 - Provides a local HTTP API and CLI ingestion entrypoint
 
@@ -250,6 +251,8 @@ OpenAICompatibleEmbeddingProvider
 
 `DeterministicEmbeddingProvider` and `InMemoryEmbeddingIndex` are only for local tests and interface validation. `OpenAICompatibleEmbeddingProvider` can call OpenAI-compatible embedding endpoints. `SqliteVectorIndex` persists vectors in SQLite while keeping the same `EmbeddingIndex` interface.
 
+When `MemoryService` receives both an `EmbeddingProvider` and an `EmbeddingIndex`, it indexes ingested memories and combines lexical score with vector score during search. Without those options, search falls back to the lexical/Jaccard path.
+
 Future SQLite vector backends can implement the same `EmbeddingIndex` interface. Candidate backends:
 
 ```text
@@ -398,6 +401,7 @@ Implemented:
 - `MemoryStore` database abstraction
 - Embedding and Vector Index abstractions
 - SQLite vector persistence
+- Hybrid lexical/vector search in `MemoryService`
 - OpenAI-compatible embedding provider
 - LLM and hybrid extractor scaffolding
 - CLI ingest/import

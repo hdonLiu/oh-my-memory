@@ -5,6 +5,7 @@ import { describe, expect, it } from "vitest";
 import { createMemoryService } from "../src/application/memory-service.js";
 import { runCli } from "../src/cli.js";
 import {
+  type EmbeddingIndex,
   DeterministicEmbeddingProvider,
   InMemoryEmbeddingIndex,
   OpenAICompatibleEmbeddingProvider,
@@ -23,6 +24,22 @@ import { createDatabase } from "../src/storage/database.js";
 import { MemoryRepository } from "../src/storage/repositories.js";
 import { SqliteMemoryStore } from "../src/storage/sqlite-store.js";
 import type { MemoryStore } from "../src/storage/store.js";
+
+class TrackingEmbeddingIndex implements EmbeddingIndex {
+  readonly upsertedIds: string[] = [];
+  searchCount = 0;
+
+  async upsert(record: { id: string }): Promise<void> {
+    this.upsertedIds.push(record.id);
+  }
+
+  async delete(): Promise<void> {}
+
+  async search(): Promise<Array<{ id: string; score: number; metadata: Record<string, unknown> }>> {
+    this.searchCount += 1;
+    return this.upsertedIds.map((id) => ({ id, score: 10, metadata: {} }));
+  }
+}
 
 describe("embedding abstraction", () => {
   it("creates deterministic vectors and compares them with cosine similarity", async () => {
@@ -220,7 +237,7 @@ describe("memory application service", () => {
 
     expect(first.memories[0]).toMatchObject({ object: "MySQL", status: "active" });
     expect(second.memories[0]).toMatchObject({ object: "PostgreSQL", status: "active" });
-    expect(service.search({ query: "项目 A 数据库", ...scope }).results.map((result) => result.memory.object)).toContain(
+    expect((await service.search({ query: "项目 A 数据库", ...scope })).results.map((result) => result.memory.object)).toContain(
       "PostgreSQL"
     );
   });
@@ -329,6 +346,56 @@ describe("memory application service", () => {
     expect(result.memories[0].summary).toContain("resolved:");
     expect(store.listMemories(scope).map((memory) => memory.subject)).toContain("custom-project");
     expect(dreaming.createdOrUpdated[0]).toMatchObject({ subject: "custom-profile" });
+  });
+
+  it("indexes ingested memories and uses vector score during service search", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const embeddingProvider = new DeterministicEmbeddingProvider(32);
+    const embeddingIndex = new TrackingEmbeddingIndex();
+    const service = createMemoryService(store, {
+      embeddingProvider,
+      embeddingIndex,
+      extractor: {
+        extract(turn) {
+          return [
+            {
+              level: "L1",
+              type: "fact",
+              subject: "project alpha",
+              predicate: "database",
+              object: "postgresql",
+              summary: "project alpha database postgresql",
+              confidence: 0.8,
+              status: "active",
+              supersedesId: null,
+              sourceTurnIds: [turn.id],
+              mis: turn.mis,
+              source: turn.source,
+              agent: turn.agent,
+              channel: turn.channel,
+              metadata: turn.metadata
+            }
+          ];
+        }
+      }
+    });
+
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    await service.ingestTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "remember alpha storage",
+      ...scope
+    });
+
+    const results = await service.search({ query: "postgresql database", ...scope });
+
+    expect(embeddingIndex.upsertedIds).toHaveLength(1);
+    expect(embeddingIndex.searchCount).toBe(1);
+    expect(results.results[0]).toMatchObject({
+      memory: { subject: "project alpha", object: "postgresql" }
+    });
+    expect(results.results[0].score).toBeGreaterThan(10);
   });
 });
 
