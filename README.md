@@ -16,15 +16,17 @@ oh-my-memory treats memory as an evolving fact system, not just a vector search 
 - Supports scope isolation by `mis / source / agent / channel / metadata`
 - Provides a `MemoryStore` database abstraction for SQLite, PostgreSQL, or other storage backends
 - Provides Embedding and Vector Index abstractions for future SQLite vector search integration
+- Provides a `MemoryService` application layer so HTTP, CLI, SDK, MCP, or background jobs can ingest through the same API
 - Provides a local HTTP API
 
 ## Architecture
 
 ```mermaid
 flowchart TD
-  Client["Client / Agent"] --> API["Memory API"]
-  API --> L0["L0 Conversation"]
-  API --> Extractor["Extractor"]
+  Client["Client / Agent"] --> Transport["HTTP / CLI / SDK / MCP"]
+  Transport --> Service["MemoryService"]
+  Service --> L0["L0 Conversation"]
+  Service --> Extractor["Extractor"]
   Extractor --> L1["L1 Memory Unit"]
   L1 --> Resolver["Relation Resolver"]
   Resolver --> Store["Memory Store"]
@@ -238,6 +240,34 @@ SqliteVecMemoryStore
 
 Each implementation only needs to satisfy the same `MemoryStore` interface. Domain logic, search, Dreaming, and API routes should not depend on a concrete database.
 
+## Application API Abstraction
+
+Transport-specific code is isolated from memory behavior through `MemoryService`.
+
+Current methods:
+
+```text
+ingestTurn(input)
+search(input)
+listMemories(scope)
+updateMemory(id, patch)
+listRelations(memoryId)
+runDreaming(scope)
+```
+
+The Fastify HTTP server is now only one transport adapter. Future insertion paths can call the same service directly:
+
+```text
+HTTP POST /turns
+CLI import command
+SDK method call
+MCP tool
+background sync job
+batch importer
+```
+
+This keeps validation, extraction, relation resolution, Project Memory updates, and Dreaming behavior consistent across all ingestion methods.
+
 ## Development
 
 ```bash
@@ -257,6 +287,9 @@ src/domain/
   embedding.ts       Embedding and Vector Index abstractions
   text.ts            Text similarity helpers
   types.ts           Domain types
+
+src/application/
+  memory-service.ts  Transport-independent application API
 
 src/storage/
   database.ts        SQLite schema
@@ -278,6 +311,7 @@ Implemented:
 - Value filtering
 - Supersede evolution
 - Memory relations
+- `MemoryService` application API abstraction
 - `MemoryStore` database abstraction
 - Embedding and Vector Index abstractions
 - Project aggregation

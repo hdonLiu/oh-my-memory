@@ -9,6 +9,7 @@ import { runDreaming } from "../src/domain/dreaming.js";
 import { rebuildProjectMemories } from "../src/domain/project-memory.js";
 import { resolveMemory } from "../src/domain/resolver.js";
 import { searchMemories } from "../src/domain/search.js";
+import { createMemoryService } from "../src/application/memory-service.js";
 import { buildServer } from "../src/server.js";
 import { createDatabase } from "../src/storage/database.js";
 import { MemoryRepository } from "../src/storage/repositories.js";
@@ -125,6 +126,33 @@ describe("memory storage", () => {
     expect(repo.listTurns()).toHaveLength(1);
     expect(repo.listMemories({ mis: "u1" })).toHaveLength(1);
     expect(repo.listRelations(memory.id)).toEqual([relation]);
+  });
+});
+
+describe("memory application service", () => {
+  it("ingests turns without depending on HTTP transport", () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const service = createMemoryService(store);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+
+    const first = service.ingestTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 使用 MySQL",
+      ...scope
+    });
+    const second = service.ingestTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 已迁移到 PostgreSQL",
+      ...scope
+    });
+
+    expect(first.memories[0]).toMatchObject({ object: "MySQL", status: "active" });
+    expect(second.memories[0]).toMatchObject({ object: "PostgreSQL", status: "active" });
+    expect(service.search({ query: "项目 A 数据库", ...scope }).results.map((result) => result.memory.object)).toContain(
+      "PostgreSQL"
+    );
   });
 });
 

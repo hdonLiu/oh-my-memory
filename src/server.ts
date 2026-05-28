@@ -2,11 +2,7 @@ import cors from "@fastify/cors";
 import type Database from "better-sqlite3";
 import Fastify from "fastify";
 import { z } from "zod";
-import { runDreaming } from "./domain/dreaming.js";
-import { extractMemories } from "./domain/extractor.js";
-import { rebuildProjectMemories } from "./domain/project-memory.js";
-import { resolveMemory } from "./domain/resolver.js";
-import { searchMemories } from "./domain/search.js";
+import { createMemoryService, type MemoryService } from "./application/memory-service.js";
 import type { MemoryStatus, Role, Scope } from "./domain/types.js";
 import { MemoryRepository } from "./storage/repositories.js";
 import type { MemoryStore } from "./storage/store.js";
@@ -37,9 +33,11 @@ const patchSchema = z.object({
   confidence: z.number().min(0).max(1).optional()
 });
 
-export function buildServer(storage: Database.Database | MemoryStore) {
+export function buildServer(storage: Database.Database | MemoryStore | MemoryService) {
   const app = Fastify({ logger: false });
-  const repo = isMemoryStore(storage) ? storage : new MemoryRepository(storage);
+  const service = isMemoryService(storage)
+    ? storage
+    : createMemoryService(isMemoryStore(storage) ? storage : new MemoryRepository(storage));
 
   app.register(cors);
 
@@ -51,18 +49,12 @@ export function buildServer(storage: Database.Database | MemoryStore) {
       return reply.status(400).send({ error: parsed.error.flatten() });
     }
     const input = parsed.data;
-    const turn = repo.createTurn({
+    return service.ingestTurn({
       sessionId: input.sessionId,
       role: input.role as Role,
       content: input.content,
       ...toScope(input)
     });
-    const window = repo.recentTurns(toScope(input), 8);
-    const memories = extractMemories(turn, window).map((draft) => resolveMemory(repo, draft));
-    if (memories.length > 0) {
-      rebuildProjectMemories(repo, toScope(input));
-    }
-    return { turn, memories };
   });
 
   app.post("/search", async (request, reply) => {
@@ -70,13 +62,13 @@ export function buildServer(storage: Database.Database | MemoryStore) {
     if (!parsed.success) {
       return reply.status(400).send({ error: parsed.error.flatten() });
     }
-    return { results: searchMemories(repo, { ...parsed.data, metadata: parsed.data.metadata }) };
+    return service.search({ ...parsed.data, metadata: parsed.data.metadata });
   });
 
   app.get("/memories", async (request) => {
     const query = request.query as Partial<Record<keyof Scope, string>>;
     return {
-      memories: repo.listMemories({
+      ...service.listMemories({
         mis: query.mis,
         source: query.source,
         agent: query.agent,
@@ -93,7 +85,7 @@ export function buildServer(storage: Database.Database | MemoryStore) {
     }
     const patch: { status?: MemoryStatus; summary?: string; confidence?: number } = parsed.data;
     try {
-      return { memory: repo.updateMemory(params.id, patch) };
+      return service.updateMemory(params.id, patch);
     } catch (error) {
       return reply.status(404).send({ error: error instanceof Error ? error.message : "not found" });
     }
@@ -101,7 +93,7 @@ export function buildServer(storage: Database.Database | MemoryStore) {
 
   app.get("/memories/:id/relations", async (request) => {
     const params = request.params as { id: string };
-    return { relations: repo.listRelations(params.id) };
+    return service.listRelations(params.id);
   });
 
   app.post("/dreaming/run", async (request, reply) => {
@@ -109,13 +101,21 @@ export function buildServer(storage: Database.Database | MemoryStore) {
     if (!parsed.success) {
       return reply.status(400).send({ error: parsed.error.flatten() });
     }
-    return runDreaming(repo, toScope(parsed.data));
+    return service.runDreaming(toScope(parsed.data));
   });
 
   return app;
 }
 
-function isMemoryStore(value: Database.Database | MemoryStore): value is MemoryStore {
+function isMemoryService(value: Database.Database | MemoryStore | MemoryService): value is MemoryService {
+  return (
+    typeof (value as MemoryService).ingestTurn === "function" &&
+    typeof (value as MemoryService).search === "function" &&
+    typeof (value as MemoryService).runDreaming === "function"
+  );
+}
+
+function isMemoryStore(value: Database.Database | MemoryStore | MemoryService): value is MemoryStore {
   return (
     typeof (value as MemoryStore).createTurn === "function" &&
     typeof (value as MemoryStore).listMemories === "function" &&
