@@ -104,6 +104,14 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
     return service.runDreaming(toScope(parsed.data));
   });
 
+  app.post("/projects/run", async (request, reply) => {
+    const parsed = scopeSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+    return service.runProjectBuild(toScope(parsed.data));
+  });
+
   return app;
 }
 
@@ -111,6 +119,7 @@ function isMemoryService(value: Database.Database | MemoryStore | MemoryService)
   return (
     typeof (value as MemoryService).ingestTurn === "function" &&
     typeof (value as MemoryService).search === "function" &&
+    typeof (value as MemoryService).runProjectBuild === "function" &&
     typeof (value as MemoryService).runDreaming === "function"
   );
 }

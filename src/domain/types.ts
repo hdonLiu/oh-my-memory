@@ -1,8 +1,9 @@
-export type MemoryLevel = "L1" | "L2" | "L3";
-export type MemoryType = "fact" | "preference" | "decision" | "profile" | "project";
+export type MemoryLevel = "topic" | "L2" | "L3";
+export type MemoryType = "topic" | "fact" | "preference" | "decision" | "profile" | "project";
 export type MemoryStatus = "active" | "superseded" | "deleted";
 export type RelationType = "duplicate" | "update" | "contradict" | "support" | "related";
 export type Role = "user" | "assistant" | "system";
+export type TopicStatus = "complete" | "partial" | "noise";
 
 export interface Scope {
   mis: string;
@@ -45,5 +46,21 @@ export interface MemoryRelation {
   createdAt: string;
 }
 
+export interface TopicSegment extends Scope {
+  id: string;
+  sessionId: string;
+  title: string;
+  summary: string;
+  status: TopicStatus;
+  confidence: number;
+  turnIds: string[];
+  reason: string;
+  fingerprint: string;
+  projectMemoryIds: string[];
+  createdAt: string;
+  updatedAt: string;
+}
+
 export type CreateTurnInput = Omit<ConversationTurn, "id" | "createdAt">;
 export type CreateMemoryInput = Omit<Memory, "id" | "createdAt" | "updatedAt">;
+export type CreateTopicSegmentInput = Omit<TopicSegment, "id" | "createdAt" | "updatedAt">;

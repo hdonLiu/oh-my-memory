@@ -3,12 +3,15 @@ import { nanoid } from "nanoid";
 import type {
   ConversationTurn,
   CreateMemoryInput,
+  CreateTopicSegmentInput,
   CreateTurnInput,
   Memory,
   MemoryRelation,
   MemoryStatus,
   RelationType,
-  Scope
+  Scope,
+  TopicSegment,
+  TopicStatus
 } from "../domain/types.js";
 import type { MemoryPatch, MemoryStore } from "./store.js";
 
@@ -55,6 +58,26 @@ type RelationRow = {
   created_at: string;
 };
 
+type TopicSegmentRow = {
+  id: string;
+  session_id: string;
+  title: string;
+  summary: string;
+  status: TopicStatus;
+  confidence: number;
+  turn_ids: string;
+  reason: string;
+  fingerprint: string;
+  project_memory_ids: string;
+  mis: string;
+  source: string;
+  agent: string;
+  channel: string;
+  metadata: string;
+  created_at: string;
+  updated_at: string;
+};
+
 export class MemoryRepository implements MemoryStore {
   constructor(private readonly db: Database.Database) {}
 
@@ -88,9 +111,9 @@ export class MemoryRepository implements MemoryStore {
       .map((row) => mapTurn(row as TurnRow));
   }
 
-  recentTurns(scope: Partial<Scope>, limit: number): ConversationTurn[] {
+  recentTurns(scope: Partial<Scope> & { sessionId?: string }, limit: number): ConversationTurn[] {
     const rows = this.listTurns()
-      .filter((turn) => matchesScope(turn, scope))
+      .filter((turn) => matchesScope(turn, scope) && (!scope.sessionId || turn.sessionId === scope.sessionId))
       .slice(-limit);
     return rows;
   }
@@ -177,6 +200,87 @@ export class MemoryRepository implements MemoryStore {
       .filter((memory) => matchesScope(memory, scope));
   }
 
+  createTopicSegment(input: CreateTopicSegmentInput): TopicSegment {
+    const timestamp = now();
+    const topic: TopicSegment = { ...input, id: nanoid(), createdAt: timestamp, updatedAt: timestamp };
+    this.db
+      .prepare(
+        `insert into topic_segments
+        (id, session_id, title, summary, status, confidence, turn_ids, reason, fingerprint, project_memory_ids,
+         mis, source, agent, channel, metadata, created_at, updated_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        topic.id,
+        topic.sessionId,
+        topic.title,
+        topic.summary,
+        topic.status,
+        topic.confidence,
+        JSON.stringify(topic.turnIds),
+        topic.reason,
+        topic.fingerprint,
+        JSON.stringify(topic.projectMemoryIds),
+        topic.mis,
+        topic.source,
+        topic.agent,
+        topic.channel,
+        JSON.stringify(topic.metadata),
+        topic.createdAt,
+        topic.updatedAt
+      );
+    return topic;
+  }
+
+  updateTopicSegment(id: string, patch: Partial<Omit<TopicSegment, "id" | "createdAt">>): TopicSegment {
+    const current = this.listTopicSegments().find((topic) => topic.id === id);
+    if (!current) {
+      throw new Error(`Topic segment not found: ${id}`);
+    }
+    const updated: TopicSegment = { ...current, ...patch, id, createdAt: current.createdAt, updatedAt: now() };
+    this.db
+      .prepare(
+        `update topic_segments set
+          session_id = ?, title = ?, summary = ?, status = ?, confidence = ?, turn_ids = ?, reason = ?, fingerprint = ?,
+          project_memory_ids = ?, mis = ?, source = ?, agent = ?, channel = ?, metadata = ?, updated_at = ?
+        where id = ?`
+      )
+      .run(
+        updated.sessionId,
+        updated.title,
+        updated.summary,
+        updated.status,
+        updated.confidence,
+        JSON.stringify(updated.turnIds),
+        updated.reason,
+        updated.fingerprint,
+        JSON.stringify(updated.projectMemoryIds),
+        updated.mis,
+        updated.source,
+        updated.agent,
+        updated.channel,
+        JSON.stringify(updated.metadata),
+        updated.updatedAt,
+        id
+      );
+    return updated;
+  }
+
+  getTopicSegmentByFingerprint(fingerprint: string): TopicSegment | null {
+    const row = this.db.prepare("select * from topic_segments where fingerprint = ?").get(fingerprint) as
+      | TopicSegmentRow
+      | undefined;
+    return row ? mapTopicSegment(row) : null;
+  }
+
+  listTopicSegments(scope: Partial<Scope> = {}): TopicSegment[] {
+    return this.db
+      .prepare("select * from topic_segments order by created_at asc")
+      .all()
+      .map((row) => mapTopicSegment(row as TopicSegmentRow))
+      .filter((topic) => matchesScope(topic, scope));
+  }
+
   createRelation(
     fromMemoryId: string,
     toMemoryId: string,
@@ -257,6 +361,28 @@ function mapMemory(row: MemoryRow): Memory {
     status: row.status,
     supersedesId: row.supersedes_id,
     sourceTurnIds: JSON.parse(row.source_turn_ids) as string[],
+    mis: row.mis,
+    source: row.source,
+    agent: row.agent,
+    channel: row.channel,
+    metadata: JSON.parse(row.metadata) as Record<string, unknown>,
+    createdAt: row.created_at,
+    updatedAt: row.updated_at
+  };
+}
+
+function mapTopicSegment(row: TopicSegmentRow): TopicSegment {
+  return {
+    id: row.id,
+    sessionId: row.session_id,
+    title: row.title,
+    summary: row.summary,
+    status: row.status,
+    confidence: row.confidence,
+    turnIds: JSON.parse(row.turn_ids) as string[],
+    reason: row.reason,
+    fingerprint: row.fingerprint,
+    projectMemoryIds: JSON.parse(row.project_memory_ids) as string[],
     mis: row.mis,
     source: row.source,
     agent: row.agent,

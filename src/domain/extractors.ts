@@ -16,9 +16,48 @@ export interface LlmCompletionClient {
   complete(prompt: string): Promise<string>;
 }
 
+export interface OpenAICompatibleCompletionProviderOptions {
+  baseUrl: string;
+  apiKey: string;
+  model: string;
+  fetch?: typeof fetch;
+}
+
+export class OpenAICompatibleCompletionClient implements LlmCompletionClient {
+  private readonly fetchImpl: typeof fetch;
+
+  constructor(private readonly options: OpenAICompatibleCompletionProviderOptions) {
+    this.fetchImpl = options.fetch ?? fetch;
+  }
+
+  async complete(prompt: string): Promise<string> {
+    const response = await this.fetchImpl(`${this.options.baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        authorization: `Bearer ${this.options.apiKey}`,
+        "content-type": "application/json"
+      },
+      body: JSON.stringify({
+        model: this.options.model,
+        messages: [{ role: "user", content: prompt }],
+        temperature: 0
+      })
+    });
+    if (!response.ok) {
+      throw new Error(`LLM completion request failed: ${response.status} ${await response.text()}`);
+    }
+    const json = (await response.json()) as { choices?: Array<{ message?: { content?: string } }> };
+    const content = json.choices?.[0]?.message?.content;
+    if (!content) {
+      throw new Error("LLM completion response missing content");
+    }
+    return content;
+  }
+}
+
 const llmMemorySchema = z.object({
-  level: z.enum(["L1", "L2", "L3"]),
-  type: z.enum(["fact", "preference", "decision", "profile", "project"]),
+  level: z.enum(["topic", "L2", "L3"]),
+  type: z.enum(["topic", "fact", "preference", "decision", "profile", "project"]),
   subject: z.string().min(1),
   predicate: z.string().min(1),
   object: z.string().min(1),

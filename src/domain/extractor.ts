@@ -21,7 +21,7 @@ export function extractMemories(turn: ConversationTurn, _window: ConversationTur
   if (migration) {
     return [
       {
-        level: "L1",
+        level: "L2",
         type: "fact",
         subject: normalizeSubject(migration[1]),
         predicate: "使用",
@@ -40,7 +40,7 @@ export function extractMemories(turn: ConversationTurn, _window: ConversationTur
   if (projectUsage) {
     return [
       {
-        level: "L1",
+        level: "L2",
         type: "fact",
         subject: normalizeSubject(projectUsage[1]),
         predicate: "使用",
@@ -59,7 +59,7 @@ export function extractMemories(turn: ConversationTurn, _window: ConversationTur
   if (preference) {
     return [
       {
-        level: "L1",
+        level: "L2",
         type: "preference",
         subject: "用户",
         predicate: "偏好",
@@ -78,7 +78,7 @@ export function extractMemories(turn: ConversationTurn, _window: ConversationTur
   if (decision) {
     return [
       {
-        level: "L1",
+        level: "L2",
         type: "decision",
         subject: "用户",
         predicate: "决定",

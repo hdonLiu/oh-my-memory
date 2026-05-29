@@ -1,19 +1,27 @@
 import { RuleBasedMemoryCompressor, type DreamingResult, type MemoryCompressor } from "../domain/dreaming.js";
 import type { EmbeddingIndex, EmbeddingProvider } from "../domain/embedding.js";
-import { RuleBasedMemoryExtractor, type MemoryExtractor } from "../domain/extractors.js";
-import { RuleBasedProjectMemoryBuilder, type ProjectMemoryBuilder } from "../domain/project-memory.js";
+import { OpenAICompatibleCompletionClient } from "../domain/extractors.js";
+import {
+  LlmProjectMemoryExtractor,
+  ModelProjectMemoryBuilder,
+  NoopProjectMemoryExtractor,
+  type ProjectMemoryBuilder
+} from "../domain/project-memory.js";
 import { RuleBasedMemoryResolver, type MemoryResolver } from "../domain/resolver.js";
 import { searchMemories, type SearchInput, type SearchResult } from "../domain/search.js";
-import type { ConversationTurn, CreateTurnInput, Memory, MemoryStatus, Scope } from "../domain/types.js";
+import { SlidingTopicBuilder, topicToMemoryDraft, type TopicBuilder } from "../domain/topics.js";
+import type { ConversationTurn, CreateTurnInput, Memory, MemoryStatus, Scope, TopicSegment } from "../domain/types.js";
 import type { MemoryStore } from "../storage/store.js";
 
 export interface IngestTurnResult {
   turn: ConversationTurn;
+  topic: TopicSegment | null;
   memories: Memory[];
 }
 
 export interface MemoryService {
   ingestTurn(input: CreateTurnInput): Promise<IngestTurnResult>;
+  runProjectBuild(scope: Scope): Promise<{ createdOrUpdated: Memory[] }>;
   search(input: SearchInput): Promise<{ results: SearchResult[] }>;
   listMemories(scope: Partial<Scope>): { memories: Memory[] };
   updateMemory(id: string, patch: { status?: MemoryStatus; summary?: string; confidence?: number }): { memory: Memory };
@@ -22,19 +30,19 @@ export interface MemoryService {
 }
 
 export interface MemoryServiceOptions {
-  extractor?: MemoryExtractor;
   resolver?: MemoryResolver;
   projectMemoryBuilder?: ProjectMemoryBuilder;
   compressor?: MemoryCompressor;
+  topicBuilder?: TopicBuilder;
   embeddingProvider?: EmbeddingProvider;
   embeddingIndex?: EmbeddingIndex;
 }
 
 export function createMemoryService(store: MemoryStore, options: MemoryServiceOptions = {}): MemoryService {
-  const extractor = options.extractor ?? new RuleBasedMemoryExtractor();
   const resolver = options.resolver ?? new RuleBasedMemoryResolver();
-  const projectMemoryBuilder = options.projectMemoryBuilder ?? new RuleBasedProjectMemoryBuilder();
+  const projectMemoryBuilder = options.projectMemoryBuilder ?? createDefaultProjectMemoryBuilder(resolver);
   const compressor = options.compressor ?? new RuleBasedMemoryCompressor();
+  const topicBuilder = options.topicBuilder ?? new SlidingTopicBuilder();
   const embeddingProvider = options.embeddingProvider;
   const embeddingIndex = options.embeddingIndex;
 
@@ -42,16 +50,24 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
     async ingestTurn(input) {
       const turn = store.createTurn(input);
       const scope = toScope(input);
-      const window = store.recentTurns(scope, 8);
-      const drafts = await extractor.extract(turn, window);
-      const memories = drafts.map((draft) => resolver.resolve(store, draft));
+      const topic = await topicBuilder.build(store, scope, turn.sessionId);
+      if (!topic || topic.status !== "complete") {
+        return { turn, topic, memories: [] };
+      }
+      const topicMemory = resolver.resolve(store, topicToMemoryDraft(topic));
+      const memories = [topicMemory];
       if (embeddingProvider && embeddingIndex) {
         await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
       }
-      if (memories.length > 0) {
-        projectMemoryBuilder.rebuild(store, scope);
+      return { turn, topic, memories };
+    },
+
+    async runProjectBuild(scope) {
+      const createdOrUpdated = await projectMemoryBuilder.rebuild(store, scope);
+      if (embeddingProvider && embeddingIndex) {
+        await Promise.all(createdOrUpdated.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
       }
-      return { turn, memories };
+      return { createdOrUpdated };
     },
 
     async search(input) {
@@ -138,4 +154,17 @@ function toScope(input: CreateTurnInput): Scope {
     channel: input.channel,
     metadata: input.metadata
   };
+}
+
+function createDefaultProjectMemoryBuilder(resolver: MemoryResolver): ProjectMemoryBuilder {
+  const baseUrl = process.env.LLM_BASE_URL;
+  const apiKey = process.env.LLM_API_KEY;
+  const model = process.env.LLM_MODEL;
+  if (!baseUrl || !apiKey || !model) {
+    return new ModelProjectMemoryBuilder(new NoopProjectMemoryExtractor(), resolver);
+  }
+  return new ModelProjectMemoryBuilder(
+    new LlmProjectMemoryExtractor(new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model })),
+    resolver
+  );
 }

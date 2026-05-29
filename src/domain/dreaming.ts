@@ -17,7 +17,7 @@ export class RuleBasedMemoryCompressor implements MemoryCompressor {
   compress(repo: MemoryStore, scope: Scope): DreamingResult {
   const candidates = repo
     .listMemories(scope)
-    .filter((memory) => memory.status === "active" && (memory.level === "L1" || memory.level === "L2"));
+    .filter((memory) => memory.status === "active" && memory.level === "L2");
   const groups = new Map<string, Memory[]>();
 
   for (const memory of candidates) {
@@ -25,7 +25,7 @@ export class RuleBasedMemoryCompressor implements MemoryCompressor {
     groups.set(key, [...(groups.get(key) ?? []), memory]);
   }
 
-  const createdOrUpdated: Memory[] = [];
+  const createdOrUpdated: Memory[] = promotePreferenceTopics(repo, scope);
   for (const group of groups.values()) {
     const first = group[0];
     if (!first || (group.length < 2 && first.type !== "preference")) {
@@ -65,4 +65,51 @@ export class RuleBasedMemoryCompressor implements MemoryCompressor {
 
   return { createdOrUpdated };
   }
+}
+
+function promotePreferenceTopics(repo: MemoryStore, scope: Scope): Memory[] {
+  const groups = new Map<string, Memory[]>();
+  for (const topic of repo
+    .listMemories(scope)
+    .filter((memory) => memory.level === "topic" && memory.type === "topic" && memory.status === "active")) {
+    const preference = inferPreference(topic.summary);
+    if (!preference) {
+      continue;
+    }
+    groups.set(preference, [...(groups.get(preference) ?? []), topic]);
+  }
+
+  const results: Memory[] = [];
+  for (const [preference, topics] of groups) {
+    const existing = repo
+      .listMemories(scope)
+      .find(
+        (memory) =>
+          memory.level === "L3" &&
+          memory.type === "profile" &&
+          memory.subject === "用户" &&
+          memory.predicate === "偏好" &&
+          memory.object === preference
+      );
+    const input = {
+      level: "L3" as const,
+      type: "profile" as const,
+      subject: "用户",
+      predicate: "偏好",
+      object: preference,
+      summary: `用户偏好 ${preference}`,
+      confidence: Math.min(1, Math.max(...topics.map((topic) => topic.confidence)) + 0.1),
+      status: "active" as const,
+      supersedesId: null,
+      sourceTurnIds: Array.from(new Set(topics.flatMap((topic) => topic.sourceTurnIds))),
+      ...scope
+    };
+    results.push(existing ? repo.updateMemory(existing.id, input) : repo.createMemory(input));
+  }
+  return results;
+}
+
+function inferPreference(text: string): string | null {
+  const match = text.match(/(?:用户|我)?(?:喜欢|偏好)\s*(.+)$/u);
+  return match?.[1]?.trim() || null;
 }

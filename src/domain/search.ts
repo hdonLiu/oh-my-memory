@@ -16,7 +16,7 @@ export interface SearchResult {
 const LEVEL_WEIGHT: Record<Memory["level"], number> = {
   L3: 0.35,
   L2: 0.25,
-  L1: 0.15
+  topic: 0.2
 };
 
 export function searchMemories(repo: MemoryStore, input: SearchInput): SearchResult[] {

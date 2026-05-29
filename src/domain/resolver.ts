@@ -16,7 +16,13 @@ export class RuleBasedMemoryResolver implements MemoryResolver {
   resolve(repo: MemoryStore, draft: MemoryDraft): Memory {
   const candidates = repo
     .listMemories(draft)
-    .filter((memory) => memory.status === "active" && memory.level === draft.level && sameScope(memory, draft));
+    .filter(
+      (memory) =>
+        memory.status === "active" &&
+        memory.level === draft.level &&
+        sameScope(memory, draft) &&
+        sameMemorySession(memory, draft)
+    );
 
   const exact = candidates.find(
     (memory) =>
@@ -56,4 +62,11 @@ export class RuleBasedMemoryResolver implements MemoryResolver {
   }
   return created;
   }
+}
+
+function sameMemorySession(memory: Memory, draft: MemoryDraft): boolean {
+  if (draft.type !== "topic") {
+    return true;
+  }
+  return memory.metadata.sessionId === draft.metadata.sessionId;
 }

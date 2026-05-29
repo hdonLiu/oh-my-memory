@@ -1,44 +1,32 @@
 # oh-my-memory
 
-A local Memory service prototype.
+A local memory service for agents and personal tools.
 
-oh-my-memory treats memory as an evolving fact system, not just a vector search index. On write, it extracts and evolves memories. Offline, it compresses and promotes stable knowledge. On search, it performs multi-level retrieval and filters stale facts.
+oh-my-memory records conversation turns, groups them into topics, turns project topics into project memories, and keeps long-term memories searchable. It is meant to be embedded behind HTTP, CLI, SDK, MCP tools, or background import jobs.
 
-## Features
+## What It Does
 
-- L0: stores raw conversation turns
-- L1: extracts atomic memory units
-- L2: aggregates project/topic memories
-- L3: promotes long-term profile memories through Dreaming
-- Supports `active / superseded / deleted` memory states
-- Supports `supersedesId` version chains
-- Supports memory relations: `duplicate / update / contradict / support / related`
-- Supports scope isolation by `mis / source / agent / channel / metadata`
-- Provides a `MemoryStore` database abstraction for SQLite, PostgreSQL, or other storage backends
-- Provides strategy abstractions for extraction, relation resolution, project aggregation, and compression
-- Provides Embedding and Vector Index abstractions with in-memory and SQLite-backed implementations
-- Supports hybrid search when `MemoryService` is configured with an `EmbeddingProvider` and `EmbeddingIndex`
-- Provides a `MemoryService` application layer so HTTP, CLI, SDK, MCP, or background jobs can ingest through the same API
-- Provides a local HTTP API and CLI ingestion entrypoint
+- Stores raw conversation turns
+- Groups related turns into topics
+- Builds project memories from topics through an offline project run
+- Keeps memories scoped by `mis / source / agent / channel`
+- Searches active project and global memories
+- Supports local SQLite persistence
+- Supports CLI and HTTP ingestion
+- Supports optional embedding-based search
 
-## Architecture
+## When To Use It
 
-```mermaid
-flowchart TD
-  Client["Client / Agent"] --> Transport["HTTP / CLI / SDK / MCP"]
-  Transport --> Service["MemoryService"]
-  Service --> L0["L0 Conversation"]
-  Service --> Extractor["MemoryExtractor"]
-  Extractor --> L1["L1 Memory Unit"]
-  L1 --> Resolver["MemoryResolver"]
-  Resolver --> Store["Memory Store"]
-  Store --> L2["L2 Project Memory"]
-  Store --> L3["L3 Global Memory"]
-  Store --> Search["Multi-level Search"]
-  Search --> Client
-  Dreaming["Dreaming Job"] --> Store
-  Store --> Dreaming
+Use oh-my-memory when you want an agent or local tool to remember things like:
+
+```text
+Project A moved from MySQL to PostgreSQL
+The user prefers TypeScript
+This task should not include Time Memory
+Project B uses SQLite
 ```
+
+It is currently a local prototype, not a production multi-tenant memory platform.
 
 ## Quick Start
 
@@ -47,28 +35,19 @@ npm install
 npm run dev
 ```
 
-Default URL:
+Default server:
 
 ```text
 http://localhost:3000
 ```
 
-Environment variables:
+Use a custom port or database path:
 
 ```bash
 PORT=3001 MEMORY_DB_PATH=memory.sqlite npm run dev
 ```
 
-Embedding provider variables:
-
-```bash
-EMBEDDING_BASE_URL=https://api.openai.com/v1
-EMBEDDING_API_KEY=...
-EMBEDDING_MODEL=text-embedding-3-small
-EMBEDDING_DIMENSIONS=1536
-```
-
-## API Examples
+## HTTP Usage
 
 ### Health Check
 
@@ -84,7 +63,7 @@ curl -s http://localhost:3000/turns \
   -d '{
     "sessionId": "s1",
     "role": "user",
-    "content": "Project A uses MySQL",
+    "content": "项目 A 使用 MySQL",
     "mis": "u1",
     "source": "local",
     "agent": "demo",
@@ -110,8 +89,6 @@ curl -s http://localhost:3000/turns \
   }'
 ```
 
-The old `MySQL` memory becomes `superseded`; the new `PostgreSQL` memory stays `active`.
-
 ### Search Memories
 
 ```bash
@@ -126,8 +103,6 @@ curl -s http://localhost:3000/search \
     "metadata": {}
   }'
 ```
-
-By default, search only returns `active` memories.
 
 ### List Memories
 
@@ -163,7 +138,21 @@ curl -s -X POST http://localhost:3000/dreaming/run \
   }'
 ```
 
-## CLI Examples
+### Run Project Extraction
+
+```bash
+curl -s -X POST http://localhost:3000/projects/run \
+  -H 'content-type: application/json' \
+  -d '{
+    "mis": "u1",
+    "source": "local",
+    "agent": "demo",
+    "channel": "default",
+    "metadata": {}
+  }'
+```
+
+## CLI Usage
 
 ### Ingest One Turn
 
@@ -185,7 +174,7 @@ oh-my-memory ingest \
 oh-my-memory import --db memory.sqlite conversations.json
 ```
 
-Input file shape:
+Input file:
 
 ```json
 [
@@ -202,154 +191,26 @@ Input file shape:
 ]
 ```
 
-## Current Extraction Rules
+## Optional Embeddings
 
-The MVP does not use a real model yet. It uses rule-based extraction:
+Lexical search works without model configuration.
 
-```text
-项目 X 使用 Y
-项目 X 用的是 Y
-项目 X 已迁移到 Y
-我喜欢 X
-我偏好 X
-决定 X
-决策 X
+To enable embedding-assisted search, configure an OpenAI-compatible embedding endpoint:
+
+```bash
+EMBEDDING_BASE_URL=https://api.openai.com/v1
+EMBEDDING_API_KEY=...
+EMBEDDING_MODEL=text-embedding-3-small
+EMBEDDING_DIMENSIONS=1536
 ```
 
-Noise examples:
+To enable offline project extraction, configure an OpenAI-compatible chat endpoint:
 
-```text
-你好
-谢谢
-好的
-ok
+```bash
+LLM_BASE_URL=https://api.openai.com/v1
+LLM_API_KEY=...
+LLM_MODEL=...
 ```
-
-## Embedding and Vector Storage
-
-The project currently abstracts two interfaces:
-
-```text
-EmbeddingProvider
-  embed(text) -> vector
-  embedMany(texts) -> vector[]
-
-EmbeddingIndex
-  upsert(record)
-  delete(id)
-  search(vector, options) -> results
-```
-
-Built-in implementations:
-
-```text
-DeterministicEmbeddingProvider
-InMemoryEmbeddingIndex
-SqliteVectorIndex
-OpenAICompatibleEmbeddingProvider
-```
-
-`DeterministicEmbeddingProvider` and `InMemoryEmbeddingIndex` are only for local tests and interface validation. `OpenAICompatibleEmbeddingProvider` can call OpenAI-compatible embedding endpoints. `SqliteVectorIndex` persists vectors in SQLite while keeping the same `EmbeddingIndex` interface.
-
-When `MemoryService` receives both an `EmbeddingProvider` and an `EmbeddingIndex`, it indexes ingested memories and combines lexical score with vector score during search. Without those options, search falls back to the lexical/Jaccard path.
-
-Future SQLite vector backends can implement the same `EmbeddingIndex` interface. Candidate backends:
-
-```text
-sqlite-vec: a lightweight SQLite vector search extension, suitable for the next integration target
-vec1: SQLite's official ANN vector extension, worth tracking as the official path evolves
-```
-
-## Strategy Abstractions
-
-Memory behavior is split behind replaceable interfaces:
-
-```text
-MemoryExtractor
-MemoryResolver
-ProjectMemoryBuilder
-MemoryCompressor
-```
-
-Default implementations preserve current deterministic behavior:
-
-```text
-RuleBasedMemoryExtractor
-RuleBasedMemoryResolver
-RuleBasedProjectMemoryBuilder
-RuleBasedMemoryCompressor
-```
-
-LLM-ready implementations:
-
-```text
-LlmMemoryExtractor
-HybridMemoryExtractor
-```
-
-`HybridMemoryExtractor` tries the primary extractor first and falls back to rule-based extraction if the primary extractor fails.
-
-## Database Storage Abstraction
-
-Database access is isolated behind the `MemoryStore` interface:
-
-```text
-createTurn
-listTurns
-recentTurns
-createMemory
-updateMemory
-getMemory
-listMemories
-createRelation
-listRelations
-```
-
-Current implementation:
-
-```text
-SqliteMemoryStore
-```
-
-For compatibility, `MemoryRepository` is still available and points to the current SQLite-backed implementation.
-
-To switch databases later, add a new implementation:
-
-```text
-PostgresMemoryStore
-MysqlMemoryStore
-SqliteVecMemoryStore
-```
-
-Each implementation only needs to satisfy the same `MemoryStore` interface. Domain logic, search, Dreaming, and API routes should not depend on a concrete database.
-
-## Application API Abstraction
-
-Transport-specific code is isolated from memory behavior through `MemoryService`.
-
-Current methods:
-
-```text
-ingestTurn(input)
-search(input)
-listMemories(scope)
-updateMemory(id, patch)
-listRelations(memoryId)
-runDreaming(scope)
-```
-
-The Fastify HTTP server is now only one transport adapter. Future insertion paths can call the same service directly:
-
-```text
-HTTP POST /turns
-CLI import command
-SDK method call
-MCP tool
-background sync job
-batch importer
-```
-
-This keeps validation, extraction, relation resolution, Project Memory updates, and Dreaming behavior consistent across all ingestion methods.
 
 ## Development
 
@@ -358,69 +219,27 @@ npm test
 npm run typecheck
 ```
 
-## Project Structure
-
-```text
-src/domain/
-  extractor.ts       Rule-based extraction
-  extractors.ts      Extractor strategies
-  resolver.ts        Deduplication, updates, relation resolution
-  project-memory.ts  L2 project aggregation
-  dreaming.ts        L3 promotion
-  search.ts          Multi-level search
-  embedding.ts       Embedding and Vector Index abstractions
-  text.ts            Text similarity helpers
-  types.ts           Domain types
-
-src/application/
-  memory-service.ts  Transport-independent application API
-
-src/storage/
-  database.ts        SQLite schema
-  repositories.ts    Backward-compatible SQLite repository
-  sqlite-store.ts    SQLite store export
-  store.ts           Database storage abstraction
-
-src/server.ts        Fastify API
-src/index.ts         Service entrypoint
-src/cli.ts           CLI ingestion entrypoint
-tests/               Behavior tests
-```
-
-## MVP Scope
+## Current Scope
 
 Implemented:
 
-- L0/L1/L2/L3 data model
-- Rule-based extraction
-- Value filtering
-- Supersede evolution
-- Memory relations
-- Strategy abstractions for extractor/resolver/project builder/compressor
-- `MemoryService` application API abstraction
-- `MemoryStore` database abstraction
-- Embedding and Vector Index abstractions
-- SQLite vector persistence
-- Hybrid lexical/vector search in `MemoryService`
-- OpenAI-compatible embedding provider
-- LLM and hybrid extractor scaffolding
-- CLI ingest/import
-- Project aggregation
-- Dreaming promotion
-- Multi-level search API
+- Local SQLite-backed memory service
+- HTTP API
+- CLI ingestion and batch import
+- Memory search
+- Memory status updates
+- Offline topic-to-project memory extraction
+- Optional embedding search
 - Unit tests
 
-Not implemented yet:
+Not included yet:
 
 - Time Memory
-- PostgreSQL/MySQL implementations
-- Production LLM prompt tuning/evaluation
-- Reranker
-- Frontend memory management UI
-- Complex knowledge graph
+- Production authentication
+- Multi-tenant authorization
+- Frontend management UI
+- Production LLM evaluation
 
 ## Design Docs
 
-- [Design doc](docs/superpowers/specs/2026-05-27-oh-my-memory-design.md)
-- [Implementation plan](docs/superpowers/plans/2026-05-27-oh-my-memory.md)
-- [Next steps roadmap](docs/roadmaps/2026-05-28-next-steps.md)
+Detailed architecture and implementation notes live under `docs/`.
