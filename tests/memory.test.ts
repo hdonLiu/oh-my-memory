@@ -227,6 +227,57 @@ describe("topic memory generation", () => {
   });
 });
 
+describe("session sliding topic builder", () => {
+  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+
+  it("keeps topic partial until boundary closes the previous buffer", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const detector: TopicBoundaryDetector = {
+      detectBoundary: ({ newTurn }) => ({
+        shouldClose: newTurn.content.includes("换个话题"),
+        confidence: 0.9,
+        reason: "topic changed"
+      })
+    };
+    const service = createMemoryService(store, {
+      topicBuilder: new SlidingTopicBuilder(detector, new RuleBasedTopicMemoryGenerator(), {
+        maxSize: 5,
+        minConfidence: 0.7
+      })
+    });
+
+    const first = await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 要做 topic", ...scope });
+    const second = await service.ingestTurn({ sessionId: "s1", role: "assistant", content: "先用滑动窗口", ...scope });
+    const third = await service.ingestTurn({ sessionId: "s1", role: "user", content: "换个话题，晚饭吃什么", ...scope });
+
+    expect(first.memories).toEqual([]);
+    expect(second.memories).toEqual([]);
+    expect(third.memories).toHaveLength(1);
+    expect(third.memories[0].sourceTurnIds).toHaveLength(2);
+
+    const partials = store.listTopicSegments(scope).filter((topic) => topic.status === "partial");
+    expect(partials).toHaveLength(1);
+    expect(partials[0].summary).toContain("晚饭吃什么");
+  });
+
+  it("forces close when max window size is reached", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const service = createMemoryService(store, {
+      topicBuilder: new SlidingTopicBuilder(
+        { detectBoundary: () => ({ shouldClose: false, confidence: 0.8, reason: "same topic" }) },
+        new RuleBasedTopicMemoryGenerator(),
+        { maxSize: 2, minConfidence: 0.7 }
+      )
+    });
+
+    await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 第一条", ...scope });
+    const result = await service.ingestTurn({ sessionId: "s1", role: "assistant", content: "项目 A 第二条", ...scope });
+
+    expect(result.memories).toHaveLength(1);
+    expect(result.topic).toMatchObject({ status: "complete", reason: "max window size reached" });
+  });
+});
+
 describe("embedding abstraction", () => {
   it("creates deterministic vectors and compares them with cosine similarity", async () => {
     const provider = new DeterministicEmbeddingProvider(16);
