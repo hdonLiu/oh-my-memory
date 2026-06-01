@@ -556,19 +556,19 @@ describe("memory application service", () => {
       content: "项目 A 使用 MySQL",
       ...scope
     });
-    const second = await service.ingestTurn({
+    await service.ingestTurn({
       sessionId: "s1",
       role: "user",
       content: "项目 A 已迁移到 PostgreSQL",
       ...scope
     });
+    const flushed = await service.flushSessionTopic(scope, "s1");
 
-    expect(first.topic).toMatchObject({ summary: "项目 A 使用 MySQL", status: "complete" });
-    expect(first.memories[0]).toMatchObject({ level: "topic", type: "topic", subject: "项目 A", status: "active" });
-    expect(first.memories).toHaveLength(1);
-    expect(second.topic).toMatchObject({ summary: "项目 A 已迁移到 PostgreSQL", status: "complete" });
-    expect(second.memories[0]).toMatchObject({ level: "topic", type: "topic", subject: "项目 A", status: "active" });
-    expect(second.memories).toHaveLength(1);
+    expect(first.topic).toMatchObject({ summary: "项目 A 使用 MySQL", status: "partial" });
+    expect(first.memories).toHaveLength(0);
+    expect(flushed.topic).toMatchObject({ status: "complete" });
+    expect(flushed.memories[0]).toMatchObject({ level: "topic", type: "topic", subject: "项目 A", status: "active" });
+    expect(flushed.memories).toHaveLength(1);
     expect(store.listMemories(scope).map((memory): string => memory.level)).not.toContain("L1");
     expect(
       (await service.search({ query: "项目 A 数据库", ...scope })).results.some((result) =>
@@ -581,7 +581,7 @@ describe("memory application service", () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
     const service = createMemoryService(store);
 
-    const result = await service.ingestTurn({
+    await service.ingestTurn({
       sessionId: "s1",
       role: "user",
       content: "项目 A 使用 PostgreSQL",
@@ -591,6 +591,10 @@ describe("memory application service", () => {
       channel: "default",
       metadata: {}
     });
+    const result = await service.flushSessionTopic(
+      { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} },
+      "s1"
+    );
 
     expect(result.topic).toMatchObject({ status: "complete" });
     expect(result.memories[0]).toMatchObject({ level: "topic", type: "topic", subject: "项目 A" });
@@ -604,13 +608,15 @@ describe("memory application service", () => {
     const service = createMemoryService(store);
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
-    const first = await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 使用 MySQL", ...scope });
-    const second = await service.ingestTurn({
+    await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 使用 MySQL", ...scope });
+    const first = await service.flushSessionTopic(scope, "s1");
+    await service.ingestTurn({
       sessionId: "s1",
       role: "user",
       content: "项目 A 已迁移到 PostgreSQL",
       ...scope
     });
+    const second = await service.flushSessionTopic(scope, "s1");
 
     expect(store.getMemory(first.memories[0].id)?.status).toBe("superseded");
     expect(second.memories[0]).toMatchObject({
@@ -695,12 +701,13 @@ describe("memory application service", () => {
     });
 
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
-    const result = await service.ingestTurn({
+    await service.ingestTurn({
       sessionId: "s1",
       role: "user",
       content: "项目 A 使用 SQLite",
       ...scope
     });
+    const result = await service.flushSessionTopic(scope, "s1");
     const dreaming = service.runDreaming(scope);
 
     const projects = await service.runProjectBuild(scope);
@@ -726,6 +733,7 @@ describe("memory application service", () => {
       content: "项目 alpha 使用 postgresql",
       ...scope
     });
+    await service.flushSessionTopic(scope, "s1");
 
     const results = await service.search({ query: "postgresql database", ...scope });
 
@@ -909,12 +917,12 @@ describe("topic extraction layer", () => {
     });
     const first = await service.flushSessionTopic(scope, "s1");
     await service.ingestTurn({
-      sessionId: "s2",
+      sessionId: "s1",
       role: "user",
       content: "项目 A 使用 PostgreSQL",
       ...scope
     });
-    const duplicate = await service.flushSessionTopic(scope, "s2");
+    const duplicate = await service.flushSessionTopic(scope, "s1");
 
     expect(first.memories).toHaveLength(1);
     expect(duplicate.memories[0].id).toBe(first.memories[0].id);
@@ -936,7 +944,15 @@ describe("memory api", () => {
       payload: { sessionId: "s1", role: "user", content: "项目 A 使用 MySQL", ...scope }
     });
     expect(first.statusCode).toBe(200);
-    expect(first.json().memories).toHaveLength(1);
+    expect(first.json().memories).toHaveLength(0);
+
+    const firstFlush = await app.inject({
+      method: "POST",
+      url: "/sessions/s1/topics/flush",
+      payload: scope
+    });
+    expect(firstFlush.statusCode).toBe(200);
+    expect(firstFlush.json().memories).toHaveLength(1);
 
     const second = await app.inject({
       method: "POST",
@@ -944,7 +960,13 @@ describe("memory api", () => {
       payload: { sessionId: "s1", role: "user", content: "项目 A 已迁移到 PostgreSQL", ...scope }
     });
     expect(second.statusCode).toBe(200);
-    const activeId = second.json().memories[0].id;
+    const secondFlush = await app.inject({
+      method: "POST",
+      url: "/sessions/s1/topics/flush",
+      payload: scope
+    });
+    expect(secondFlush.statusCode).toBe(200);
+    const activeId = secondFlush.json().memories[0].id;
 
     const search = await app.inject({
       method: "POST",
@@ -972,6 +994,11 @@ describe("memory api", () => {
       method: "POST",
       url: "/turns",
       payload: { sessionId: "s1", role: "user", content: "我偏好 TypeScript", ...scope }
+    });
+    await app.inject({
+      method: "POST",
+      url: "/sessions/s1/topics/flush",
+      payload: scope
     });
     const dreaming = await app.inject({
       method: "POST",
