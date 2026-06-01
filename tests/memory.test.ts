@@ -311,6 +311,47 @@ describe("topic resolver integration", () => {
   });
 });
 
+describe("session topic flush", () => {
+  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+
+  it("flushes an open partial topic into a memory", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const service = createMemoryService(store, {
+      topicBuilder: new SlidingTopicBuilder(
+        { detectBoundary: () => ({ shouldClose: false, confidence: 0.8, reason: "same topic" }) },
+        new RuleBasedTopicMemoryGenerator()
+      )
+    });
+
+    await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 要做 flush", ...scope });
+    const flushed = await service.flushSessionTopic(scope, "s1");
+
+    expect(flushed.topic).toMatchObject({ status: "complete", reason: "session topic flush" });
+    expect(flushed.memories).toHaveLength(1);
+    expect(flushed.memories[0]).toMatchObject({ level: "topic", type: "topic" });
+  });
+
+  it("exposes HTTP flush endpoint", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const app = buildServer(createMemoryService(store));
+
+    await app.inject({
+      method: "POST",
+      url: "/turns",
+      payload: { sessionId: "s1", role: "user", content: "项目 A 要做 HTTP flush", ...scope }
+    });
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/sessions/s1/topics/flush",
+      payload: scope
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().memories).toHaveLength(1);
+  });
+});
+
 describe("embedding abstraction", () => {
   it("creates deterministic vectors and compares them with cosine similarity", async () => {
     const provider = new DeterministicEmbeddingProvider(16);

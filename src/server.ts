@@ -57,6 +57,15 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
     });
   });
 
+  app.post("/sessions/:sessionId/topics/flush", async (request, reply) => {
+    const params = request.params as { sessionId: string };
+    const parsed = scopeSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+    return service.flushSessionTopic(toScope(parsed.data), params.sessionId);
+  });
+
   app.post("/search", async (request, reply) => {
     const parsed = searchSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -118,6 +127,7 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
 function isMemoryService(value: Database.Database | MemoryStore | MemoryService): value is MemoryService {
   return (
     typeof (value as MemoryService).ingestTurn === "function" &&
+    typeof (value as MemoryService).flushSessionTopic === "function" &&
     typeof (value as MemoryService).search === "function" &&
     typeof (value as MemoryService).runProjectBuild === "function" &&
     typeof (value as MemoryService).runDreaming === "function"

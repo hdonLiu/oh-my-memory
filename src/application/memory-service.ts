@@ -31,6 +31,7 @@ export interface IngestTurnResult {
 
 export interface MemoryService {
   ingestTurn(input: CreateTurnInput): Promise<IngestTurnResult>;
+  flushSessionTopic(scope: Scope, sessionId: string): Promise<{ topic: TopicSegment | null; memories: Memory[] }>;
   runProjectBuild(scope: Scope): Promise<{ createdOrUpdated: Memory[] }>;
   search(input: SearchInput): Promise<{ results: SearchResult[] }>;
   listMemories(scope: Partial<Scope>): { memories: Memory[] };
@@ -70,6 +71,19 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
         await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
       }
       return { turn, topic, memories };
+    },
+
+    async flushSessionTopic(scope, sessionId) {
+      const topic = await topicBuilder.flush(store, scope, sessionId);
+      if (!topic || topic.status !== "complete") {
+        return { topic, memories: [] };
+      }
+      const topicMemory = resolver.resolve(store, topicToDraftFromSegment(topic));
+      const memories = [topicMemory];
+      if (embeddingProvider && embeddingIndex) {
+        await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
+      }
+      return { topic, memories };
     },
 
     async runProjectBuild(scope) {
