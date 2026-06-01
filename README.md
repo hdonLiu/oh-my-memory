@@ -7,7 +7,7 @@ oh-my-memory records conversation turns, groups them into topics, turns project 
 ## What It Does
 
 - Stores raw conversation turns
-- Groups related turns into topics
+- Groups session turns into topics with a streaming buffer
 - Builds project memories from topics through an offline project run
 - Keeps memories scoped by `mis / source / agent / channel`
 - Searches active project and global memories

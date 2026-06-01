@@ -303,9 +303,9 @@ describe("memory application service", () => {
       detect(turns) {
         seenWindows.push(turns.map((turn) => `${turn.sessionId}:${turn.content}`));
         return {
-          status: "complete",
+          status: turns.length >= 2 ? "complete" : "partial",
           shouldMergeBackward: false,
-          confidence: 0.9,
+          confidence: turns.length >= 2 ? 0.9 : 0.4,
           title: "项目 A 数据库",
           summary: turns.map((turn) => turn.content).join(" / "),
           reason: "test"
@@ -414,6 +414,89 @@ describe("memory application service", () => {
 });
 
 describe("topic extraction layer", () => {
+  it("closes the current session buffer when a new unrelated instruction starts", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const detector: TopicDetector = {
+      detect(turns) {
+        const unrelated = turns.at(-1)?.content.includes("项目 B");
+        if (unrelated) {
+          const projectATurns = turns.filter((turn) => turn.content.includes("项目 A"));
+          return {
+            status: "complete",
+            shouldMergeBackward: false,
+            confidence: 0.9,
+            title: "项目 A 数据库",
+            summary: "项目 A 使用 PostgreSQL",
+            reason: "new unrelated project starts",
+            turnIds: projectATurns.map((turn) => turn.id)
+          };
+        }
+        return {
+          status: "partial",
+          shouldMergeBackward: false,
+          confidence: 0.4,
+          title: "项目 A 数据库",
+          summary: turns.map((turn) => turn.content).join(" / "),
+          reason: "topic still open"
+        };
+      }
+    };
+    const service = createMemoryService(store, {
+      topicBuilder: new SlidingTopicBuilder(detector, { initialSize: 3, stepSize: 1, maxSize: 8, minConfidence: 0.7 })
+    });
+
+    const first = await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 使用 MySQL", ...scope });
+    const second = await service.ingestTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 已迁移到 PostgreSQL",
+      ...scope
+    });
+    const closed = await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 B 使用 Redis", ...scope });
+
+    expect(first.memories).toEqual([]);
+    expect(second.memories).toEqual([]);
+    expect(closed.memories[0]).toMatchObject({ level: "topic", subject: "项目 A", object: "项目 A 使用 PostgreSQL" });
+    expect(closed.memories[0].sourceTurnIds).toEqual([first.turn.id, second.turn.id]);
+    expect(
+      store.listTopicSegments(scope).find((topic) => topic.status === "partial" && topic.sessionId === "s1")?.turnIds
+    ).toEqual([closed.turn.id]);
+  });
+
+  it("forces the open buffer to close when it reaches max size", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const service = createMemoryService(store, {
+      topicBuilder: new SlidingTopicBuilder(
+        {
+          detect(turns) {
+            return {
+              status: "partial",
+              shouldMergeBackward: false,
+              confidence: 0.5,
+              title: "项目 A 数据库",
+              summary: turns.map((turn) => turn.content).join(" / "),
+              reason: "waiting for more context"
+            };
+          }
+        },
+        { initialSize: 2, stepSize: 1, maxSize: 2, minConfidence: 0.7 }
+      )
+    });
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+
+    await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 使用 MySQL", ...scope });
+    const result = await service.ingestTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 已迁移到 PostgreSQL",
+      ...scope
+    });
+
+    expect(result.topic).toMatchObject({ status: "complete", reason: "max window size reached" });
+    expect(result.memories[0]).toMatchObject({ level: "topic", subject: "项目 A" });
+  });
+
   it("expands the L0 sliding window backward and creates topic memory", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };

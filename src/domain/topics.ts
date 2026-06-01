@@ -49,50 +49,93 @@ export class SlidingTopicBuilder implements TopicBuilder {
 
   async build(store: MemoryStore, scope: Scope, sessionId: string): Promise<TopicSegment | null> {
     const allTurns = store.recentTurns({ ...scope, sessionId }, this.config.maxSize);
-    if (allTurns.length === 0) {
+    const latest = allTurns.at(-1);
+    if (!latest) {
       return null;
     }
 
-    let size = Math.min(this.config.initialSize, allTurns.length);
-    let lastDecision: TopicDetectionDecision | null = null;
-    let lastWindow = allTurns.slice(-size);
+    const openTopic = findOpenTopic(store, scope, sessionId);
+    const candidateTurnIds = Array.from(new Set([...(openTopic?.turnIds ?? []), latest.id])).slice(-this.config.maxSize);
+    const candidateTurns = candidateTurnIds
+      .map((id) => allTurns.find((turn) => turn.id === id))
+      .filter((turn): turn is ConversationTurn => Boolean(turn))
+      .filter((turn) => !isNoise(turn.content));
 
-    while (size <= this.config.maxSize) {
-      const window = allTurns.slice(-size);
-      lastWindow = window;
-      const decision = await this.detector.detect(window);
-      lastDecision = decision;
-
-      if (decision.status === "noise") {
-        return this.persist(store, scope, sessionId, window, decision);
-      }
-      if (decision.status === "complete" && decision.confidence >= this.config.minConfidence) {
-        return this.persist(store, scope, sessionId, window, decision);
-      }
-      if (!decision.shouldMergeBackward || size >= this.config.maxSize || size >= allTurns.length) {
-        break;
-      }
-      size = Math.min(size + this.config.stepSize, this.config.maxSize, allTurns.length);
+    if (candidateTurns.length === 0) {
+      return this.persistSegment(store, scope, sessionId, [latest], {
+        status: "noise",
+        shouldMergeBackward: false,
+        confidence: 0.9,
+        reason: "window only contains noise"
+      });
     }
 
-    if (!lastDecision) {
-      return null;
+    const decision = await this.detector.detect(candidateTurns);
+    if (decision.status === "noise") {
+      return this.persistSegment(store, scope, sessionId, candidateTurns, decision, openTopic);
     }
-    return this.persist(store, scope, sessionId, lastWindow, { ...lastDecision, status: "partial" });
+
+    if (decision.status === "complete" && decision.confidence >= this.config.minConfidence) {
+      return this.closeTopic(store, scope, sessionId, candidateTurns, decision, openTopic);
+    }
+
+    if (candidateTurns.length >= this.config.maxSize) {
+      return this.closeTopic(
+        store,
+        scope,
+        sessionId,
+        candidateTurns,
+        {
+          ...decision,
+          status: "complete",
+          confidence: Math.max(decision.confidence, this.config.minConfidence),
+          reason: "max window size reached"
+        },
+        openTopic
+      );
+    }
+
+    return this.persistSegment(store, scope, sessionId, candidateTurns, { ...decision, status: "partial" }, openTopic);
   }
 
-  private persist(
+  private closeTopic(
     store: MemoryStore,
     scope: Scope,
     sessionId: string,
     turns: ConversationTurn[],
-    decision: TopicDetectionDecision
+    decision: TopicDetectionDecision,
+    openTopic: TopicSegment | null
+  ): TopicSegment {
+    const closeTurnIds = decision.turnIds?.length ? decision.turnIds : turns.map((turn) => turn.id);
+    const closedTurns = turns.filter((turn) => closeTurnIds.includes(turn.id));
+    const remainingTurns = turns.filter((turn) => !closeTurnIds.includes(turn.id));
+    const closed = this.persistSegment(store, scope, sessionId, closedTurns, decision, openTopic);
+    if (remainingTurns.length > 0) {
+      this.persistSegment(store, scope, sessionId, remainingTurns, {
+        status: "partial",
+        shouldMergeBackward: false,
+        confidence: 0.5,
+        title: inferTitle(remainingTurns),
+        summary: remainingTurns.map((turn) => turn.content).join("\n"),
+        reason: "new topic buffer started after boundary"
+      });
+    }
+    return closed;
+  }
+
+  private persistSegment(
+    store: MemoryStore,
+    scope: Scope,
+    sessionId: string,
+    turns: ConversationTurn[],
+    decision: TopicDetectionDecision,
+    existingTopic?: TopicSegment | null
   ): TopicSegment {
     const turnIds = decision.turnIds?.length ? decision.turnIds : turns.map((turn) => turn.id);
     const title = decision.title ?? inferTitle(turns);
     const summary = decision.summary ?? turns.map((turn) => turn.content).join("\n");
     const fingerprint = topicFingerprintWithSession(scope, sessionId, title, summary);
-    const existing = store.getTopicSegmentByFingerprint(fingerprint);
+    const existing = existingTopic ?? store.getTopicSegmentByFingerprint(fingerprint);
     if (existing) {
       return store.updateTopicSegment(existing.id, {
         title,
@@ -149,7 +192,8 @@ const llmTopicSchema = z.object({
   confidence: z.number().min(0).max(1),
   title: z.string().optional(),
   summary: z.string().optional(),
-  reason: z.string().min(1)
+  reason: z.string().min(1),
+  turnIds: z.array(z.string()).optional()
 });
 
 export class LlmTopicDetector implements TopicDetector {
@@ -158,7 +202,7 @@ export class LlmTopicDetector implements TopicDetector {
   async detect(turns: ConversationTurn[]): Promise<TopicDetectionDecision> {
     const raw = await this.client.complete(
       JSON.stringify({
-        task: "Decide whether these turns form a complete memory topic. Return strict JSON.",
+        task: "Decide whether the buffered session turns should stay open, close as a complete topic, or be treated as noise. If a new unrelated instruction starts, return status=complete and set turnIds to only the turns that should be closed.",
         turns
       })
     );
@@ -237,6 +281,15 @@ function inferTopicSubject(topic: TopicSegment): string {
 function inferTitle(turns: ConversationTurn[]): string {
   const latest = turns.at(-1);
   return latest ? latest.content.trim().slice(0, 80) : "Untitled topic";
+}
+
+function findOpenTopic(store: MemoryStore, scope: Scope, sessionId: string): TopicSegment | null {
+  return (
+    store
+      .listTopicSegments(scope)
+      .filter((topic) => topic.sessionId === sessionId && topic.status === "partial")
+      .at(-1) ?? null
+  );
 }
 
 export type TopicDraft = CreateTopicSegmentInput;
