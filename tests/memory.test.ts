@@ -16,7 +16,8 @@ import {
 import { extractMemories } from "../src/domain/extractor.js";
 import { HybridMemoryExtractor, LlmMemoryExtractor, RuleBasedMemoryExtractor } from "../src/domain/extractors.js";
 import { runDreaming } from "../src/domain/dreaming.js";
-import { ModelProjectMemoryBuilder, rebuildProjectMemories } from "../src/domain/project-memory.js";
+import { loadProjectBuildSchedulerConfig, runScheduledProjectBuild } from "../src/application/project-scheduler.js";
+import { ModelProjectMemoryBuilder, buildProjectTopicInputs, rebuildProjectMemories } from "../src/domain/project-memory.js";
 import { RuleBasedMemoryResolver, resolveMemory } from "../src/domain/resolver.js";
 import { searchMemories } from "../src/domain/search.js";
 import { SlidingTopicBuilder } from "../src/domain/topics.js";
@@ -1337,6 +1338,124 @@ describe("memory search", () => {
 });
 
 describe("project memory and dreaming", () => {
+  it("passes structured topic inputs into the L2 project extractor", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const topic = repo.createMemory({
+      level: "topic",
+      type: "topic",
+      subject: "项目 A",
+      predicate: "topic",
+      object: "项目 A 决定使用 SQLite",
+      summary: "项目 A 决定使用 SQLite",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope,
+      metadata: {
+        topicType: "project_work",
+        entities: ["项目 A"],
+        decisions: ["使用 SQLite"],
+        tasks: ["实现 L2 定时任务"],
+        preferences: []
+      }
+    });
+
+    expect(buildProjectTopicInputs([topic])).toEqual([
+      expect.objectContaining({
+        id: topic.id,
+        summary: "项目 A 决定使用 SQLite",
+        topicType: "project_work",
+        entities: ["项目 A"],
+        decisions: ["使用 SQLite"],
+        tasks: ["实现 L2 定时任务"]
+      })
+    ]);
+
+    await rebuildProjectMemories(repo, scope, {
+      extract(input) {
+        expect(input.topicInputs).toEqual([
+          expect.objectContaining({
+            id: topic.id,
+            topicType: "project_work",
+            entities: ["项目 A"],
+            decisions: ["使用 SQLite"],
+            tasks: ["实现 L2 定时任务"]
+          })
+        ]);
+        return [];
+      }
+    });
+  });
+
+  it("runs scheduled project builds for scopes with active topic memories", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scopeA = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: { team: "a" } };
+    const scopeB = { mis: "u2", source: "test", agent: "agent", channel: "default", metadata: { team: "b" } };
+    repo.createMemory({
+      level: "topic",
+      type: "topic",
+      subject: "项目 A",
+      predicate: "topic",
+      object: "项目 A",
+      summary: "项目 A",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scopeA
+    });
+    repo.createMemory({
+      level: "topic",
+      type: "topic",
+      subject: "项目 B",
+      predicate: "topic",
+      object: "项目 B",
+      summary: "项目 B",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t2"],
+      ...scopeB
+    });
+    repo.createMemory({
+      level: "topic",
+      type: "topic",
+      subject: "旧项目",
+      predicate: "topic",
+      object: "旧项目",
+      summary: "旧项目",
+      confidence: 0.8,
+      status: "deleted",
+      supersedesId: null,
+      sourceTurnIds: ["t3"],
+      ...scopeB
+    });
+
+    const scopesRun: string[] = [];
+    const service = createMemoryService(repo, {
+      projectMemoryBuilder: {
+        rebuild(_store, scope) {
+          scopesRun.push(`${scope.mis}:${scope.metadata.team as string}`);
+          return [];
+        }
+      }
+    });
+
+    const result = await runScheduledProjectBuild(service);
+
+    expect(result.scopesRun).toBe(2);
+    expect(result.errors).toEqual([]);
+    expect(scopesRun.sort()).toEqual(["u1:a", "u2:b"]);
+    expect(loadProjectBuildSchedulerConfig({ PROJECT_BUILD_ENABLED: "true", PROJECT_BUILD_INTERVAL_MS: "60000" })).toEqual({
+      enabled: true,
+      intervalMs: 60000
+    });
+  });
+
   it("builds L2 project memory from topic memories with a model extractor", async () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);

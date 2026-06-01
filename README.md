@@ -240,6 +240,15 @@ LLM_API_KEY=...
 LLM_MODEL=...
 ```
 
+Project extraction can also run as a background scheduled job:
+
+```bash
+PROJECT_BUILD_ENABLED=true
+PROJECT_BUILD_INTERVAL_MS=300000
+```
+
+The job scans active topic memories, groups their scopes, and runs the L2 project builder for each scope.
+
 Topic buffering can be tuned with:
 
 ```bash
