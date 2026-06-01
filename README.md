@@ -10,7 +10,7 @@ oh-my-memory records conversation turns, groups them into topics, turns project 
 - Groups session turns into topics with a streaming buffer
 - Builds project memories from topics through an offline project run
 - Keeps memories scoped by `mis / source / agent / channel`
-- Searches active project and global memories
+- Searches active topic, project, and global memories
 - Supports local SQLite persistence
 - Supports CLI and HTTP ingestion
 - Supports optional embedding-based search
@@ -55,7 +55,9 @@ PORT=3001 MEMORY_DB_PATH=memory.sqlite npm run dev
 curl -s http://localhost:3000/health
 ```
 
-### Write a Turn
+### Ingest Turns
+
+`POST /turns` appends one conversation turn to a session. The service keeps an open topic buffer and closes it when a topic boundary is detected or the configured maximum window is reached.
 
 ```bash
 curl -s http://localhost:3000/turns \
@@ -81,6 +83,22 @@ curl -s http://localhost:3000/turns \
     "sessionId": "s1",
     "role": "user",
     "content": "项目 A 已迁移到 PostgreSQL",
+    "mis": "u1",
+    "source": "local",
+    "agent": "demo",
+    "channel": "default",
+    "metadata": {}
+  }'
+```
+
+### Flush a Session Topic
+
+Use this when a chat/session ends and you want the latest open topic to become searchable immediately.
+
+```bash
+curl -s -X POST http://localhost:3000/sessions/s1/topics/flush \
+  -H 'content-type: application/json' \
+  -d '{
     "mis": "u1",
     "source": "local",
     "agent": "demo",
@@ -139,6 +157,8 @@ curl -s -X POST http://localhost:3000/dreaming/run \
 ```
 
 ### Run Project Extraction
+
+`POST /projects/run` runs the offline project-memory builder. It reads active topic memories and extracts stable project memories.
 
 ```bash
 curl -s -X POST http://localhost:3000/projects/run \

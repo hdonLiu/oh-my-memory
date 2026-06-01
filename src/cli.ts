@@ -20,7 +20,8 @@ export async function runCli(argv: string[]): Promise<CliResult> {
       const input = turnFromOptions(parsed);
       const service = createMemoryService(new SqliteMemoryStore(createDatabase(dbPath)));
       const result = await service.ingestTurn(input);
-      return ok({ turn: result.turn, memories: result.memories });
+      const flushed = await service.flushSessionTopic(toScope(input), input.sessionId);
+      return ok({ turn: result.turn, memories: flushed.memories });
     }
 
     if (command === "import") {
@@ -37,13 +38,19 @@ export async function runCli(argv: string[]): Promise<CliResult> {
       const service = createMemoryService(new SqliteMemoryStore(createDatabase(dbPath)));
       let success = 0;
       const failures: Array<{ index: number; error: string }> = [];
+      const sessionsToFlush = new Map<string, CreateTurnInput>();
       for (const [index, record] of records.entries()) {
         try {
-          await service.ingestTurn(validateTurn(record));
+          const input = validateTurn(record);
+          await service.ingestTurn(input);
+          sessionsToFlush.set(sessionFlushKey(input), input);
           success += 1;
         } catch (error) {
           failures.push({ index, error: error instanceof Error ? error.message : "unknown error" });
         }
+      }
+      for (const input of sessionsToFlush.values()) {
+        await service.flushSessionTopic(toScope(input), input.sessionId);
       }
       return {
         exitCode: failures.length > 0 ? 1 : 0,
@@ -56,6 +63,20 @@ export async function runCli(argv: string[]): Promise<CliResult> {
   } catch (error) {
     return fail(error instanceof Error ? error.message : "unknown error");
   }
+}
+
+function toScope(input: CreateTurnInput): Omit<CreateTurnInput, "sessionId" | "role" | "content"> {
+  return {
+    mis: input.mis,
+    source: input.source,
+    agent: input.agent,
+    channel: input.channel,
+    metadata: input.metadata
+  };
+}
+
+function sessionFlushKey(input: CreateTurnInput): string {
+  return [input.mis, input.source, input.agent, input.channel, input.sessionId].join("\0");
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {

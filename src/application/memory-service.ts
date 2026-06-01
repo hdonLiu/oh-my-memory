@@ -9,8 +9,19 @@ import {
 } from "../domain/project-memory.js";
 import { RuleBasedMemoryResolver, type MemoryResolver } from "../domain/resolver.js";
 import { searchMemories, type SearchInput, type SearchResult } from "../domain/search.js";
-import { SlidingTopicBuilder, topicToMemoryDraft, type TopicBuilder } from "../domain/topics.js";
-import type { ConversationTurn, CreateTurnInput, Memory, MemoryStatus, Scope, TopicSegment } from "../domain/types.js";
+import { HybridTopicBoundaryDetector, LlmTopicBoundaryDetector, RuleBasedTopicBoundaryDetector } from "../domain/topic-boundary.js";
+import { LlmTopicMemoryGenerator, RuleBasedTopicMemoryGenerator, topicMemoryUnitToDraft } from "../domain/topic-memory.js";
+import { SlidingTopicBuilder, type TopicBuilder } from "../domain/topics.js";
+import type {
+  ConversationTurn,
+  CreateMemoryInput,
+  CreateTurnInput,
+  Memory,
+  MemoryStatus,
+  Scope,
+  TopicSegment,
+  TopicType
+} from "../domain/types.js";
 import type { MemoryStore } from "../storage/store.js";
 
 export interface IngestTurnResult {
@@ -21,6 +32,7 @@ export interface IngestTurnResult {
 
 export interface MemoryService {
   ingestTurn(input: CreateTurnInput): Promise<IngestTurnResult>;
+  flushSessionTopic(scope: Scope, sessionId: string): Promise<{ topic: TopicSegment | null; memories: Memory[] }>;
   runProjectBuild(scope: Scope): Promise<{ createdOrUpdated: Memory[] }>;
   search(input: SearchInput): Promise<{ results: SearchResult[] }>;
   listMemories(scope: Partial<Scope>): { memories: Memory[] };
@@ -42,7 +54,7 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
   const resolver = options.resolver ?? new RuleBasedMemoryResolver();
   const projectMemoryBuilder = options.projectMemoryBuilder ?? createDefaultProjectMemoryBuilder(resolver);
   const compressor = options.compressor ?? new RuleBasedMemoryCompressor();
-  const topicBuilder = options.topicBuilder ?? new SlidingTopicBuilder();
+  const topicBuilder = options.topicBuilder ?? createDefaultTopicBuilder();
   const embeddingProvider = options.embeddingProvider;
   const embeddingIndex = options.embeddingIndex;
 
@@ -54,12 +66,25 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
       if (!topic || topic.status !== "complete") {
         return { turn, topic, memories: [] };
       }
-      const topicMemory = resolver.resolve(store, topicToMemoryDraft(topic));
+      const topicMemory = resolver.resolve(store, topicToDraftFromSegment(topic));
       const memories = [topicMemory];
       if (embeddingProvider && embeddingIndex) {
         await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
       }
       return { turn, topic, memories };
+    },
+
+    async flushSessionTopic(scope, sessionId) {
+      const topic = await topicBuilder.flush(store, scope, sessionId);
+      if (!topic || topic.status !== "complete") {
+        return { topic, memories: [] };
+      }
+      const topicMemory = resolver.resolve(store, topicToDraftFromSegment(topic));
+      const memories = [topicMemory];
+      if (embeddingProvider && embeddingIndex) {
+        await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
+      }
+      return { topic, memories };
     },
 
     async runProjectBuild(scope) {
@@ -167,4 +192,61 @@ function createDefaultProjectMemoryBuilder(resolver: MemoryResolver): ProjectMem
     new LlmProjectMemoryExtractor(new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model })),
     resolver
   );
+}
+
+function createDefaultTopicBuilder(): TopicBuilder {
+  const baseUrl = process.env.LLM_BASE_URL;
+  const apiKey = process.env.LLM_API_KEY;
+  const model = process.env.LLM_MODEL;
+  if (!baseUrl || !apiKey || !model) {
+    return new SlidingTopicBuilder(new RuleBasedTopicBoundaryDetector(), new RuleBasedTopicMemoryGenerator());
+  }
+  const client = new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model });
+  return new SlidingTopicBuilder(
+    new HybridTopicBoundaryDetector(new LlmTopicBoundaryDetector(client), new RuleBasedTopicBoundaryDetector()),
+    new LlmTopicMemoryGenerator(client)
+  );
+}
+
+function topicToDraftFromSegment(topic: TopicSegment): CreateMemoryInput {
+  return topicMemoryUnitToDraft(
+    {
+      title: topic.title,
+      summary: topic.summary,
+      topicType: toTopicType(topic.metadata.topicType),
+      entities: toStringArray(topic.metadata.entities),
+      decisions: toStringArray(topic.metadata.decisions),
+      tasks: toStringArray(topic.metadata.tasks),
+      preferences: toStringArray(topic.metadata.preferences),
+      confidence: topic.confidence,
+      reason: topic.reason,
+      evidenceTurnIds: topic.turnIds
+    },
+    {
+      sessionId: topic.sessionId,
+      mis: topic.mis,
+      source: topic.source,
+      agent: topic.agent,
+      channel: topic.channel,
+      metadata: topic.metadata
+    }
+  );
+}
+
+function toStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function toTopicType(value: unknown): TopicType {
+  const allowed = new Set<TopicType>([
+    "project_work",
+    "product_design",
+    "technical_decision",
+    "workflow",
+    "preference",
+    "personal_context",
+    "research",
+    "other"
+  ]);
+  return typeof value === "string" && allowed.has(value as TopicType) ? (value as TopicType) : "other";
 }

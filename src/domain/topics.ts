@@ -1,126 +1,158 @@
 import { createHash } from "node:crypto";
-import { z } from "zod";
-import type { ConversationTurn, CreateMemoryInput, CreateTopicSegmentInput, Scope, TopicSegment, TopicStatus } from "./types.js";
+import type { CreateMemoryInput, ConversationTurn, Scope, TopicSegment, TopicStatus } from "./types.js";
 import type { MemoryStore } from "../storage/store.js";
 import { isNoise } from "./text.js";
-import type { LlmCompletionClient } from "./extractors.js";
+import {
+  RuleBasedTopicBoundaryDetector,
+  type TopicBoundaryDecision,
+  type TopicBoundaryDetector
+} from "./topic-boundary.js";
+import {
+  RuleBasedTopicMemoryGenerator,
+  topicMemoryUnitToDraft,
+  type TopicMemoryGenerator,
+  type TopicMemoryUnit
+} from "./topic-memory.js";
 
 export interface TopicWindowConfig {
-  initialSize: number;
-  stepSize: number;
   maxSize: number;
   minConfidence: number;
-}
-
-export interface TopicDetectionDecision {
-  status: TopicStatus;
-  shouldMergeBackward: boolean;
-  confidence: number;
-  title?: string;
-  summary?: string;
-  reason: string;
-  turnIds?: string[];
-}
-
-export interface TopicDetector {
-  detect(turns: ConversationTurn[]): Promise<TopicDetectionDecision> | TopicDetectionDecision;
+  excludeLastTurnForBoundary: boolean;
+  excludeLastTurnThreshold: number;
 }
 
 export interface TopicBuilder {
   build(store: MemoryStore, scope: Scope, sessionId: string): Promise<TopicSegment | null> | TopicSegment | null;
+  flush(store: MemoryStore, scope: Scope, sessionId: string): Promise<TopicSegment | null> | TopicSegment | null;
 }
 
 const defaultConfig: TopicWindowConfig = {
-  initialSize: 8,
-  stepSize: 4,
   maxSize: 24,
-  minConfidence: 0.7
+  minConfidence: 0.7,
+  excludeLastTurnForBoundary: true,
+  excludeLastTurnThreshold: 10
 };
 
 export class SlidingTopicBuilder implements TopicBuilder {
   private readonly config: TopicWindowConfig;
 
   constructor(
-    private readonly detector: TopicDetector = new RuleBasedTopicDetector(),
+    private readonly boundaryDetector: TopicBoundaryDetector = new RuleBasedTopicBoundaryDetector(),
+    private readonly topicMemoryGenerator: TopicMemoryGenerator = new RuleBasedTopicMemoryGenerator(),
     config: Partial<TopicWindowConfig> = {}
   ) {
     this.config = { ...defaultConfig, ...config };
   }
 
   async build(store: MemoryStore, scope: Scope, sessionId: string): Promise<TopicSegment | null> {
-    const allTurns = store.recentTurns({ ...scope, sessionId }, this.config.maxSize);
-    const latest = allTurns.at(-1);
-    if (!latest) {
+    const latest = store.recentTurns({ ...scope, sessionId }, 1).at(-1);
+    if (!latest || isNoise(latest.content)) {
       return null;
     }
 
     const openTopic = findOpenTopic(store, scope, sessionId);
-    const candidateTurnIds = Array.from(new Set([...(openTopic?.turnIds ?? []), latest.id])).slice(-this.config.maxSize);
-    const candidateTurns = candidateTurnIds
-      .map((id) => allTurns.find((turn) => turn.id === id))
-      .filter((turn): turn is ConversationTurn => Boolean(turn))
-      .filter((turn) => !isNoise(turn.content));
-
-    if (candidateTurns.length === 0) {
-      return this.persistSegment(store, scope, sessionId, [latest], {
-        status: "noise",
-        shouldMergeBackward: false,
-        confidence: 0.9,
-        reason: "window only contains noise"
-      });
+    const existingTurns = openTopic ? resolveTurns(store, scope, sessionId, openTopic.turnIds) : [];
+    if (existingTurns.length === 0) {
+      return this.persistPartial(store, scope, sessionId, [latest], "new session topic buffer");
     }
 
-    const decision = await this.detector.detect(candidateTurns);
-    if (decision.status === "noise") {
-      return this.persistSegment(store, scope, sessionId, candidateTurns, decision, openTopic);
-    }
+    const boundary = await this.boundaryDetector.detectBoundary({
+      existingTurns: this.boundaryDetectionTurns(existingTurns),
+      newTurn: latest
+    });
 
-    if (decision.status === "complete" && decision.confidence >= this.config.minConfidence) {
-      return this.closeTopic(store, scope, sessionId, candidateTurns, decision, openTopic);
-    }
-
-    if (candidateTurns.length >= this.config.maxSize) {
-      return this.closeTopic(
+    if (boundary.shouldClose && boundary.confidence >= this.config.minConfidence) {
+      const closed = await this.closeTurns(
         store,
         scope,
         sessionId,
-        candidateTurns,
-        {
-          ...decision,
-          status: "complete",
-          confidence: Math.max(decision.confidence, this.config.minConfidence),
-          reason: "max window size reached"
-        },
+        selectClosedTurns(existingTurns, boundary),
+        boundary.reason,
         openTopic
       );
+      const carryOver = selectCarryOverTurns([...existingTurns, latest], latest, boundary);
+      if (carryOver.length > 0) {
+        this.persistPartial(store, scope, sessionId, carryOver, "new topic buffer started after boundary");
+      }
+      return closed;
     }
 
-    return this.persistSegment(store, scope, sessionId, candidateTurns, { ...decision, status: "partial" }, openTopic);
+    const nextTurns = [...existingTurns, latest].slice(-this.config.maxSize);
+    if (nextTurns.length >= this.config.maxSize) {
+      return this.closeTurns(store, scope, sessionId, nextTurns, "max window size reached", openTopic);
+    }
+
+    return this.persistPartial(store, scope, sessionId, nextTurns, boundary.reason, openTopic);
   }
 
-  private closeTopic(
+  async flush(store: MemoryStore, scope: Scope, sessionId: string): Promise<TopicSegment | null> {
+    const openTopic = findOpenTopic(store, scope, sessionId);
+    if (!openTopic) {
+      return null;
+    }
+    const turns = resolveTurns(store, scope, sessionId, openTopic.turnIds);
+    if (turns.length === 0) {
+      return null;
+    }
+    return this.closeTurns(store, scope, sessionId, turns, "session topic flush", openTopic);
+  }
+
+  private boundaryDetectionTurns(turns: ConversationTurn[]): ConversationTurn[] {
+    if (!this.config.excludeLastTurnForBoundary || turns.length <= this.config.excludeLastTurnThreshold) {
+      return turns;
+    }
+    return turns.slice(0, -1);
+  }
+
+  private async closeTurns(
     store: MemoryStore,
     scope: Scope,
     sessionId: string,
     turns: ConversationTurn[],
-    decision: TopicDetectionDecision,
-    openTopic: TopicSegment | null
+    reason: string,
+    existingTopic?: TopicSegment | null
+  ): Promise<TopicSegment> {
+    const unit = await this.topicMemoryGenerator.generate({ sessionId, turns, reason });
+    return this.persistSegment(
+      store,
+      scope,
+      sessionId,
+      turns,
+      {
+        status: "complete",
+        title: unit.title,
+        summary: unit.summary,
+        confidence: unit.confidence,
+        reason,
+        metadata: topicUnitMetadata(unit)
+      },
+      existingTopic
+    );
+  }
+
+  private persistPartial(
+    store: MemoryStore,
+    scope: Scope,
+    sessionId: string,
+    turns: ConversationTurn[],
+    reason: string,
+    existingTopic?: TopicSegment | null
   ): TopicSegment {
-    const closeTurnIds = decision.turnIds?.length ? decision.turnIds : turns.map((turn) => turn.id);
-    const closedTurns = turns.filter((turn) => closeTurnIds.includes(turn.id));
-    const remainingTurns = turns.filter((turn) => !closeTurnIds.includes(turn.id));
-    const closed = this.persistSegment(store, scope, sessionId, closedTurns, decision, openTopic);
-    if (remainingTurns.length > 0) {
-      this.persistSegment(store, scope, sessionId, remainingTurns, {
+    return this.persistSegment(
+      store,
+      scope,
+      sessionId,
+      turns,
+      {
         status: "partial",
-        shouldMergeBackward: false,
+        title: inferTitle(turns),
+        summary: turns.map((turn) => turn.content).join("\n"),
         confidence: 0.5,
-        title: inferTitle(remainingTurns),
-        summary: remainingTurns.map((turn) => turn.content).join("\n"),
-        reason: "new topic buffer started after boundary"
-      });
-    }
-    return closed;
+        reason,
+        metadata: {}
+      },
+      existingTopic
+    );
   }
 
   private persistSegment(
@@ -128,104 +160,33 @@ export class SlidingTopicBuilder implements TopicBuilder {
     scope: Scope,
     sessionId: string,
     turns: ConversationTurn[],
-    decision: TopicDetectionDecision,
+    input: {
+      status: TopicStatus;
+      title: string;
+      summary: string;
+      confidence: number;
+      reason: string;
+      metadata: Record<string, unknown>;
+    },
     existingTopic?: TopicSegment | null
   ): TopicSegment {
-    const turnIds = decision.turnIds?.length ? decision.turnIds : turns.map((turn) => turn.id);
-    const title = decision.title ?? inferTitle(turns);
-    const summary = decision.summary ?? turns.map((turn) => turn.content).join("\n");
-    const fingerprint = topicFingerprintWithSession(scope, sessionId, title, summary);
+    const turnIds = turns.map((turn) => turn.id);
+    const fingerprint = topicFingerprintWithSession(scope, sessionId, input.title, input.summary);
     const existing = existingTopic ?? store.getTopicSegmentByFingerprint(fingerprint);
-    if (existing) {
-      return store.updateTopicSegment(existing.id, {
-        title,
-        summary,
-        status: decision.status,
-        confidence: decision.confidence,
-        turnIds,
-        reason: decision.reason,
-        fingerprint,
-        sessionId,
-        ...scope
-      });
-    }
-    return store.createTopicSegment({
+    const patch = {
       sessionId,
-      title,
-      summary,
-      status: decision.status,
-      confidence: decision.confidence,
+      title: input.title,
+      summary: input.summary,
+      status: input.status,
+      confidence: input.confidence,
       turnIds,
-      reason: decision.reason,
+      reason: input.reason,
       fingerprint,
-      projectMemoryIds: [],
-      ...scope
-    });
-  }
-}
-
-export class RuleBasedTopicDetector implements TopicDetector {
-  detect(turns: ConversationTurn[]): TopicDetectionDecision {
-    const latest = turns.at(-1);
-    if (!latest || isNoise(latest.content)) {
-      return {
-        status: "noise",
-        shouldMergeBackward: false,
-        confidence: 0.9,
-        reason: "latest turn is noise"
-      };
-    }
-    return {
-      status: "complete",
-      shouldMergeBackward: false,
-      confidence: 0.8,
-      title: inferTitle(turns),
-      summary: latest.content,
-      reason: "rule-based fallback treats valuable latest turn as a complete topic"
+      projectMemoryIds: existingTopic?.projectMemoryIds ?? [],
+      ...scope,
+      metadata: { ...scope.metadata, ...input.metadata }
     };
-  }
-}
-
-const llmTopicSchema = z.object({
-  status: z.enum(["complete", "partial", "noise"]),
-  shouldMergeBackward: z.boolean(),
-  confidence: z.number().min(0).max(1),
-  title: z.string().optional(),
-  summary: z.string().optional(),
-  reason: z.string().min(1),
-  turnIds: z.array(z.string()).optional()
-});
-
-export class LlmTopicDetector implements TopicDetector {
-  constructor(private readonly client: LlmCompletionClient) {}
-
-  async detect(turns: ConversationTurn[]): Promise<TopicDetectionDecision> {
-    const raw = await this.client.complete(
-      JSON.stringify({
-        task: "Decide whether the buffered session turns should stay open, close as a complete topic, or be treated as noise. If a new unrelated instruction starts, return status=complete and set turnIds to only the turns that should be closed.",
-        turns
-      })
-    );
-    try {
-      return llmTopicSchema.parse(JSON.parse(raw) as unknown);
-    } catch (error) {
-      throw new Error(`Invalid LLM topic detection response: ${error instanceof Error ? error.message : "unknown"}`);
-    }
-  }
-}
-
-export class HybridTopicDetector implements TopicDetector {
-  constructor(
-    private readonly primary: TopicDetector,
-    private readonly fallback: TopicDetector
-  ) {}
-
-  async detect(turns: ConversationTurn[]): Promise<TopicDetectionDecision> {
-    try {
-      return await this.primary.detect(turns);
-    } catch {
-      return this.fallback.detect(turns);
-    }
+    return existing ? store.updateTopicSegment(existing.id, patch) : store.createTopicSegment(patch);
   }
 }
 
@@ -240,42 +201,65 @@ export function topicFingerprintWithSession(scope: Scope, sessionId: string, tit
 }
 
 export function topicToMemoryDraft(topic: TopicSegment): CreateMemoryInput {
-  const subject = inferTopicSubject(topic);
-  return {
-    level: "topic",
-    type: "topic",
-    subject,
-    predicate: "topic",
-    object: topic.summary,
-    summary: topic.summary,
-    confidence: topic.confidence,
-    status: "active",
-    supersedesId: null,
-    sourceTurnIds: topic.turnIds,
-    mis: topic.mis,
-    source: topic.source,
-    agent: topic.agent,
-    channel: topic.channel,
-    metadata: {
-      ...topic.metadata,
-      topicId: topic.id,
-      sessionId: topic.sessionId,
+  return topicMemoryUnitToDraft(
+    {
       title: topic.title,
-      reason: topic.reason
+      summary: topic.summary,
+      topicType: (topic.metadata.topicType as TopicMemoryUnit["topicType"]) ?? "other",
+      entities: asStringArray(topic.metadata.entities),
+      decisions: asStringArray(topic.metadata.decisions),
+      tasks: asStringArray(topic.metadata.tasks),
+      preferences: asStringArray(topic.metadata.preferences),
+      confidence: topic.confidence,
+      reason: topic.reason,
+      evidenceTurnIds: topic.turnIds
+    },
+    {
+      sessionId: topic.sessionId,
+      mis: topic.mis,
+      source: topic.source,
+      agent: topic.agent,
+      channel: topic.channel,
+      metadata: topic.metadata
     }
+  );
+}
+
+function resolveTurns(store: MemoryStore, scope: Scope, sessionId: string, ids: string[]): ConversationTurn[] {
+  const byId = new Map(store.recentTurns({ ...scope, sessionId }, Math.max(ids.length + 5, 50)).map((turn) => [turn.id, turn]));
+  return ids.map((id) => byId.get(id)).filter((turn): turn is ConversationTurn => Boolean(turn));
+}
+
+function selectClosedTurns(existingTurns: ConversationTurn[], boundary: TopicBoundaryDecision): ConversationTurn[] {
+  if (!boundary.closedTurnIds?.length) {
+    return existingTurns;
+  }
+  return existingTurns.filter((turn) => boundary.closedTurnIds?.includes(turn.id));
+}
+
+function selectCarryOverTurns(
+  allTurns: ConversationTurn[],
+  latest: ConversationTurn,
+  boundary: TopicBoundaryDecision
+): ConversationTurn[] {
+  if (!boundary.carryOverTurnIds?.length) {
+    return [latest];
+  }
+  return allTurns.filter((turn) => boundary.carryOverTurnIds?.includes(turn.id));
+}
+
+function topicUnitMetadata(unit: TopicMemoryUnit): Record<string, unknown> {
+  return {
+    topicType: unit.topicType,
+    entities: unit.entities,
+    decisions: unit.decisions,
+    tasks: unit.tasks,
+    preferences: unit.preferences
   };
 }
 
-function inferTopicSubject(topic: TopicSegment): string {
-  const text = [topic.title, topic.summary].join("\n");
-  const project = text.match(/项目\s*\S+/u)?.[0].replace(/\s+/g, " ").trim();
-  if (project) {
-    return project;
-  }
-  if (/(?:我|用户)(?:喜欢|偏好)/u.test(text)) {
-    return "用户";
-  }
-  return topic.title;
+function asStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
 }
 
 function inferTitle(turns: ConversationTurn[]): string {
@@ -292,4 +276,16 @@ function findOpenTopic(store: MemoryStore, scope: Scope, sessionId: string): Top
   );
 }
 
-export type TopicDraft = CreateTopicSegmentInput;
+export interface TopicDetectionDecision {
+  status: TopicStatus;
+  shouldMergeBackward: boolean;
+  confidence: number;
+  title?: string;
+  summary?: string;
+  reason: string;
+  turnIds?: string[];
+}
+
+export interface TopicDetector {
+  detect(turns: ConversationTurn[]): Promise<TopicDetectionDecision> | TopicDetectionDecision;
+}

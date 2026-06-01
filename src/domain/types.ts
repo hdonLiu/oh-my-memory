@@ -1,4 +1,13 @@
 export type MemoryLevel = "topic" | "L2" | "L3";
+export type TopicType =
+  | "project_work"
+  | "product_design"
+  | "technical_decision"
+  | "workflow"
+  | "preference"
+  | "personal_context"
+  | "research"
+  | "other";
 export type MemoryType = "topic" | "fact" | "preference" | "decision" | "profile" | "project";
 export type MemoryStatus = "active" | "superseded" | "deleted";
 export type RelationType = "duplicate" | "update" | "contradict" | "support" | "related";
