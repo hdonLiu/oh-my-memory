@@ -9,7 +9,8 @@ import {
 } from "../domain/project-memory.js";
 import { RuleBasedMemoryResolver, type MemoryResolver } from "../domain/resolver.js";
 import { searchMemories, type SearchInput, type SearchResult } from "../domain/search.js";
-import { topicMemoryUnitToDraft } from "../domain/topic-memory.js";
+import { HybridTopicBoundaryDetector, LlmTopicBoundaryDetector, RuleBasedTopicBoundaryDetector } from "../domain/topic-boundary.js";
+import { LlmTopicMemoryGenerator, RuleBasedTopicMemoryGenerator, topicMemoryUnitToDraft } from "../domain/topic-memory.js";
 import { SlidingTopicBuilder, type TopicBuilder } from "../domain/topics.js";
 import type {
   ConversationTurn,
@@ -53,7 +54,7 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
   const resolver = options.resolver ?? new RuleBasedMemoryResolver();
   const projectMemoryBuilder = options.projectMemoryBuilder ?? createDefaultProjectMemoryBuilder(resolver);
   const compressor = options.compressor ?? new RuleBasedMemoryCompressor();
-  const topicBuilder = options.topicBuilder ?? new SlidingTopicBuilder();
+  const topicBuilder = options.topicBuilder ?? createDefaultTopicBuilder();
   const embeddingProvider = options.embeddingProvider;
   const embeddingIndex = options.embeddingIndex;
 
@@ -190,6 +191,20 @@ function createDefaultProjectMemoryBuilder(resolver: MemoryResolver): ProjectMem
   return new ModelProjectMemoryBuilder(
     new LlmProjectMemoryExtractor(new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model })),
     resolver
+  );
+}
+
+function createDefaultTopicBuilder(): TopicBuilder {
+  const baseUrl = process.env.LLM_BASE_URL;
+  const apiKey = process.env.LLM_API_KEY;
+  const model = process.env.LLM_MODEL;
+  if (!baseUrl || !apiKey || !model) {
+    return new SlidingTopicBuilder(new RuleBasedTopicBoundaryDetector(), new RuleBasedTopicMemoryGenerator());
+  }
+  const client = new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model });
+  return new SlidingTopicBuilder(
+    new HybridTopicBoundaryDetector(new LlmTopicBoundaryDetector(client), new RuleBasedTopicBoundaryDetector()),
+    new LlmTopicMemoryGenerator(client)
   );
 }
 

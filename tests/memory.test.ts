@@ -18,7 +18,7 @@ import { runDreaming } from "../src/domain/dreaming.js";
 import { ModelProjectMemoryBuilder, rebuildProjectMemories } from "../src/domain/project-memory.js";
 import { RuleBasedMemoryResolver, resolveMemory } from "../src/domain/resolver.js";
 import { searchMemories } from "../src/domain/search.js";
-import { SlidingTopicBuilder, type TopicDetector } from "../src/domain/topics.js";
+import { SlidingTopicBuilder } from "../src/domain/topics.js";
 import {
   HybridTopicBoundaryDetector,
   LlmTopicBoundaryDetector,
@@ -352,6 +352,23 @@ describe("session topic flush", () => {
   });
 });
 
+describe("default topic LLM wiring", () => {
+  it("keeps topic layer injectable without requiring network in tests", () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const service = createMemoryService(store, {
+      topicBuilder: new SlidingTopicBuilder(
+        { detectBoundary: () => ({ shouldClose: false, confidence: 0.8, reason: "test" }) },
+        new RuleBasedTopicMemoryGenerator()
+      )
+    });
+
+    expect(service).toMatchObject({
+      ingestTurn: expect.any(Function),
+      flushSessionTopic: expect.any(Function)
+    });
+  });
+});
+
 describe("embedding abstraction", () => {
   it("creates deterministic vectors and compares them with cosine similarity", async () => {
     const provider = new DeterministicEmbeddingProvider(16);
@@ -609,21 +626,19 @@ describe("memory application service", () => {
   it("builds sliding windows within the current session only", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
     const seenWindows: string[][] = [];
-    const detector: TopicDetector = {
-      detect(turns) {
+    const detector: TopicBoundaryDetector = {
+      detectBoundary({ existingTurns, newTurn }) {
+        const turns = [...existingTurns, newTurn];
         seenWindows.push(turns.map((turn) => `${turn.sessionId}:${turn.content}`));
         return {
-          status: turns.length >= 2 ? "complete" : "partial",
-          shouldMergeBackward: false,
+          shouldClose: turns.length >= 2,
           confidence: turns.length >= 2 ? 0.9 : 0.4,
-          title: "项目 A 数据库",
-          summary: turns.map((turn) => turn.content).join(" / "),
           reason: "test"
         };
       }
     };
     const service = createMemoryService(store, {
-      topicBuilder: new SlidingTopicBuilder(detector, { initialSize: 3, stepSize: 1, maxSize: 3, minConfidence: 0.7 })
+      topicBuilder: new SlidingTopicBuilder(detector, new RuleBasedTopicMemoryGenerator(), { maxSize: 3, minConfidence: 0.7 })
     });
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
@@ -727,33 +742,46 @@ describe("topic extraction layer", () => {
   it("closes the current session buffer when a new unrelated instruction starts", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
-    const detector: TopicDetector = {
-      detect(turns) {
-        const unrelated = turns.at(-1)?.content.includes("项目 B");
+    const detector: TopicBoundaryDetector = {
+      detectBoundary({ existingTurns, newTurn }) {
+        const unrelated = newTurn.content.includes("项目 B");
         if (unrelated) {
-          const projectATurns = turns.filter((turn) => turn.content.includes("项目 A"));
+          const projectATurns = existingTurns.filter((turn) => turn.content.includes("项目 A"));
           return {
-            status: "complete",
-            shouldMergeBackward: false,
+            shouldClose: true,
             confidence: 0.9,
-            title: "项目 A 数据库",
-            summary: "项目 A 使用 PostgreSQL",
             reason: "new unrelated project starts",
-            turnIds: projectATurns.map((turn) => turn.id)
+            closedTurnIds: projectATurns.map((turn) => turn.id)
           };
         }
         return {
-          status: "partial",
-          shouldMergeBackward: false,
+          shouldClose: false,
           confidence: 0.4,
-          title: "项目 A 数据库",
-          summary: turns.map((turn) => turn.content).join(" / "),
           reason: "topic still open"
         };
       }
     };
     const service = createMemoryService(store, {
-      topicBuilder: new SlidingTopicBuilder(detector, { initialSize: 3, stepSize: 1, maxSize: 8, minConfidence: 0.7 })
+      topicBuilder: new SlidingTopicBuilder(
+        detector,
+        {
+          generate(input) {
+            return {
+              title: "项目 A 数据库",
+              summary: "项目 A 使用 PostgreSQL",
+              topicType: "project_work",
+              entities: ["项目 A"],
+              decisions: [],
+              tasks: [],
+              preferences: [],
+              confidence: 0.9,
+              reason: input.reason,
+              evidenceTurnIds: input.turns.map((turn) => turn.id)
+            };
+          }
+        },
+        { maxSize: 8, minConfidence: 0.7 }
+      )
     });
 
     const first = await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 使用 MySQL", ...scope });
@@ -779,18 +807,16 @@ describe("topic extraction layer", () => {
     const service = createMemoryService(store, {
       topicBuilder: new SlidingTopicBuilder(
         {
-          detect(turns) {
+          detectBoundary() {
             return {
-              status: "partial",
-              shouldMergeBackward: false,
+              shouldClose: false,
               confidence: 0.5,
-              title: "项目 A 数据库",
-              summary: turns.map((turn) => turn.content).join(" / "),
               reason: "waiting for more context"
             };
           }
         },
-        { initialSize: 2, stepSize: 1, maxSize: 2, minConfidence: 0.7 }
+        new RuleBasedTopicMemoryGenerator(),
+        { maxSize: 2, minConfidence: 0.7 }
       )
     });
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
@@ -807,60 +833,57 @@ describe("topic extraction layer", () => {
     expect(result.memories[0]).toMatchObject({ level: "topic", subject: "项目 A" });
   });
 
-  it("expands the L0 sliding window backward and creates topic memory", async () => {
+  it("keeps growing the open L0 buffer until max window creates topic memory", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     const sizes: number[] = [];
-    const detector: TopicDetector = {
-      async detect(turns) {
-        sizes.push(turns.length);
+    const detector: TopicBoundaryDetector = {
+      async detectBoundary({ existingTurns, newTurn }) {
+        sizes.push([...existingTurns, newTurn].length);
         return {
-          status: turns.length >= 3 ? "complete" : "partial",
-          shouldMergeBackward: turns.length < 3,
-          confidence: turns.length >= 3 ? 0.9 : 0.4,
-          title: "项目 A 存储方案",
-          summary: "项目 A 已迁移到 PostgreSQL",
+          shouldClose: false,
+          confidence: 0.4,
           reason: "needs earlier context"
         };
       }
     };
     const service = createMemoryService(store, {
-      topicBuilder: new SlidingTopicBuilder(detector, { initialSize: 1, stepSize: 1, maxSize: 3, minConfidence: 0.7 })
+      topicBuilder: new SlidingTopicBuilder(detector, new RuleBasedTopicMemoryGenerator(), { maxSize: 3, minConfidence: 0.7 })
     });
 
     await service.ingestTurn({ sessionId: "s1", role: "user", content: "为什么？", ...scope });
     await service.ingestTurn({ sessionId: "s1", role: "assistant", content: "因为 MySQL 成本高", ...scope });
     const result = await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 已迁移到 PostgreSQL", ...scope });
 
-    expect(sizes.slice(-3)).toEqual([1, 2, 3]);
-    expect(result.topic).toMatchObject({ title: "项目 A 存储方案", status: "complete" });
+    expect(sizes.slice(-2)).toEqual([2, 3]);
+    expect(result.topic).toMatchObject({ status: "complete" });
     expect(result.memories[0]).toMatchObject({ level: "topic", subject: "项目 A" });
     expect(result.memories[0].sourceTurnIds).toEqual(result.topic?.turnIds);
     expect(store.listMemories(scope).map((memory): string => memory.level)).not.toContain("L1");
   });
 
-  it("skips extraction when the topic detector marks the window as noise", async () => {
+  it("skips extraction when the turn is noise", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
     const service = createMemoryService(store, {
       topicBuilder: new SlidingTopicBuilder(
         {
-          detect() {
+          detectBoundary() {
             return {
-              status: "noise",
-              shouldMergeBackward: false,
+              shouldClose: true,
               confidence: 0.95,
               reason: "small talk"
             };
           }
         },
-        { initialSize: 1, stepSize: 1, maxSize: 1, minConfidence: 0.7 }
+        new RuleBasedTopicMemoryGenerator(),
+        { maxSize: 1, minConfidence: 0.7 }
       )
     });
 
     const result = await service.ingestTurn({
       sessionId: "s1",
       role: "user",
-      content: "项目 A 使用 PostgreSQL",
+      content: "好的",
       mis: "u1",
       source: "test",
       agent: "agent",
@@ -868,45 +891,30 @@ describe("topic extraction layer", () => {
       metadata: {}
     });
 
-    expect(result.topic).toMatchObject({ status: "noise" });
+    expect(result.topic).toBeNull();
     expect(result.memories).toEqual([]);
     expect(store.listMemories()).toEqual([]);
   });
 
   it("reuses duplicate topic memories through resolver", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const service = createMemoryService(store, {
-      topicBuilder: new SlidingTopicBuilder(
-        {
-          detect(turns) {
-            return {
-              status: "complete",
-              shouldMergeBackward: false,
-              confidence: 0.9,
-              title: "项目 A 数据库",
-              summary: "项目 A 使用 PostgreSQL",
-              reason: "complete topic",
-              turnIds: turns.map((turn) => turn.id)
-            };
-          }
-        },
-        { initialSize: 1, stepSize: 1, maxSize: 1, minConfidence: 0.7 }
-      )
-    });
+    const service = createMemoryService(store);
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
-    const first = await service.ingestTurn({
+    await service.ingestTurn({
       sessionId: "s1",
       role: "user",
       content: "项目 A 使用 PostgreSQL",
       ...scope
     });
-    const duplicate = await service.ingestTurn({
-      sessionId: "s1",
+    const first = await service.flushSessionTopic(scope, "s1");
+    await service.ingestTurn({
+      sessionId: "s2",
       role: "user",
       content: "项目 A 使用 PostgreSQL",
       ...scope
     });
+    const duplicate = await service.flushSessionTopic(scope, "s2");
 
     expect(first.memories).toHaveLength(1);
     expect(duplicate.memories[0].id).toBe(first.memories[0].id);
