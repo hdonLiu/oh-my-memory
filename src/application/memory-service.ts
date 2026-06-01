@@ -23,6 +23,7 @@ import type {
   TopicType
 } from "../domain/types.js";
 import type { MemoryStore } from "../storage/store.js";
+import { loadTopicWindowConfig } from "./topic-config.js";
 
 export interface IngestTurnResult {
   turn: ConversationTurn;
@@ -33,6 +34,7 @@ export interface IngestTurnResult {
 export interface MemoryService {
   ingestTurn(input: CreateTurnInput): Promise<IngestTurnResult>;
   flushSessionTopic(scope: Scope, sessionId: string): Promise<{ topic: TopicSegment | null; memories: Memory[] }>;
+  listTopicSegments(scope: Partial<Scope> & { sessionId?: string; status?: TopicSegment["status"] }): { topics: TopicSegment[] };
   runProjectBuild(scope: Scope): Promise<{ createdOrUpdated: Memory[] }>;
   search(input: SearchInput): Promise<{ results: SearchResult[] }>;
   listMemories(scope: Partial<Scope>): { memories: Memory[] };
@@ -85,6 +87,14 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
         await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
       }
       return { topic, memories };
+    },
+
+    listTopicSegments(scope) {
+      const { sessionId, status, ...baseScope } = scope;
+      const topics = store
+        .listTopicSegments(baseScope)
+        .filter((topic) => (!sessionId || topic.sessionId === sessionId) && (!status || topic.status === status));
+      return { topics };
     },
 
     async runProjectBuild(scope) {
@@ -199,12 +209,13 @@ function createDefaultTopicBuilder(): TopicBuilder {
   const apiKey = process.env.LLM_API_KEY;
   const model = process.env.LLM_MODEL;
   if (!baseUrl || !apiKey || !model) {
-    return new SlidingTopicBuilder(new RuleBasedTopicBoundaryDetector(), new RuleBasedTopicMemoryGenerator());
+    return new SlidingTopicBuilder(new RuleBasedTopicBoundaryDetector(), new RuleBasedTopicMemoryGenerator(), loadTopicWindowConfig());
   }
   const client = new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model });
   return new SlidingTopicBuilder(
     new HybridTopicBoundaryDetector(new LlmTopicBoundaryDetector(client), new RuleBasedTopicBoundaryDetector()),
-    new LlmTopicMemoryGenerator(client)
+    new LlmTopicMemoryGenerator(client),
+    loadTopicWindowConfig()
   );
 }
 

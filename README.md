@@ -128,6 +128,14 @@ curl -s http://localhost:3000/search \
 curl -s 'http://localhost:3000/memories?mis=u1&source=local&agent=demo&channel=default'
 ```
 
+### Inspect Topic Segments
+
+Use this to debug the current open topic buffer or review closed topics.
+
+```bash
+curl -s 'http://localhost:3000/topics?mis=u1&source=local&agent=demo&channel=default&sessionId=s1&status=partial'
+```
+
 ### Update Memory Status
 
 ```bash
@@ -230,6 +238,15 @@ To enable offline project extraction, configure an OpenAI-compatible chat endpoi
 LLM_BASE_URL=https://api.openai.com/v1
 LLM_API_KEY=...
 LLM_MODEL=...
+```
+
+Topic buffering can be tuned with:
+
+```bash
+TOPIC_BUFFER_MAX_TURNS=24
+TOPIC_BOUNDARY_CONFIDENCE=0.7
+TOPIC_BOUNDARY_EXCLUDE_LAST_TURN=true
+TOPIC_BOUNDARY_EXCLUDE_THRESHOLD=10
 ```
 
 ## Development

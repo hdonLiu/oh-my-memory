@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createMemoryService } from "../src/application/memory-service.js";
+import { loadTopicWindowConfig } from "../src/application/topic-config.js";
 import { runCli } from "../src/cli.js";
 import {
   type EmbeddingIndex,
@@ -366,6 +367,63 @@ describe("default topic LLM wiring", () => {
       ingestTurn: expect.any(Function),
       flushSessionTopic: expect.any(Function)
     });
+  });
+});
+
+describe("topic configuration and debug api", () => {
+  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+
+  it("loads topic window config from environment values", () => {
+    expect(
+      loadTopicWindowConfig({
+        TOPIC_BUFFER_MAX_TURNS: "12",
+        TOPIC_BOUNDARY_CONFIDENCE: "0.82",
+        TOPIC_BOUNDARY_EXCLUDE_LAST_TURN: "false",
+        TOPIC_BOUNDARY_EXCLUDE_THRESHOLD: "7"
+      })
+    ).toEqual({
+      maxSize: 12,
+      minConfidence: 0.82,
+      excludeLastTurnForBoundary: false,
+      excludeLastTurnThreshold: 7
+    });
+  });
+
+  it("returns topic segments for debugging", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const app = buildServer(createMemoryService(store));
+
+    await app.inject({
+      method: "POST",
+      url: "/turns",
+      payload: { sessionId: "s1", role: "user", content: "项目 A 要做 debug api", ...scope }
+    });
+
+    const partial = await app.inject({
+      method: "GET",
+      url: "/topics?mis=u1&source=test&agent=agent&channel=default&sessionId=s1&status=partial"
+    });
+
+    expect(partial.statusCode).toBe(200);
+    expect(partial.json().topics).toEqual([
+      expect.objectContaining({
+        sessionId: "s1",
+        status: "partial",
+        summary: "项目 A 要做 debug api"
+      })
+    ]);
+
+    await app.inject({ method: "POST", url: "/sessions/s1/topics/flush", payload: scope });
+
+    const complete = await app.inject({
+      method: "GET",
+      url: "/topics?mis=u1&source=test&agent=agent&channel=default&sessionId=s1&status=complete"
+    });
+
+    expect(complete.statusCode).toBe(200);
+    expect(complete.json().topics).toEqual([expect.objectContaining({ sessionId: "s1", status: "complete" })]);
+
+    await app.close();
   });
 });
 
