@@ -25,6 +25,7 @@ import {
   RuleBasedTopicBoundaryDetector,
   type TopicBoundaryDetector
 } from "../src/domain/topic-boundary.js";
+import { LlmTopicMemoryGenerator, RuleBasedTopicMemoryGenerator, topicMemoryUnitToDraft } from "../src/domain/topic-memory.js";
 import { RuleBasedMemoryCompressor } from "../src/domain/dreaming.js";
 import { buildServer } from "../src/server.js";
 import { createDatabase } from "../src/storage/database.js";
@@ -139,6 +140,90 @@ describe("topic boundary detection", () => {
         }
       })
     ).resolves.toMatchObject({ reason: "fallback" });
+  });
+});
+
+describe("topic memory generation", () => {
+  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+
+  it("generates structured topic units from closed turns", async () => {
+    const generator = new RuleBasedTopicMemoryGenerator();
+    const unit = await generator.generate({
+      sessionId: "s1",
+      turns: [
+        {
+          id: "t1",
+          sessionId: "s1",
+          role: "user",
+          content: "项目 A 要实现 memory 系统",
+          createdAt: "2026-06-01T00:00:00.000Z",
+          ...scope
+        },
+        {
+          id: "t2",
+          sessionId: "s1",
+          role: "assistant",
+          content: "先实现 topic 层",
+          createdAt: "2026-06-01T00:01:00.000Z",
+          ...scope
+        }
+      ],
+      reason: "boundary"
+    });
+
+    expect(unit).toMatchObject({
+      topicType: "project_work",
+      title: expect.any(String),
+      evidenceTurnIds: ["t1", "t2"]
+    });
+  });
+
+  it("converts structured topic units to topic memory drafts", () => {
+    const draft = topicMemoryUnitToDraft(
+      {
+        title: "项目 A memory 系统",
+        summary: "讨论项目 A 的 memory 系统 topic 层。",
+        topicType: "project_work",
+        entities: ["项目 A"],
+        decisions: ["先实现 topic 层"],
+        tasks: ["实现 topic 层"],
+        preferences: [],
+        confidence: 0.86,
+        reason: "boundary",
+        evidenceTurnIds: ["t1", "t2"]
+      },
+      { sessionId: "s1", ...scope }
+    );
+
+    expect(draft).toMatchObject({
+      level: "topic",
+      type: "topic",
+      subject: "项目 A",
+      predicate: "topic",
+      sourceTurnIds: ["t1", "t2"],
+      metadata: expect.objectContaining({ topicType: "project_work", sessionId: "s1" })
+    });
+  });
+
+  it("rejects invalid LLM topic memory output", async () => {
+    const generator = new LlmTopicMemoryGenerator({ complete: async () => JSON.stringify({ title: "bad" }) });
+
+    await expect(
+      generator.generate({
+        sessionId: "s1",
+        turns: [
+          {
+            id: "t1",
+            sessionId: "s1",
+            role: "user",
+            content: "项目 A",
+            createdAt: "2026-06-01T00:00:00.000Z",
+            ...scope
+          }
+        ],
+        reason: "flush"
+      })
+    ).rejects.toThrow("Invalid LLM topic memory response");
   });
 });
 
