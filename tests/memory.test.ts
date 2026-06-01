@@ -19,6 +19,12 @@ import { ModelProjectMemoryBuilder, rebuildProjectMemories } from "../src/domain
 import { RuleBasedMemoryResolver, resolveMemory } from "../src/domain/resolver.js";
 import { searchMemories } from "../src/domain/search.js";
 import { SlidingTopicBuilder, type TopicDetector } from "../src/domain/topics.js";
+import {
+  HybridTopicBoundaryDetector,
+  LlmTopicBoundaryDetector,
+  RuleBasedTopicBoundaryDetector,
+  type TopicBoundaryDetector
+} from "../src/domain/topic-boundary.js";
 import { RuleBasedMemoryCompressor } from "../src/domain/dreaming.js";
 import { buildServer } from "../src/server.js";
 import { createDatabase } from "../src/storage/database.js";
@@ -41,6 +47,100 @@ class TrackingEmbeddingIndex implements EmbeddingIndex {
     return this.upsertedIds.map((id) => ({ id, score: 10, metadata: {} }));
   }
 }
+
+describe("topic boundary detection", () => {
+  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+
+  it("keeps related messages in the same open topic", async () => {
+    const detector = new RuleBasedTopicBoundaryDetector();
+    const result = await detector.detectBoundary({
+      existingTurns: [
+        {
+          id: "t1",
+          sessionId: "s1",
+          role: "user",
+          content: "项目 A 要做 memory 系统",
+          createdAt: "2026-06-01T00:00:00.000Z",
+          ...scope
+        }
+      ],
+      newTurn: {
+        id: "t2",
+        sessionId: "s1",
+        role: "assistant",
+        content: "可以先做 topic 抽取",
+        createdAt: "2026-06-01T00:01:00.000Z",
+        ...scope
+      }
+    });
+
+    expect(result).toMatchObject({ shouldClose: false, confidence: expect.any(Number) });
+  });
+
+  it("parses LLM boundary decisions with closed turn ids", async () => {
+    const detector = new LlmTopicBoundaryDetector({
+      complete: async () =>
+        JSON.stringify({
+          shouldClose: true,
+          confidence: 0.91,
+          reason: "new unrelated request",
+          closedTurnIds: ["t1"],
+          carryOverTurnIds: ["t2"]
+        })
+    });
+
+    await expect(
+      detector.detectBoundary({
+        existingTurns: [
+          {
+            id: "t1",
+            sessionId: "s1",
+            role: "user",
+            content: "项目 A",
+            createdAt: "2026-06-01T00:00:00.000Z",
+            ...scope
+          }
+        ],
+        newTurn: {
+          id: "t2",
+          sessionId: "s1",
+          role: "user",
+          content: "换个话题，健身计划",
+          createdAt: "2026-06-01T00:02:00.000Z",
+          ...scope
+        }
+      })
+    ).resolves.toMatchObject({
+      shouldClose: true,
+      closedTurnIds: ["t1"],
+      carryOverTurnIds: ["t2"]
+    });
+  });
+
+  it("falls back when LLM boundary output is invalid", async () => {
+    const fallback: TopicBoundaryDetector = {
+      detectBoundary: () => ({ shouldClose: false, confidence: 0.6, reason: "fallback" })
+    };
+    const detector = new HybridTopicBoundaryDetector(
+      new LlmTopicBoundaryDetector({ complete: async () => "not-json" }),
+      fallback
+    );
+
+    await expect(
+      detector.detectBoundary({
+        existingTurns: [],
+        newTurn: {
+          id: "t1",
+          sessionId: "s1",
+          role: "user",
+          content: "hello",
+          createdAt: "2026-06-01T00:00:00.000Z",
+          ...scope
+        }
+      })
+    ).resolves.toMatchObject({ reason: "fallback" });
+  });
+});
 
 describe("embedding abstraction", () => {
   it("creates deterministic vectors and compares them with cosine similarity", async () => {
