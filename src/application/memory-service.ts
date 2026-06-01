@@ -9,8 +9,18 @@ import {
 } from "../domain/project-memory.js";
 import { RuleBasedMemoryResolver, type MemoryResolver } from "../domain/resolver.js";
 import { searchMemories, type SearchInput, type SearchResult } from "../domain/search.js";
-import { SlidingTopicBuilder, topicToMemoryDraft, type TopicBuilder } from "../domain/topics.js";
-import type { ConversationTurn, CreateTurnInput, Memory, MemoryStatus, Scope, TopicSegment } from "../domain/types.js";
+import { topicMemoryUnitToDraft } from "../domain/topic-memory.js";
+import { SlidingTopicBuilder, type TopicBuilder } from "../domain/topics.js";
+import type {
+  ConversationTurn,
+  CreateMemoryInput,
+  CreateTurnInput,
+  Memory,
+  MemoryStatus,
+  Scope,
+  TopicSegment,
+  TopicType
+} from "../domain/types.js";
 import type { MemoryStore } from "../storage/store.js";
 
 export interface IngestTurnResult {
@@ -54,7 +64,7 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
       if (!topic || topic.status !== "complete") {
         return { turn, topic, memories: [] };
       }
-      const topicMemory = resolver.resolve(store, topicToMemoryDraft(topic));
+      const topicMemory = resolver.resolve(store, topicToDraftFromSegment(topic));
       const memories = [topicMemory];
       if (embeddingProvider && embeddingIndex) {
         await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
@@ -167,4 +177,47 @@ function createDefaultProjectMemoryBuilder(resolver: MemoryResolver): ProjectMem
     new LlmProjectMemoryExtractor(new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model })),
     resolver
   );
+}
+
+function topicToDraftFromSegment(topic: TopicSegment): CreateMemoryInput {
+  return topicMemoryUnitToDraft(
+    {
+      title: topic.title,
+      summary: topic.summary,
+      topicType: toTopicType(topic.metadata.topicType),
+      entities: toStringArray(topic.metadata.entities),
+      decisions: toStringArray(topic.metadata.decisions),
+      tasks: toStringArray(topic.metadata.tasks),
+      preferences: toStringArray(topic.metadata.preferences),
+      confidence: topic.confidence,
+      reason: topic.reason,
+      evidenceTurnIds: topic.turnIds
+    },
+    {
+      sessionId: topic.sessionId,
+      mis: topic.mis,
+      source: topic.source,
+      agent: topic.agent,
+      channel: topic.channel,
+      metadata: topic.metadata
+    }
+  );
+}
+
+function toStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function toTopicType(value: unknown): TopicType {
+  const allowed = new Set<TopicType>([
+    "project_work",
+    "product_design",
+    "technical_decision",
+    "workflow",
+    "preference",
+    "personal_context",
+    "research",
+    "other"
+  ]);
+  return typeof value === "string" && allowed.has(value as TopicType) ? (value as TopicType) : "other";
 }

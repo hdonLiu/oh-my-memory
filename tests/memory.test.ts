@@ -278,6 +278,39 @@ describe("session sliding topic builder", () => {
   });
 });
 
+describe("topic resolver integration", () => {
+  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+
+  it("runs MemoryResolver only when a topic closes", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const resolvedSubjects: string[] = [];
+    const service = createMemoryService(store, {
+      resolver: {
+        resolve: (repo, draft) => {
+          resolvedSubjects.push(draft.subject);
+          return repo.createMemory(draft);
+        }
+      },
+      topicBuilder: new SlidingTopicBuilder(
+        {
+          detectBoundary: ({ newTurn }) => ({
+            shouldClose: newTurn.content.includes("换个话题"),
+            confidence: 0.9,
+            reason: "topic changed"
+          })
+        },
+        new RuleBasedTopicMemoryGenerator()
+      )
+    });
+
+    await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 要做 memory", ...scope });
+    expect(resolvedSubjects).toEqual([]);
+
+    await service.ingestTurn({ sessionId: "s1", role: "user", content: "换个话题，健身计划", ...scope });
+    expect(resolvedSubjects).toEqual(["项目 A"]);
+  });
+});
+
 describe("embedding abstraction", () => {
   it("creates deterministic vectors and compares them with cosine similarity", async () => {
     const provider = new DeterministicEmbeddingProvider(16);
