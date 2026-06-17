@@ -136,6 +136,14 @@ Use this to debug the current open topic buffer or review closed topics.
 curl -s 'http://localhost:3000/topics?mis=u1&source=local&agent=demo&channel=default&sessionId=s1&status=partial'
 ```
 
+### Inspect Project Memories
+
+Use this to review L2 project memories produced by manual or scheduled project extraction.
+
+```bash
+curl -s 'http://localhost:3000/projects?mis=u1&source=local&agent=demo&channel=default&status=active&projectType=repository'
+```
+
 ### Update Memory Status
 
 ```bash
@@ -264,6 +272,8 @@ TOPIC_BOUNDARY_EXCLUDE_THRESHOLD=10
 npm test
 npm run typecheck
 ```
+
+L2 project evaluation fixtures live in `src/domain/project-eval-fixtures.ts`. They cover merging related topics, keeping distinct projects separate, preserving workflow projects, and excluding preference-only topics.
 
 ## Current Scope
 

@@ -20,6 +20,7 @@ import { loadProjectBuildSchedulerConfig, runScheduledProjectBuild } from "../sr
 import { ModelProjectMemoryBuilder, buildProjectTopicInputs, rebuildProjectMemories } from "../src/domain/project-memory.js";
 import { RuleBasedMemoryResolver, resolveMemory } from "../src/domain/resolver.js";
 import { searchMemories } from "../src/domain/search.js";
+import { projectEvaluationFixtures } from "../src/domain/project-eval-fixtures.js";
 import { SlidingTopicBuilder } from "../src/domain/topics.js";
 import {
   HybridTopicBoundaryDetector,
@@ -425,6 +426,75 @@ describe("topic configuration and debug api", () => {
     expect(complete.json().topics).toEqual([expect.objectContaining({ sessionId: "s1", status: "complete" })]);
 
     await app.close();
+  });
+});
+
+describe("project debug api and eval fixtures", () => {
+  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+
+  it("returns L2 project memories with project metadata filters", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    store.createMemory({
+      level: "L2",
+      type: "project",
+      subject: "oh-my-memory",
+      predicate: "project",
+      object: "Topic layer is implemented",
+      summary: "oh-my-memory topic layer project",
+      confidence: 0.9,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope,
+      metadata: { projectKey: "repo:oh-my-memory", projectType: "repository" }
+    });
+    store.createMemory({
+      level: "L2",
+      type: "project",
+      subject: "debug workflow",
+      predicate: "project",
+      object: "Debug workflow",
+      summary: "debug workflow",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t2"],
+      ...scope,
+      metadata: { projectKey: "workflow:debug", projectType: "workflow" }
+    });
+    const app = buildServer(createMemoryService(store));
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/projects?mis=u1&source=test&agent=agent&channel=default&projectType=repository&projectKey=repo%3Aoh-my-memory"
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().projects).toEqual([
+      expect.objectContaining({
+        level: "L2",
+        type: "project",
+        subject: "oh-my-memory",
+        metadata: expect.objectContaining({ projectKey: "repo:oh-my-memory", projectType: "repository" })
+      })
+    ]);
+
+    await app.close();
+  });
+
+  it("keeps L2 project evaluation fixtures for core aggregation cases", () => {
+    expect(projectEvaluationFixtures.map((fixture) => fixture.id)).toEqual([
+      "merge-topics-into-project",
+      "keep-distinct-projects-separate",
+      "keep-workflow-as-workflow",
+      "exclude-preference-topic"
+    ]);
+    expect(projectEvaluationFixtures.find((fixture) => fixture.id === "exclude-preference-topic")).toMatchObject({
+      expected: {
+        projects: [],
+        excludedTopicIds: ["topic-preference-1"]
+      }
+    });
   });
 });
 

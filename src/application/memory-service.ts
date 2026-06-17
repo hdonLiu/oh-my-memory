@@ -35,6 +35,9 @@ export interface MemoryService {
   ingestTurn(input: CreateTurnInput): Promise<IngestTurnResult>;
   flushSessionTopic(scope: Scope, sessionId: string): Promise<{ topic: TopicSegment | null; memories: Memory[] }>;
   listTopicSegments(scope: Partial<Scope> & { sessionId?: string; status?: TopicSegment["status"] }): { topics: TopicSegment[] };
+  listProjectMemories(
+    scope: Partial<Scope> & { status?: MemoryStatus; projectType?: string; projectKey?: string }
+  ): { projects: Memory[] };
   runProjectBuild(scope: Scope): Promise<{ createdOrUpdated: Memory[] }>;
   search(input: SearchInput): Promise<{ results: SearchResult[] }>;
   listMemories(scope: Partial<Scope>): { memories: Memory[] };
@@ -95,6 +98,17 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
         .listTopicSegments(baseScope)
         .filter((topic) => (!sessionId || topic.sessionId === sessionId) && (!status || topic.status === status));
       return { topics };
+    },
+
+    listProjectMemories(scope) {
+      const { status, projectType, projectKey, ...baseScope } = scope;
+      const projects = store
+        .listMemories(baseScope)
+        .filter((memory) => memory.level === "L2" && memory.type === "project")
+        .filter((memory) => !status || memory.status === status)
+        .filter((memory) => !projectType || memory.metadata.projectType === projectType)
+        .filter((memory) => !projectKey || memory.metadata.projectKey === projectKey);
+      return { projects };
     },
 
     async runProjectBuild(scope) {
