@@ -3,11 +3,14 @@ import { nanoid } from "nanoid";
 import type {
   ConversationTurn,
   CreateMemoryInput,
+  CreateProjectBuildRunInput,
   CreateTopicSegmentInput,
   CreateTurnInput,
   Memory,
   MemoryRelation,
   MemoryStatus,
+  ProjectBuildRun,
+  ProjectBuildRunStatus,
   RelationType,
   Scope,
   TopicSegment,
@@ -76,6 +79,16 @@ type TopicSegmentRow = {
   metadata: string;
   created_at: string;
   updated_at: string;
+};
+
+type ProjectBuildRunRow = {
+  id: string;
+  started_at: string;
+  ended_at: string;
+  scopes_run: number;
+  created_or_updated: number;
+  status: ProjectBuildRunStatus;
+  errors: string;
 };
 
 export class MemoryRepository implements MemoryStore {
@@ -318,6 +331,33 @@ export class MemoryRepository implements MemoryStore {
       .all(memoryId, memoryId)
       .map((row) => mapRelation(row as RelationRow));
   }
+
+  createProjectBuildRun(input: CreateProjectBuildRunInput): ProjectBuildRun {
+    const run: ProjectBuildRun = { ...input, id: nanoid() };
+    this.db
+      .prepare(
+        `insert into project_build_runs
+        (id, started_at, ended_at, scopes_run, created_or_updated, status, errors)
+        values (?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(
+        run.id,
+        run.startedAt,
+        run.endedAt,
+        run.scopesRun,
+        run.createdOrUpdated,
+        run.status,
+        JSON.stringify(run.errors)
+      );
+    return run;
+  }
+
+  listProjectBuildRuns(limit = 20): ProjectBuildRun[] {
+    return this.db
+      .prepare("select * from project_build_runs order by started_at desc limit ?")
+      .all(limit)
+      .map((row) => mapProjectBuildRun(row as ProjectBuildRunRow));
+  }
 }
 
 export function sameScope(left: Scope, right: Partial<Scope>): boolean {
@@ -401,6 +441,18 @@ function mapRelation(row: RelationRow): MemoryRelation {
     relationType: row.relation_type,
     confidence: row.confidence,
     createdAt: row.created_at
+  };
+}
+
+function mapProjectBuildRun(row: ProjectBuildRunRow): ProjectBuildRun {
+  return {
+    id: row.id,
+    startedAt: row.started_at,
+    endedAt: row.ended_at,
+    scopesRun: row.scopes_run,
+    createdOrUpdated: row.created_or_updated,
+    status: row.status,
+    errors: JSON.parse(row.errors) as ProjectBuildRun["errors"]
   };
 }
 

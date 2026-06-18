@@ -1,11 +1,25 @@
 import { z } from "zod";
 import type { LlmCompletionClient } from "./extractors.js";
 import { RuleBasedMemoryResolver, type MemoryResolver } from "./resolver.js";
-import type { CreateMemoryInput, Memory, Scope } from "./types.js";
+import type { CreateMemoryInput, Memory, Scope, TopicType } from "./types.js";
 import type { MemoryStore } from "../storage/store.js";
+
+export interface ProjectTopicInput {
+  id: string;
+  subject: string;
+  summary: string;
+  topicType: TopicType;
+  entities: string[];
+  decisions: string[];
+  tasks: string[];
+  preferences: string[];
+  sourceTurnIds: string[];
+  confidence: number;
+}
 
 export interface ProjectExtractionInput {
   topics: Memory[];
+  topicInputs: ProjectTopicInput[];
   existingProjects: Memory[];
   scope: Scope;
 }
@@ -40,8 +54,8 @@ export class ModelProjectMemoryBuilder implements ProjectMemoryBuilder {
       .listMemories(scope)
       .filter((memory) => memory.level === "L2" && memory.type === "project" && memory.status === "active");
 
-    const drafts = await this.extractor.extract({ topics, existingProjects, scope });
-    return drafts.map((draft) => this.resolver.resolve(repo, draft));
+    const drafts = await this.extractor.extract({ topics, topicInputs: buildProjectTopicInputs(topics), existingProjects, scope });
+    return Promise.all(drafts.map((draft) => this.resolver.resolve(repo, draft)));
   }
 }
 
@@ -118,9 +132,42 @@ function buildPrompt(input: ProjectExtractionInput): string {
   return JSON.stringify({
     task: "Extract stable L2 project memories from L1 topic memories. Return strict JSON.",
     dimensions: ["workspace", "system", "goal", "module", "workflow", "constraint", "stakeholder/context"],
-    topics: input.topics,
+    topics: input.topicInputs,
     existingProjects: input.existingProjects
   });
+}
+
+export function buildProjectTopicInputs(topics: Memory[]): ProjectTopicInput[] {
+  return topics.map((topic) => ({
+    id: topic.id,
+    subject: topic.subject,
+    summary: topic.summary,
+    topicType: toTopicType(topic.metadata.topicType),
+    entities: toStringArray(topic.metadata.entities),
+    decisions: toStringArray(topic.metadata.decisions),
+    tasks: toStringArray(topic.metadata.tasks),
+    preferences: toStringArray(topic.metadata.preferences),
+    sourceTurnIds: topic.sourceTurnIds,
+    confidence: topic.confidence
+  }));
+}
+
+function toStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function toTopicType(value: unknown): TopicType {
+  const allowed = new Set<TopicType>([
+    "project_work",
+    "product_design",
+    "technical_decision",
+    "workflow",
+    "preference",
+    "personal_context",
+    "research",
+    "other"
+  ]);
+  return typeof value === "string" && allowed.has(value as TopicType) ? (value as TopicType) : "other";
 }
 
 function buildProjectSummary(project: z.infer<typeof llmProjectSchema>): string {

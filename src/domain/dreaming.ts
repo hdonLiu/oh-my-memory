@@ -1,4 +1,7 @@
-import type { Memory, Scope } from "./types.js";
+import { z } from "zod";
+import type { LlmCompletionClient } from "./extractors.js";
+import { RuleBasedMemoryResolver, type MemoryResolver } from "./resolver.js";
+import type { CreateMemoryInput, Memory, MemoryType, Scope } from "./types.js";
 import type { MemoryStore } from "../storage/store.js";
 
 export interface DreamingResult {
@@ -10,7 +13,7 @@ export function runDreaming(repo: MemoryStore, scope: Scope): DreamingResult {
 }
 
 export interface MemoryCompressor {
-  compress(repo: MemoryStore, scope: Scope): DreamingResult;
+  compress(repo: MemoryStore, scope: Scope): DreamingResult | Promise<DreamingResult>;
 }
 
 export class RuleBasedMemoryCompressor implements MemoryCompressor {
@@ -65,6 +68,119 @@ export class RuleBasedMemoryCompressor implements MemoryCompressor {
 
   return { createdOrUpdated };
   }
+}
+
+const llmDreamMemorySchema = z.object({
+  type: z.enum(["fact", "preference", "decision", "profile"]),
+  subject: z.string().min(1),
+  predicate: z.string().min(1),
+  object: z.string().min(1),
+  summary: z.string().min(1),
+  confidence: z.number().min(0).max(1),
+  evidenceMemoryIds: z.array(z.string()).min(1)
+});
+
+const llmDreamResponseSchema = z.object({
+  memories: z.array(llmDreamMemorySchema)
+});
+
+export class LlmMemoryCompressor implements MemoryCompressor {
+  constructor(
+    private readonly client: LlmCompletionClient,
+    private readonly resolver: MemoryResolver = new RuleBasedMemoryResolver()
+  ) {}
+
+  async compress(repo: MemoryStore, scope: Scope): Promise<DreamingResult> {
+    const candidates = repo
+      .listMemories(scope)
+      .filter((memory) => memory.status === "active" && (memory.level === "L2" || memory.level === "topic"));
+    const raw = await this.client.complete(buildDreamingPrompt(candidates));
+    const parsed = parseDreamingResponse(raw);
+    const createdOrUpdated: Memory[] = [];
+    for (const memory of parsed.memories) {
+      const evidence = candidates.filter((candidate) => memory.evidenceMemoryIds.includes(candidate.id));
+      const draft: CreateMemoryInput = {
+        level: "L3",
+        type: memory.type as MemoryType,
+        subject: memory.subject,
+        predicate: memory.predicate,
+        object: memory.object,
+        summary: memory.summary,
+        confidence: memory.confidence,
+        status: "active",
+        supersedesId: null,
+        sourceTurnIds: Array.from(new Set(evidence.flatMap((item) => item.sourceTurnIds))),
+        mis: scope.mis,
+        source: scope.source,
+        agent: scope.agent,
+        channel: scope.channel,
+        metadata: {
+          ...scope.metadata,
+          evidenceMemoryIds: memory.evidenceMemoryIds
+        }
+      };
+      createdOrUpdated.push(await this.resolver.resolve(repo, draft));
+    }
+    return { createdOrUpdated };
+  }
+}
+
+export class HybridMemoryCompressor implements MemoryCompressor {
+  constructor(
+    private readonly primary: MemoryCompressor,
+    private readonly fallback: MemoryCompressor = new RuleBasedMemoryCompressor()
+  ) {}
+
+  async compress(repo: MemoryStore, scope: Scope): Promise<DreamingResult> {
+    try {
+      return await this.primary.compress(repo, scope);
+    } catch {
+      return this.fallback.compress(repo, scope);
+    }
+  }
+}
+
+function parseDreamingResponse(raw: string): z.infer<typeof llmDreamResponseSchema> {
+  try {
+    return llmDreamResponseSchema.parse(JSON.parse(raw) as unknown);
+  } catch (error) {
+    throw new Error(`Invalid LLM dreaming response: ${error instanceof Error ? error.message : "unknown"}`);
+  }
+}
+
+function buildDreamingPrompt(candidates: Memory[]): string {
+  return JSON.stringify({
+    task: "Extract stable L3 global/profile memories from active topic and L2 memories. Return strict JSON only.",
+    rules: [
+      "Only output stable long-term memories.",
+      "Use evidenceMemoryIds from the provided candidates.",
+      "Do not output temporary task chatter."
+    ],
+    candidates: candidates.map((memory) => ({
+      id: memory.id,
+      level: memory.level,
+      type: memory.type,
+      subject: memory.subject,
+      predicate: memory.predicate,
+      object: memory.object,
+      summary: memory.summary,
+      confidence: memory.confidence,
+      metadata: memory.metadata
+    })),
+    responseSchema: {
+      memories: [
+        {
+          type: "fact|preference|decision|profile",
+          subject: "string",
+          predicate: "string",
+          object: "string",
+          summary: "string",
+          confidence: "0..1",
+          evidenceMemoryIds: "string[]"
+        }
+      ]
+    }
+  });
 }
 
 function promotePreferenceTopics(repo: MemoryStore, scope: Scope): Memory[] {

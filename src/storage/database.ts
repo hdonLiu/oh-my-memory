@@ -66,6 +66,16 @@ export function createDatabase(path = process.env.MEMORY_DB_PATH ?? "memory.sqli
       confidence real not null,
       created_at text not null
     );
+
+    create table if not exists project_build_runs (
+      id text primary key,
+      started_at text not null,
+      ended_at text not null,
+      scopes_run integer not null,
+      created_or_updated integer not null,
+      status text not null,
+      errors text not null
+    );
   `);
   ensureTopicProjectMemoryColumn(db);
   return db;

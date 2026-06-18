@@ -3,7 +3,7 @@ import type Database from "better-sqlite3";
 import Fastify from "fastify";
 import { z } from "zod";
 import { createMemoryService, type MemoryService } from "./application/memory-service.js";
-import type { MemoryStatus, Role, Scope } from "./domain/types.js";
+import type { MemoryStatus, Role, Scope, TopicStatus } from "./domain/types.js";
 import { MemoryRepository } from "./storage/repositories.js";
 import type { MemoryStore } from "./storage/store.js";
 
@@ -31,6 +31,29 @@ const patchSchema = z.object({
   status: z.enum(["active", "superseded", "deleted"]).optional(),
   summary: z.string().optional(),
   confidence: z.number().min(0).max(1).optional()
+});
+
+const topicQuerySchema = z.object({
+  mis: z.string().optional(),
+  source: z.string().optional(),
+  agent: z.string().optional(),
+  channel: z.string().optional(),
+  sessionId: z.string().optional(),
+  status: z.enum(["complete", "partial", "noise"]).optional()
+});
+
+const projectQuerySchema = z.object({
+  mis: z.string().optional(),
+  source: z.string().optional(),
+  agent: z.string().optional(),
+  channel: z.string().optional(),
+  status: z.enum(["active", "superseded", "deleted"]).optional(),
+  projectType: z.string().optional(),
+  projectKey: z.string().optional()
+});
+
+const projectRunQuerySchema = z.object({
+  limit: z.coerce.number().int().positive().max(100).optional()
 });
 
 export function buildServer(storage: Database.Database | MemoryStore | MemoryService) {
@@ -86,6 +109,45 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
     };
   });
 
+  app.get("/topics", async (request, reply) => {
+    const parsed = topicQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+    return service.listTopicSegments({
+      mis: parsed.data.mis,
+      source: parsed.data.source,
+      agent: parsed.data.agent,
+      channel: parsed.data.channel,
+      sessionId: parsed.data.sessionId,
+      status: parsed.data.status as TopicStatus | undefined
+    });
+  });
+
+  app.get("/projects", async (request, reply) => {
+    const parsed = projectQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+    return service.listProjectMemories({
+      mis: parsed.data.mis,
+      source: parsed.data.source,
+      agent: parsed.data.agent,
+      channel: parsed.data.channel,
+      status: parsed.data.status,
+      projectType: parsed.data.projectType,
+      projectKey: parsed.data.projectKey
+    });
+  });
+
+  app.get("/projects/runs", async (request, reply) => {
+    const parsed = projectRunQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+    return service.listProjectBuildRuns(parsed.data.limit);
+  });
+
   app.patch("/memories/:id", async (request, reply) => {
     const params = request.params as { id: string };
     const parsed = patchSchema.safeParse(request.body);
@@ -128,6 +190,9 @@ function isMemoryService(value: Database.Database | MemoryStore | MemoryService)
   return (
     typeof (value as MemoryService).ingestTurn === "function" &&
     typeof (value as MemoryService).flushSessionTopic === "function" &&
+    typeof (value as MemoryService).listTopicSegments === "function" &&
+    typeof (value as MemoryService).listProjectMemories === "function" &&
+    typeof (value as MemoryService).listProjectBuildRuns === "function" &&
     typeof (value as MemoryService).search === "function" &&
     typeof (value as MemoryService).runProjectBuild === "function" &&
     typeof (value as MemoryService).runDreaming === "function"

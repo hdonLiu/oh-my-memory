@@ -1,9 +1,11 @@
 import type {
   ConversationTurn,
   CreateMemoryInput,
+  CreateProjectBuildRunInput,
   CreateTopicSegmentInput,
   CreateTurnInput,
   Memory,
+  ProjectBuildRun,
   MemoryRelation,
   RelationType,
   Scope,
@@ -31,4 +33,6 @@ export interface MemoryStore {
     confidence: number
   ): MemoryRelation;
   listRelations(memoryId: string): MemoryRelation[];
+  createProjectBuildRun(input: CreateProjectBuildRunInput): ProjectBuildRun;
+  listProjectBuildRuns(limit?: number): ProjectBuildRun[];
 }

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { createMemoryService } from "../src/application/memory-service.js";
+import { loadTopicWindowConfig } from "../src/application/topic-config.js";
 import { runCli } from "../src/cli.js";
 import {
   type EmbeddingIndex,
@@ -14,10 +15,13 @@ import {
 } from "../src/domain/embedding.js";
 import { extractMemories } from "../src/domain/extractor.js";
 import { HybridMemoryExtractor, LlmMemoryExtractor, RuleBasedMemoryExtractor } from "../src/domain/extractors.js";
-import { runDreaming } from "../src/domain/dreaming.js";
-import { ModelProjectMemoryBuilder, rebuildProjectMemories } from "../src/domain/project-memory.js";
-import { RuleBasedMemoryResolver, resolveMemory } from "../src/domain/resolver.js";
+import { HybridMemoryCompressor, LlmMemoryCompressor, runDreaming } from "../src/domain/dreaming.js";
+import { loadProjectBuildSchedulerConfig, runScheduledProjectBuild } from "../src/application/project-scheduler.js";
+import { ModelProjectMemoryBuilder, buildProjectTopicInputs, rebuildProjectMemories } from "../src/domain/project-memory.js";
+import { HybridMemoryResolver, LlmMemoryResolver, RuleBasedMemoryResolver, resolveMemory } from "../src/domain/resolver.js";
 import { searchMemories } from "../src/domain/search.js";
+import { projectEvaluationFixtures } from "../src/domain/project-eval-fixtures.js";
+import { runProjectEvaluationFixtures } from "../src/domain/project-eval-runner.js";
 import { SlidingTopicBuilder } from "../src/domain/topics.js";
 import {
   HybridTopicBoundaryDetector,
@@ -369,6 +373,158 @@ describe("default topic LLM wiring", () => {
   });
 });
 
+describe("topic configuration and debug api", () => {
+  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+
+  it("loads topic window config from environment values", () => {
+    expect(
+      loadTopicWindowConfig({
+        TOPIC_BUFFER_MAX_TURNS: "12",
+        TOPIC_BOUNDARY_CONFIDENCE: "0.82",
+        TOPIC_BOUNDARY_EXCLUDE_LAST_TURN: "false",
+        TOPIC_BOUNDARY_EXCLUDE_THRESHOLD: "7"
+      })
+    ).toEqual({
+      maxSize: 12,
+      minConfidence: 0.82,
+      excludeLastTurnForBoundary: false,
+      excludeLastTurnThreshold: 7
+    });
+  });
+
+  it("returns topic segments for debugging", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    const app = buildServer(createMemoryService(store));
+
+    await app.inject({
+      method: "POST",
+      url: "/turns",
+      payload: { sessionId: "s1", role: "user", content: "项目 A 要做 debug api", ...scope }
+    });
+
+    const partial = await app.inject({
+      method: "GET",
+      url: "/topics?mis=u1&source=test&agent=agent&channel=default&sessionId=s1&status=partial"
+    });
+
+    expect(partial.statusCode).toBe(200);
+    expect(partial.json().topics).toEqual([
+      expect.objectContaining({
+        sessionId: "s1",
+        status: "partial",
+        summary: "项目 A 要做 debug api"
+      })
+    ]);
+
+    await app.inject({ method: "POST", url: "/sessions/s1/topics/flush", payload: scope });
+
+    const complete = await app.inject({
+      method: "GET",
+      url: "/topics?mis=u1&source=test&agent=agent&channel=default&sessionId=s1&status=complete"
+    });
+
+    expect(complete.statusCode).toBe(200);
+    expect(complete.json().topics).toEqual([expect.objectContaining({ sessionId: "s1", status: "complete" })]);
+
+    await app.close();
+  });
+});
+
+describe("project debug api and eval fixtures", () => {
+  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+
+  it("returns L2 project memories with project metadata filters", async () => {
+    const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
+    store.createMemory({
+      level: "L2",
+      type: "project",
+      subject: "oh-my-memory",
+      predicate: "project",
+      object: "Topic layer is implemented",
+      summary: "oh-my-memory topic layer project",
+      confidence: 0.9,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope,
+      metadata: { projectKey: "repo:oh-my-memory", projectType: "repository" }
+    });
+    store.createMemory({
+      level: "L2",
+      type: "project",
+      subject: "debug workflow",
+      predicate: "project",
+      object: "Debug workflow",
+      summary: "debug workflow",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t2"],
+      ...scope,
+      metadata: { projectKey: "workflow:debug", projectType: "workflow" }
+    });
+    const app = buildServer(createMemoryService(store));
+
+    const response = await app.inject({
+      method: "GET",
+      url: "/projects?mis=u1&source=test&agent=agent&channel=default&projectType=repository&projectKey=repo%3Aoh-my-memory"
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().projects).toEqual([
+      expect.objectContaining({
+        level: "L2",
+        type: "project",
+        subject: "oh-my-memory",
+        metadata: expect.objectContaining({ projectKey: "repo:oh-my-memory", projectType: "repository" })
+      })
+    ]);
+
+    await app.close();
+  });
+
+  it("keeps L2 project evaluation fixtures for core aggregation cases", () => {
+    expect(projectEvaluationFixtures.map((fixture) => fixture.id)).toEqual([
+      "merge-topics-into-project",
+      "keep-distinct-projects-separate",
+      "keep-workflow-as-workflow",
+      "exclude-preference-topic"
+    ]);
+    expect(projectEvaluationFixtures.find((fixture) => fixture.id === "exclude-preference-topic")).toMatchObject({
+      expected: {
+        projects: [],
+        excludedTopicIds: ["topic-preference-1"]
+      }
+    });
+  });
+
+  it("runs L2 project evaluation fixtures and reports failures", async () => {
+    const passing = await runProjectEvaluationFixtures(projectEvaluationFixtures, {
+      extract: async (fixture) => fixture.expected.projects
+    });
+
+    expect(passing.passed).toBe(projectEvaluationFixtures.length);
+    expect(passing.failed).toBe(0);
+    expect(passing.results.every((result) => result.passed)).toBe(true);
+
+    const failing = await runProjectEvaluationFixtures([projectEvaluationFixtures[0]], {
+      extract: async () => []
+    });
+
+    expect(failing).toMatchObject({
+      passed: 0,
+      failed: 1,
+      results: [
+        expect.objectContaining({
+          fixtureId: "merge-topics-into-project",
+          passed: false,
+          errors: [expect.stringContaining("missing project repository:oh-my-memory")]
+        })
+      ]
+    });
+  });
+});
+
 describe("embedding abstraction", () => {
   it("creates deterministic vectors and compares them with cosine similarity", async () => {
     const provider = new DeterministicEmbeddingProvider(16);
@@ -708,7 +864,7 @@ describe("memory application service", () => {
       ...scope
     });
     const result = await service.flushSessionTopic(scope, "s1");
-    const dreaming = service.runDreaming(scope);
+    const dreaming = await service.runDreaming(scope);
 
     const projects = await service.runProjectBuild(scope);
     expect(result.memories[0]).toMatchObject({ level: "topic" });
@@ -1279,6 +1435,207 @@ describe("memory search", () => {
 });
 
 describe("project memory and dreaming", () => {
+  it("passes structured topic inputs into the L2 project extractor", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const topic = repo.createMemory({
+      level: "topic",
+      type: "topic",
+      subject: "项目 A",
+      predicate: "topic",
+      object: "项目 A 决定使用 SQLite",
+      summary: "项目 A 决定使用 SQLite",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope,
+      metadata: {
+        topicType: "project_work",
+        entities: ["项目 A"],
+        decisions: ["使用 SQLite"],
+        tasks: ["实现 L2 定时任务"],
+        preferences: []
+      }
+    });
+
+    expect(buildProjectTopicInputs([topic])).toEqual([
+      expect.objectContaining({
+        id: topic.id,
+        summary: "项目 A 决定使用 SQLite",
+        topicType: "project_work",
+        entities: ["项目 A"],
+        decisions: ["使用 SQLite"],
+        tasks: ["实现 L2 定时任务"]
+      })
+    ]);
+
+    await rebuildProjectMemories(repo, scope, {
+      extract(input) {
+        expect(input.topicInputs).toEqual([
+          expect.objectContaining({
+            id: topic.id,
+            topicType: "project_work",
+            entities: ["项目 A"],
+            decisions: ["使用 SQLite"],
+            tasks: ["实现 L2 定时任务"]
+          })
+        ]);
+        return [];
+      }
+    });
+  });
+
+  it("runs scheduled project builds for scopes with active topic memories", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scopeA = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: { team: "a" } };
+    const scopeB = { mis: "u2", source: "test", agent: "agent", channel: "default", metadata: { team: "b" } };
+    repo.createMemory({
+      level: "topic",
+      type: "topic",
+      subject: "项目 A",
+      predicate: "topic",
+      object: "项目 A",
+      summary: "项目 A",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scopeA
+    });
+    repo.createMemory({
+      level: "topic",
+      type: "topic",
+      subject: "项目 B",
+      predicate: "topic",
+      object: "项目 B",
+      summary: "项目 B",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t2"],
+      ...scopeB
+    });
+    repo.createMemory({
+      level: "topic",
+      type: "topic",
+      subject: "旧项目",
+      predicate: "topic",
+      object: "旧项目",
+      summary: "旧项目",
+      confidence: 0.8,
+      status: "deleted",
+      supersedesId: null,
+      sourceTurnIds: ["t3"],
+      ...scopeB
+    });
+
+    const scopesRun: string[] = [];
+    const service = createMemoryService(repo, {
+      projectMemoryBuilder: {
+        rebuild(_store, scope) {
+          scopesRun.push(`${scope.mis}:${scope.metadata.team as string}`);
+          return [];
+        }
+      }
+    });
+
+    const result = await runScheduledProjectBuild(service);
+
+    expect(result.scopesRun).toBe(2);
+    expect(result.errors).toEqual([]);
+    expect(scopesRun.sort()).toEqual(["u1:a", "u2:b"]);
+    expect(loadProjectBuildSchedulerConfig({ PROJECT_BUILD_ENABLED: "true", PROJECT_BUILD_INTERVAL_MS: "60000" })).toEqual({
+      enabled: true,
+      intervalMs: 60000
+    });
+  });
+
+  it("records scheduled project build runs", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    repo.createMemory({
+      level: "topic",
+      type: "topic",
+      subject: "项目 A",
+      predicate: "topic",
+      object: "项目 A",
+      summary: "项目 A",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope
+    });
+    const service = createMemoryService(repo, {
+      projectMemoryBuilder: {
+        rebuild(memoryStore, scope) {
+          return [
+            memoryStore.createMemory({
+              level: "L2",
+              type: "project",
+              subject: "项目 A",
+              predicate: "project",
+              object: "项目 A 已聚合",
+              summary: "项目 A 已聚合",
+              confidence: 0.8,
+              status: "active",
+              supersedesId: null,
+              sourceTurnIds: ["t1"],
+              ...scope
+            })
+          ];
+        }
+      }
+    });
+
+    const result = await runScheduledProjectBuild(service);
+    const [run] = service.listProjectBuildRuns().runs;
+
+    expect(result.createdOrUpdated).toBe(1);
+    expect(run).toMatchObject({
+      scopesRun: 1,
+      createdOrUpdated: 1,
+      status: "success",
+      errors: []
+    });
+    expect(Date.parse(run.startedAt)).not.toBeNaN();
+    expect(Date.parse(run.endedAt)).not.toBeNaN();
+  });
+
+  it("exposes project build run records through HTTP", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const service = createMemoryService(repo);
+    service.recordProjectBuildRun({
+      startedAt: "2026-06-18T00:00:00.000Z",
+      endedAt: "2026-06-18T00:00:01.000Z",
+      scopesRun: 1,
+      createdOrUpdated: 2,
+      status: "success",
+      errors: []
+    });
+    const app = buildServer(service);
+
+    const response = await app.inject({ method: "GET", url: "/projects/runs?limit=1" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().runs).toEqual([
+      expect.objectContaining({
+        scopesRun: 1,
+        createdOrUpdated: 2,
+        status: "success",
+        errors: []
+      })
+    ]);
+
+    await app.close();
+  });
+
   it("builds L2 project memory from topic memories with a model extractor", async () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
@@ -1388,6 +1745,79 @@ describe("project memory and dreaming", () => {
       predicate: "偏好",
       object: "TypeScript"
     });
+  });
+
+  it("extracts L3 memories with a model compressor", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const project = repo.createMemory({
+      level: "L2",
+      type: "project",
+      subject: "oh-my-memory",
+      predicate: "project",
+      object: "The project is a local memory service.",
+      summary: "oh-my-memory is a local memory service.",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope,
+      metadata: { projectKey: "repository:oh-my-memory" }
+    });
+    const compressor = new LlmMemoryCompressor({
+      complete: async () =>
+        JSON.stringify({
+          memories: [
+            {
+              type: "profile",
+              subject: "oh-my-memory",
+              predicate: "定位",
+              object: "local memory service",
+              summary: "oh-my-memory is a local memory service.",
+              confidence: 0.91,
+              evidenceMemoryIds: [project.id]
+            }
+          ]
+        })
+    });
+
+    const result = await compressor.compress(repo, scope);
+
+    expect(result.createdOrUpdated).toEqual([
+      expect.objectContaining({
+        level: "L3",
+        type: "profile",
+        subject: "oh-my-memory",
+        predicate: "定位",
+        object: "local memory service",
+        sourceTurnIds: ["t1"]
+      })
+    ]);
+  });
+
+  it("falls back to rule-based dreaming when model compressor output is invalid", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    repo.createMemory({
+      level: "topic",
+      type: "topic",
+      subject: "用户",
+      predicate: "topic",
+      object: "用户偏好 TypeScript",
+      summary: "用户偏好 TypeScript",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope
+    });
+    const compressor = new HybridMemoryCompressor(new LlmMemoryCompressor({ complete: async () => "bad-json" }));
+
+    const result = await compressor.compress(repo, scope);
+
+    expect(result.createdOrUpdated[0]).toMatchObject({ level: "L3", object: "TypeScript" });
   });
 });
 
@@ -1504,5 +1934,172 @@ describe("memory extraction and resolution", () => {
     expect(repo.listRelations(old.id)).toEqual([
       expect.objectContaining({ relationType: "duplicate", fromMemoryId: old.id, toMemoryId: old.id })
     ]);
+  });
+
+  it("lets an LLM choose update for conflicting memories", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const old = repo.createMemory({
+      level: "L2",
+      type: "fact",
+      subject: "项目 A",
+      predicate: "使用",
+      object: "MySQL",
+      summary: "项目 A 使用 MySQL",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+    const turn = repo.createTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 已迁移到 PostgreSQL",
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+    const [draft] = extractMemories(turn, []);
+    const resolver = new LlmMemoryResolver({
+      complete: async () => JSON.stringify({ operation: "update", targetMemoryId: old.id, confidence: 0.92 })
+    });
+
+    const memory = await resolver.resolve(repo, draft);
+
+    expect(repo.getMemory(old.id)?.status).toBe("superseded");
+    expect(memory).toMatchObject({ object: "PostgreSQL", supersedesId: old.id, status: "active" });
+    expect(repo.listRelations(old.id)).toEqual([
+      expect.objectContaining({ relationType: "update", fromMemoryId: old.id, toMemoryId: memory.id })
+    ]);
+  });
+
+  it("lets an LLM choose none for duplicate memories", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const old = repo.createMemory({
+      level: "L2",
+      type: "fact",
+      subject: "项目 A",
+      predicate: "使用",
+      object: "PostgreSQL",
+      summary: "项目 A 使用 PostgreSQL",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+    const turn = repo.createTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 使用 PostgreSQL",
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+    const [draft] = extractMemories(turn, []);
+    const resolver = new LlmMemoryResolver({
+      complete: async () => JSON.stringify({ operation: "none", targetMemoryId: old.id, confidence: 0.96 })
+    });
+
+    const memory = await resolver.resolve(repo, draft);
+
+    expect(memory.id).toBe(old.id);
+    expect(memory.sourceTurnIds).toEqual(["t1", turn.id]);
+    expect(repo.listMemories()).toHaveLength(1);
+    expect(repo.listRelations(old.id)).toEqual([
+      expect.objectContaining({ relationType: "duplicate", fromMemoryId: old.id, toMemoryId: old.id })
+    ]);
+  });
+
+  it("falls back to rule-based resolution when LLM decision is invalid", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const old = repo.createMemory({
+      level: "L2",
+      type: "fact",
+      subject: "项目 A",
+      predicate: "使用",
+      object: "MySQL",
+      summary: "项目 A 使用 MySQL",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+    const turn = repo.createTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 已迁移到 PostgreSQL",
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+    const [draft] = extractMemories(turn, []);
+    const resolver = new HybridMemoryResolver(new LlmMemoryResolver({ complete: async () => "bad-json" }));
+
+    const memory = await resolver.resolve(repo, draft);
+
+    expect(repo.getMemory(old.id)?.status).toBe("superseded");
+    expect(memory).toMatchObject({ object: "PostgreSQL", supersedesId: old.id });
+  });
+
+  it("updates project memories by projectKey even when project names change", () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const old = repo.createMemory({
+      level: "L2",
+      type: "project",
+      subject: "old project name",
+      predicate: "project",
+      object: "Project is using MySQL",
+      summary: "Project is using MySQL",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope,
+      metadata: { projectKey: "repository:oh-my-memory", projectType: "repository" }
+    });
+
+    const resolved = resolveMemory(repo, {
+      level: "L2",
+      type: "project",
+      subject: "oh-my-memory",
+      predicate: "project",
+      object: "Project is using SQLite",
+      summary: "Project is using SQLite",
+      confidence: 0.9,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t2"],
+      ...scope,
+      metadata: { projectKey: "repository:oh-my-memory", projectType: "repository" }
+    });
+
+    expect(repo.getMemory(old.id)?.status).toBe("superseded");
+    expect(resolved).toMatchObject({ subject: "oh-my-memory", supersedesId: old.id, status: "active" });
+    expect(repo.listRelations(old.id)).toEqual([expect.objectContaining({ relationType: "update" })]);
   });
 });

@@ -128,6 +128,22 @@ curl -s http://localhost:3000/search \
 curl -s 'http://localhost:3000/memories?mis=u1&source=local&agent=demo&channel=default'
 ```
 
+### Inspect Topic Segments
+
+Use this to debug the current open topic buffer or review closed topics.
+
+```bash
+curl -s 'http://localhost:3000/topics?mis=u1&source=local&agent=demo&channel=default&sessionId=s1&status=partial'
+```
+
+### Inspect Project Memories
+
+Use this to review L2 project memories produced by manual or scheduled project extraction.
+
+```bash
+curl -s 'http://localhost:3000/projects?mis=u1&source=local&agent=demo&channel=default&status=active&projectType=repository'
+```
+
 ### Update Memory Status
 
 ```bash
@@ -232,12 +248,33 @@ LLM_API_KEY=...
 LLM_MODEL=...
 ```
 
+Project extraction can also run as a background scheduled job:
+
+```bash
+PROJECT_BUILD_ENABLED=true
+PROJECT_BUILD_INTERVAL_MS=300000
+```
+
+The job scans active topic memories, groups their scopes, and runs the L2 project builder for each scope.
+Each scheduled run is recorded and can be inspected through `GET /projects/runs`.
+
+Topic buffering can be tuned with:
+
+```bash
+TOPIC_BUFFER_MAX_TURNS=24
+TOPIC_BOUNDARY_CONFIDENCE=0.7
+TOPIC_BOUNDARY_EXCLUDE_LAST_TURN=true
+TOPIC_BOUNDARY_EXCLUDE_THRESHOLD=10
+```
+
 ## Development
 
 ```bash
 npm test
 npm run typecheck
 ```
+
+L2 project evaluation fixtures live in `src/domain/project-eval-fixtures.ts`. They cover merging related topics, keeping distinct projects separate, preserving workflow projects, and excluding preference-only topics. Use `runProjectEvaluationFixtures` from `src/domain/project-eval-runner.ts` to score a project extractor against those fixtures.
 
 ## Current Scope
 
@@ -248,7 +285,11 @@ Implemented:
 - CLI ingestion and batch import
 - Memory search
 - Memory status updates
+- LLM-assisted memory resolution with rule-based fallback
 - Offline topic-to-project memory extraction
+- Scheduled project build runs with run history
+- L2 project debug and evaluation fixtures
+- L3 dreaming with optional LLM compressor and rule-based fallback
 - Optional embedding search
 - Unit tests
 
@@ -258,7 +299,7 @@ Not included yet:
 - Production authentication
 - Multi-tenant authorization
 - Frontend management UI
-- Production LLM evaluation
+- Production LLM evaluation harness
 
 ## Design Docs
 
