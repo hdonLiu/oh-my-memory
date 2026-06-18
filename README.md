@@ -256,6 +256,7 @@ PROJECT_BUILD_INTERVAL_MS=300000
 ```
 
 The job scans active topic memories, groups their scopes, and runs the L2 project builder for each scope.
+Each scheduled run is recorded and can be inspected through `GET /projects/runs`.
 
 Topic buffering can be tuned with:
 
@@ -273,7 +274,7 @@ npm test
 npm run typecheck
 ```
 
-L2 project evaluation fixtures live in `src/domain/project-eval-fixtures.ts`. They cover merging related topics, keeping distinct projects separate, preserving workflow projects, and excluding preference-only topics.
+L2 project evaluation fixtures live in `src/domain/project-eval-fixtures.ts`. They cover merging related topics, keeping distinct projects separate, preserving workflow projects, and excluding preference-only topics. Use `runProjectEvaluationFixtures` from `src/domain/project-eval-runner.ts` to score a project extractor against those fixtures.
 
 ## Current Scope
 
@@ -284,7 +285,11 @@ Implemented:
 - CLI ingestion and batch import
 - Memory search
 - Memory status updates
+- LLM-assisted memory resolution with rule-based fallback
 - Offline topic-to-project memory extraction
+- Scheduled project build runs with run history
+- L2 project debug and evaluation fixtures
+- L3 dreaming with optional LLM compressor and rule-based fallback
 - Optional embedding search
 - Unit tests
 
@@ -294,7 +299,7 @@ Not included yet:
 - Production authentication
 - Multi-tenant authorization
 - Frontend management UI
-- Production LLM evaluation
+- Production LLM evaluation harness
 
 ## Design Docs
 
