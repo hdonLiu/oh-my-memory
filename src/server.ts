@@ -27,6 +27,11 @@ const searchSchema = scopeSchema.extend({
   limit: z.number().int().positive().optional()
 });
 
+const recallSchema = scopeSchema.extend({
+  query: z.string().min(1),
+  limit: z.number().int().positive().optional()
+});
+
 const patchSchema = z.object({
   status: z.enum(["active", "superseded", "deleted"]).optional(),
   summary: z.string().optional(),
@@ -95,6 +100,14 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
       return reply.status(400).send({ error: parsed.error.flatten() });
     }
     return service.search({ ...parsed.data, metadata: parsed.data.metadata });
+  });
+
+  app.post("/recall", async (request, reply) => {
+    const parsed = recallSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+    return service.recall({ ...parsed.data, metadata: parsed.data.metadata });
   });
 
   app.get("/memories", async (request) => {
@@ -194,6 +207,7 @@ function isMemoryService(value: Database.Database | MemoryStore | MemoryService)
     typeof (value as MemoryService).listProjectMemories === "function" &&
     typeof (value as MemoryService).listProjectBuildRuns === "function" &&
     typeof (value as MemoryService).search === "function" &&
+    typeof (value as MemoryService).recall === "function" &&
     typeof (value as MemoryService).runProjectBuild === "function" &&
     typeof (value as MemoryService).runDreaming === "function"
   );

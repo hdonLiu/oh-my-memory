@@ -38,6 +38,7 @@ export interface Memory extends Scope {
   predicate: string;
   object: string;
   summary: string;
+  readableText: string;
   confidence: number;
   status: MemoryStatus;
   supersedesId: string | null;
@@ -83,6 +84,8 @@ export interface TopicSegment extends Scope {
 }
 
 export type CreateTurnInput = Omit<ConversationTurn, "id" | "createdAt">;
-export type CreateMemoryInput = Omit<Memory, "id" | "createdAt" | "updatedAt">;
+export type CreateMemoryInput = Omit<Memory, "id" | "createdAt" | "updatedAt" | "readableText"> & {
+  readableText?: string;
+};
 export type CreateTopicSegmentInput = Omit<TopicSegment, "id" | "createdAt" | "updatedAt">;
 export type CreateProjectBuildRunInput = Omit<ProjectBuildRun, "id">;

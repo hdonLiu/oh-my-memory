@@ -1,12 +1,13 @@
 import { buildServer } from "./server.js";
-import { createMemoryService } from "./application/memory-service.js";
+import { createRuntimeMemoryService } from "./application/memory-service.js";
 import { startProjectBuildScheduler } from "./application/project-scheduler.js";
 import { createDatabase } from "./storage/database.js";
 import { MemoryRepository } from "./storage/repositories.js";
 
 const port = Number(process.env.PORT ?? 3000);
-const store = new MemoryRepository(createDatabase());
-const service = createMemoryService(store);
+const db = createDatabase();
+const store = new MemoryRepository(db);
+const service = createRuntimeMemoryService(store, {}, db);
 const app = buildServer(service);
 
 const scheduler = startProjectBuildScheduler(service);

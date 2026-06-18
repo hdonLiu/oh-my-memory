@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createMemoryService, type MemoryServiceOptions } from "../src/application/memory-service.js";
+import { createMemoryService, createRuntimeMemoryService, type MemoryServiceOptions } from "../src/application/memory-service.js";
 import { loadTopicWindowConfig } from "../src/application/topic-config.js";
 import { runCli } from "../src/cli.js";
 import {
@@ -26,6 +26,8 @@ import { HybridMemoryResolver, LlmMemoryResolver, RuleBasedMemoryResolver, resol
 import { searchMemories } from "../src/domain/search.js";
 import { projectEvaluationFixtures } from "../src/domain/project-eval-fixtures.js";
 import { runProjectEvaluationFixtures } from "../src/domain/project-eval-runner.js";
+import { recallEvaluationFixtures } from "../src/domain/recall-eval-fixtures.js";
+import { runRecallEvaluationFixtures } from "../src/domain/recall-eval-runner.js";
 import { SlidingTopicBuilder } from "../src/domain/topics.js";
 import {
   HybridTopicBoundaryDetector,
@@ -64,6 +66,9 @@ function createTestMemoryService(store: MemoryStore, options: MemoryServiceOptio
     projectMemoryBuilder: { rebuild: () => [] },
     compressor: new RuleBasedMemoryCompressor(),
     topicBuilder: new SlidingTopicBuilder(new RuleBasedTopicBoundaryDetector(), new RuleBasedTopicMemoryGenerator()),
+    recallPlanner: {
+      plan: () => ({ shouldUseMemory: false, selectedMemoryIds: [], reason: "test default" })
+    },
     ...options
   });
 }
@@ -657,6 +662,65 @@ describe("embedding abstraction", () => {
   });
 });
 
+describe("runtime service wiring", () => {
+  it("attaches SQLite vector search when embedding environment is configured", async () => {
+    const previousEnv = {
+      baseUrl: process.env.EMBEDDING_BASE_URL,
+      apiKey: process.env.EMBEDDING_API_KEY,
+      model: process.env.EMBEDDING_MODEL,
+      dimensions: process.env.EMBEDDING_DIMENSIONS
+    };
+    const previousFetch = globalThis.fetch;
+    process.env.EMBEDDING_BASE_URL = "https://embedding.test";
+    process.env.EMBEDDING_API_KEY = "test-key";
+    process.env.EMBEDDING_MODEL = "test-embedding";
+    process.env.EMBEDDING_DIMENSIONS = "3";
+    globalThis.fetch = async () =>
+      new Response(JSON.stringify({ data: [{ embedding: [1, 0, 0] }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+
+    try {
+      const db = createDatabase(":memory:");
+      const service = createRuntimeMemoryService(
+        new SqliteMemoryStore(db),
+        {
+          resolver: new RuleBasedMemoryResolver(),
+          projectMemoryBuilder: { rebuild: () => [] },
+          compressor: new RuleBasedMemoryCompressor(),
+          topicBuilder: new SlidingTopicBuilder(
+            { detectBoundary: () => ({ shouldClose: false, confidence: 0.8, reason: "same topic" }) },
+            new RuleBasedTopicMemoryGenerator()
+          ),
+          recallPlanner: {
+            plan: () => ({ shouldUseMemory: false, selectedMemoryIds: [], reason: "test default" })
+          }
+        },
+        db
+      );
+      const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+
+      await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 使用 PostgreSQL", ...scope });
+      const flushed = await service.flushSessionTopic(scope, "s1");
+      const rows = db.prepare("select id from memory_vectors").all();
+
+      expect(flushed.memories).toHaveLength(1);
+      expect(rows).toEqual([{ id: flushed.memories[0].id }]);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousEnv.baseUrl === undefined) delete process.env.EMBEDDING_BASE_URL;
+      else process.env.EMBEDDING_BASE_URL = previousEnv.baseUrl;
+      if (previousEnv.apiKey === undefined) delete process.env.EMBEDDING_API_KEY;
+      else process.env.EMBEDDING_API_KEY = previousEnv.apiKey;
+      if (previousEnv.model === undefined) delete process.env.EMBEDDING_MODEL;
+      else process.env.EMBEDDING_MODEL = previousEnv.model;
+      if (previousEnv.dimensions === undefined) delete process.env.EMBEDDING_DIMENSIONS;
+      else process.env.EMBEDDING_DIMENSIONS = previousEnv.dimensions;
+    }
+  });
+});
+
 describe("memory storage", () => {
   it("keeps persistence behind a replaceable MemoryStore interface", () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
@@ -691,7 +755,23 @@ describe("memory storage", () => {
     });
 
     expect(store.getMemory(memory.id)).toEqual(memory);
+    expect(memory.readableText).toBe("L2 fact: 项目 A 使用 PostgreSQL\n项目 A 使用 PostgreSQL");
     expect(store.listMemories({ mis: "u1" })).toEqual([memory]);
+  });
+
+  it("migrates databases to readable text and indexed schema", () => {
+    const db = createDatabase(":memory:");
+    const columns = db.pragma("table_info(memories)") as Array<{ name: string }>;
+    const memoryIndexes = db.pragma("index_list(memories)") as Array<{ name: string }>;
+    const topicIndexes = db.pragma("index_list(topic_segments)") as Array<{ name: string }>;
+    const runIndexes = db.pragma("index_list(project_build_runs)") as Array<{ name: string }>;
+    const versions = db.prepare("select version from schema_migrations").all() as Array<{ version: number }>;
+
+    expect(columns.map((column) => column.name)).toContain("readable_text");
+    expect(memoryIndexes.map((index) => index.name)).toContain("idx_memories_scope_status_level_type");
+    expect(topicIndexes.map((index) => index.name)).toContain("idx_topic_segments_scope_session_status");
+    expect(runIndexes.map((index) => index.name)).toContain("idx_project_build_runs_started_at");
+    expect(versions.map((version) => version.version)).toContain(1);
   });
 
   it("persists turns, memories, and relations", () => {
@@ -1218,6 +1298,51 @@ describe("memory api", () => {
     expect(response.statusCode).toBe(400);
     await app.close();
   });
+
+  it("recalls selected memories through an LLM-guided service", async () => {
+    const db = createDatabase(":memory:");
+    const store = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const memory = store.createMemory({
+      level: "L3",
+      type: "profile",
+      subject: "用户",
+      predicate: "偏好",
+      object: "TypeScript",
+      summary: "用户偏好 TypeScript",
+      confidence: 0.9,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope
+    });
+    const service = createTestMemoryService(store, {
+      recallPlanner: {
+        plan: async () => ({
+          shouldUseMemory: true,
+          selectedMemoryIds: [memory.id],
+          reason: "query asks for user preference"
+        })
+      }
+    });
+    const app = buildServer(service);
+
+    const response = await app.inject({
+      method: "POST",
+      url: "/recall",
+      payload: { query: "我应该用什么语言写脚本？", ...scope }
+    });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json()).toMatchObject({
+      shouldUseMemory: true,
+      reason: "query asks for user preference",
+      memories: [expect.objectContaining({ id: memory.id, readableText: memory.readableText })],
+      promptSnippets: [memory.readableText]
+    });
+
+    await app.close();
+  });
 });
 
 describe("extractor strategies", () => {
@@ -1547,6 +1672,36 @@ describe("memory search", () => {
 
     expect(results).toHaveLength(1);
     expect(results[0].memory.object).toBe("PostgreSQL");
+  });
+});
+
+describe("recall eval fixtures", () => {
+  it("covers hit, stale-filter, and no-memory-needed cases", async () => {
+    expect(recallEvaluationFixtures.map((fixture) => fixture.id)).toEqual([
+      "select-user-preference",
+      "exclude-superseded-memory",
+      "skip-when-memory-not-needed"
+    ]);
+
+    const passing = await runRecallEvaluationFixtures(recallEvaluationFixtures, {
+      recall: async (fixture) => fixture.expected
+    });
+
+    expect(passing).toMatchObject({ passed: 3, failed: 0 });
+
+    const failing = await runRecallEvaluationFixtures([recallEvaluationFixtures[0]], {
+      recall: async () => ({ shouldUseMemory: true, selectedMemoryIds: [], promptSnippets: [] })
+    });
+
+    expect(failing).toMatchObject({
+      passed: 0,
+      failed: 1,
+      results: [
+        expect.objectContaining({
+          errors: expect.arrayContaining([expect.stringContaining("missing memory")])
+        })
+      ]
+    });
   });
 });
 

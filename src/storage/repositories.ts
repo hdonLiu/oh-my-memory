@@ -39,6 +39,7 @@ type MemoryRow = {
   predicate: string;
   object: string;
   summary: string;
+  readable_text: string;
   confidence: number;
   status: MemoryStatus;
   supersedes_id: string | null;
@@ -133,13 +134,19 @@ export class MemoryRepository implements MemoryStore {
 
   createMemory(input: CreateMemoryInput): Memory {
     const timestamp = now();
-    const memory: Memory = { ...input, id: nanoid(), createdAt: timestamp, updatedAt: timestamp };
+    const memory: Memory = {
+      ...input,
+      readableText: input.readableText ?? buildReadableText(input),
+      id: nanoid(),
+      createdAt: timestamp,
+      updatedAt: timestamp
+    };
     this.db
       .prepare(
         `insert into memories
-        (id, level, type, subject, predicate, object, summary, confidence, status, supersedes_id,
+        (id, level, type, subject, predicate, object, summary, readable_text, confidence, status, supersedes_id,
          source_turn_ids, mis, source, agent, channel, metadata, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         memory.id,
@@ -149,6 +156,7 @@ export class MemoryRepository implements MemoryStore {
         memory.predicate,
         memory.object,
         memory.summary,
+        memory.readableText,
         memory.confidence,
         memory.status,
         memory.supersedesId,
@@ -169,11 +177,15 @@ export class MemoryRepository implements MemoryStore {
     if (!current) {
       throw new Error(`Memory not found: ${id}`);
     }
-    const updated: Memory = { ...current, ...patch, id, createdAt: current.createdAt, updatedAt: now() };
+    const merged = { ...current, ...patch, id, createdAt: current.createdAt, updatedAt: now() };
+    const updated: Memory = {
+      ...merged,
+      readableText: patch.readableText ?? buildReadableText(merged)
+    };
     this.db
       .prepare(
         `update memories set
-          level = ?, type = ?, subject = ?, predicate = ?, object = ?, summary = ?, confidence = ?,
+          level = ?, type = ?, subject = ?, predicate = ?, object = ?, summary = ?, readable_text = ?, confidence = ?,
           status = ?, supersedes_id = ?, source_turn_ids = ?, mis = ?, source = ?, agent = ?,
           channel = ?, metadata = ?, updated_at = ?
         where id = ?`
@@ -185,6 +197,7 @@ export class MemoryRepository implements MemoryStore {
         updated.predicate,
         updated.object,
         updated.summary,
+        updated.readableText,
         updated.confidence,
         updated.status,
         updated.supersedesId,
@@ -397,6 +410,7 @@ function mapMemory(row: MemoryRow): Memory {
     predicate: row.predicate,
     object: row.object,
     summary: row.summary,
+    readableText: row.readable_text,
     confidence: row.confidence,
     status: row.status,
     supersedesId: row.supersedes_id,
@@ -458,4 +472,8 @@ function mapProjectBuildRun(row: ProjectBuildRunRow): ProjectBuildRun {
 
 function now(): string {
   return new Date().toISOString();
+}
+
+export function buildReadableText(memory: Pick<Memory, "level" | "type" | "subject" | "predicate" | "object" | "summary">): string {
+  return `${memory.level} ${memory.type}: ${memory.subject} ${memory.predicate} ${memory.object}\n${memory.summary}`;
 }
