@@ -21,6 +21,7 @@ import { ModelProjectMemoryBuilder, buildProjectTopicInputs, rebuildProjectMemor
 import { HybridMemoryResolver, LlmMemoryResolver, RuleBasedMemoryResolver, resolveMemory } from "../src/domain/resolver.js";
 import { searchMemories } from "../src/domain/search.js";
 import { projectEvaluationFixtures } from "../src/domain/project-eval-fixtures.js";
+import { runProjectEvaluationFixtures } from "../src/domain/project-eval-runner.js";
 import { SlidingTopicBuilder } from "../src/domain/topics.js";
 import {
   HybridTopicBoundaryDetector,
@@ -494,6 +495,32 @@ describe("project debug api and eval fixtures", () => {
         projects: [],
         excludedTopicIds: ["topic-preference-1"]
       }
+    });
+  });
+
+  it("runs L2 project evaluation fixtures and reports failures", async () => {
+    const passing = await runProjectEvaluationFixtures(projectEvaluationFixtures, {
+      extract: async (fixture) => fixture.expected.projects
+    });
+
+    expect(passing.passed).toBe(projectEvaluationFixtures.length);
+    expect(passing.failed).toBe(0);
+    expect(passing.results.every((result) => result.passed)).toBe(true);
+
+    const failing = await runProjectEvaluationFixtures([projectEvaluationFixtures[0]], {
+      extract: async () => []
+    });
+
+    expect(failing).toMatchObject({
+      passed: 0,
+      failed: 1,
+      results: [
+        expect.objectContaining({
+          fixtureId: "merge-topics-into-project",
+          passed: false,
+          errors: [expect.stringContaining("missing project repository:oh-my-memory")]
+        })
+      ]
     });
   });
 });
