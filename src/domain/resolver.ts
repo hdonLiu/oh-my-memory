@@ -22,8 +22,7 @@ export class RuleBasedMemoryResolver implements MemoryResolver {
 
   const exact = candidates.find(
     (memory) =>
-      memory.subject === draft.subject &&
-      memory.predicate === draft.predicate &&
+      sameMemoryIdentity(memory, draft) &&
       memory.object === draft.object &&
       memory.type === draft.type
   );
@@ -39,8 +38,7 @@ export class RuleBasedMemoryResolver implements MemoryResolver {
 
   const updated = candidates.find(
     (memory) =>
-      memory.subject === draft.subject &&
-      memory.predicate === draft.predicate &&
+      sameMemoryIdentity(memory, draft) &&
       memory.object !== draft.object &&
       memory.type === draft.type
   );
@@ -196,4 +194,15 @@ function sameMemorySession(memory: Memory, draft: MemoryDraft): boolean {
     return true;
   }
   return memory.metadata.sessionId === draft.metadata.sessionId;
+}
+
+function sameMemoryIdentity(memory: Memory, draft: MemoryDraft): boolean {
+  if (memory.level === "L2" && memory.type === "project" && draft.level === "L2" && draft.type === "project") {
+    const memoryProjectKey = memory.metadata.projectKey;
+    const draftProjectKey = draft.metadata.projectKey;
+    if (typeof memoryProjectKey === "string" && typeof draftProjectKey === "string") {
+      return memoryProjectKey === draftProjectKey;
+    }
+  }
+  return memory.subject === draft.subject && memory.predicate === draft.predicate;
 }

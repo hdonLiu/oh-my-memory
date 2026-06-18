@@ -1990,4 +1990,43 @@ describe("memory extraction and resolution", () => {
     expect(repo.getMemory(old.id)?.status).toBe("superseded");
     expect(memory).toMatchObject({ object: "PostgreSQL", supersedesId: old.id });
   });
+
+  it("updates project memories by projectKey even when project names change", () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const old = repo.createMemory({
+      level: "L2",
+      type: "project",
+      subject: "old project name",
+      predicate: "project",
+      object: "Project is using MySQL",
+      summary: "Project is using MySQL",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope,
+      metadata: { projectKey: "repository:oh-my-memory", projectType: "repository" }
+    });
+
+    const resolved = resolveMemory(repo, {
+      level: "L2",
+      type: "project",
+      subject: "oh-my-memory",
+      predicate: "project",
+      object: "Project is using SQLite",
+      summary: "Project is using SQLite",
+      confidence: 0.9,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t2"],
+      ...scope,
+      metadata: { projectKey: "repository:oh-my-memory", projectType: "repository" }
+    });
+
+    expect(repo.getMemory(old.id)?.status).toBe("superseded");
+    expect(resolved).toMatchObject({ subject: "oh-my-memory", supersedesId: old.id, status: "active" });
+    expect(repo.listRelations(old.id)).toEqual([expect.objectContaining({ relationType: "update" })]);
+  });
 });
