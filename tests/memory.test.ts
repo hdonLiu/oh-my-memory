@@ -2,7 +2,7 @@ import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createMemoryService } from "../src/application/memory-service.js";
+import { createMemoryService, type MemoryServiceOptions } from "../src/application/memory-service.js";
 import { loadTopicWindowConfig } from "../src/application/topic-config.js";
 import { runCli } from "../src/cli.js";
 import {
@@ -13,11 +13,15 @@ import {
   SqliteVectorIndex,
   cosineSimilarity
 } from "../src/domain/embedding.js";
-import { extractMemories } from "../src/domain/extractor.js";
-import { HybridMemoryExtractor, LlmMemoryExtractor, RuleBasedMemoryExtractor } from "../src/domain/extractors.js";
+import { LlmMemoryExtractor } from "../src/domain/extractors.js";
 import { HybridMemoryCompressor, LlmMemoryCompressor, runDreaming } from "../src/domain/dreaming.js";
 import { loadProjectBuildSchedulerConfig, runScheduledProjectBuild } from "../src/application/project-scheduler.js";
-import { ModelProjectMemoryBuilder, buildProjectTopicInputs, rebuildProjectMemories } from "../src/domain/project-memory.js";
+import {
+  LlmProjectMemoryExtractor,
+  ModelProjectMemoryBuilder,
+  buildProjectTopicInputs,
+  rebuildProjectMemories
+} from "../src/domain/project-memory.js";
 import { HybridMemoryResolver, LlmMemoryResolver, RuleBasedMemoryResolver, resolveMemory } from "../src/domain/resolver.js";
 import { searchMemories } from "../src/domain/search.js";
 import { projectEvaluationFixtures } from "../src/domain/project-eval-fixtures.js";
@@ -36,6 +40,7 @@ import { createDatabase } from "../src/storage/database.js";
 import { MemoryRepository } from "../src/storage/repositories.js";
 import { SqliteMemoryStore } from "../src/storage/sqlite-store.js";
 import type { MemoryStore } from "../src/storage/store.js";
+import type { ConversationTurn, CreateMemoryInput } from "../src/domain/types.js";
 
 class TrackingEmbeddingIndex implements EmbeddingIndex {
   readonly upsertedIds: string[] = [];
@@ -51,6 +56,36 @@ class TrackingEmbeddingIndex implements EmbeddingIndex {
     this.searchCount += 1;
     return this.upsertedIds.map((id) => ({ id, score: 10, metadata: {} }));
   }
+}
+
+function createTestMemoryService(store: MemoryStore, options: MemoryServiceOptions = {}) {
+  return createMemoryService(store, {
+    resolver: new RuleBasedMemoryResolver(),
+    projectMemoryBuilder: { rebuild: () => [] },
+    compressor: new RuleBasedMemoryCompressor(),
+    topicBuilder: new SlidingTopicBuilder(new RuleBasedTopicBoundaryDetector(), new RuleBasedTopicMemoryGenerator()),
+    ...options
+  });
+}
+
+function projectUsageDraft(turn: ConversationTurn, object: string): CreateMemoryInput {
+  return {
+    level: "L2",
+    type: "fact",
+    subject: "项目 A",
+    predicate: "使用",
+    object,
+    summary: `项目 A 使用 ${object}`,
+    confidence: 0.9,
+    status: "active",
+    supersedesId: null,
+    sourceTurnIds: [turn.id],
+    mis: turn.mis,
+    source: turn.source,
+    agent: turn.agent,
+    channel: turn.channel,
+    metadata: turn.metadata
+  };
 }
 
 describe("topic boundary detection", () => {
@@ -243,7 +278,7 @@ describe("session sliding topic builder", () => {
         reason: "topic changed"
       })
     };
-    const service = createMemoryService(store, {
+    const service = createTestMemoryService(store, {
       topicBuilder: new SlidingTopicBuilder(detector, new RuleBasedTopicMemoryGenerator(), {
         maxSize: 5,
         minConfidence: 0.7
@@ -266,7 +301,7 @@ describe("session sliding topic builder", () => {
 
   it("forces close when max window size is reached", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const service = createMemoryService(store, {
+    const service = createTestMemoryService(store, {
       topicBuilder: new SlidingTopicBuilder(
         { detectBoundary: () => ({ shouldClose: false, confidence: 0.8, reason: "same topic" }) },
         new RuleBasedTopicMemoryGenerator(),
@@ -288,7 +323,7 @@ describe("topic resolver integration", () => {
   it("runs MemoryResolver only when a topic closes", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
     const resolvedSubjects: string[] = [];
-    const service = createMemoryService(store, {
+    const service = createTestMemoryService(store, {
       resolver: {
         resolve: (repo, draft) => {
           resolvedSubjects.push(draft.subject);
@@ -320,7 +355,7 @@ describe("session topic flush", () => {
 
   it("flushes an open partial topic into a memory", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const service = createMemoryService(store, {
+    const service = createTestMemoryService(store, {
       topicBuilder: new SlidingTopicBuilder(
         { detectBoundary: () => ({ shouldClose: false, confidence: 0.8, reason: "same topic" }) },
         new RuleBasedTopicMemoryGenerator()
@@ -337,7 +372,7 @@ describe("session topic flush", () => {
 
   it("exposes HTTP flush endpoint", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const app = buildServer(createMemoryService(store));
+    const app = buildServer(createTestMemoryService(store));
 
     await app.inject({
       method: "POST",
@@ -359,7 +394,7 @@ describe("session topic flush", () => {
 describe("default topic LLM wiring", () => {
   it("keeps topic layer injectable without requiring network in tests", () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const service = createMemoryService(store, {
+    const service = createTestMemoryService(store, {
       topicBuilder: new SlidingTopicBuilder(
         { detectBoundary: () => ({ shouldClose: false, confidence: 0.8, reason: "test" }) },
         new RuleBasedTopicMemoryGenerator()
@@ -394,7 +429,7 @@ describe("topic configuration and debug api", () => {
 
   it("returns topic segments for debugging", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const app = buildServer(createMemoryService(store));
+    const app = buildServer(createTestMemoryService(store));
 
     await app.inject({
       method: "POST",
@@ -463,7 +498,7 @@ describe("project debug api and eval fixtures", () => {
       ...scope,
       metadata: { projectKey: "workflow:debug", projectType: "workflow" }
     });
-    const app = buildServer(createMemoryService(store));
+    const app = buildServer(createTestMemoryService(store));
 
     const response = await app.inject({
       method: "GET",
@@ -703,7 +738,7 @@ describe("memory storage", () => {
 describe("memory application service", () => {
   it("ingests turns without depending on HTTP transport", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const service = createMemoryService(store);
+    const service = createTestMemoryService(store);
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     const first = await service.ingestTurn({
@@ -735,7 +770,7 @@ describe("memory application service", () => {
 
   it("creates topic memories without creating L2 during online ingestion", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const service = createMemoryService(store);
+    const service = createTestMemoryService(store);
 
     await service.ingestTurn({
       sessionId: "s1",
@@ -761,7 +796,7 @@ describe("memory application service", () => {
 
   it("resolves topic memory updates and relations before rebuilding L2", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const service = createMemoryService(store);
+    const service = createTestMemoryService(store);
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 使用 MySQL", ...scope });
@@ -799,7 +834,7 @@ describe("memory application service", () => {
         };
       }
     };
-    const service = createMemoryService(store, {
+    const service = createTestMemoryService(store, {
       topicBuilder: new SlidingTopicBuilder(detector, new RuleBasedTopicMemoryGenerator(), { maxSize: 3, minConfidence: 0.7 })
     });
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
@@ -813,7 +848,7 @@ describe("memory application service", () => {
 
   it("supports custom project builder and compressor strategies", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const service = createMemoryService(store, {
+    const service = createTestMemoryService(store, {
       projectMemoryBuilder: {
         rebuild(memoryStore, scope) {
           return [
@@ -877,7 +912,7 @@ describe("memory application service", () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
     const embeddingProvider = new DeterministicEmbeddingProvider(32);
     const embeddingIndex = new TrackingEmbeddingIndex();
-    const service = createMemoryService(store, {
+    const service = createTestMemoryService(store, {
       embeddingProvider,
       embeddingIndex
     });
@@ -925,7 +960,7 @@ describe("topic extraction layer", () => {
         };
       }
     };
-    const service = createMemoryService(store, {
+    const service = createTestMemoryService(store, {
       topicBuilder: new SlidingTopicBuilder(
         detector,
         {
@@ -968,7 +1003,7 @@ describe("topic extraction layer", () => {
 
   it("forces the open buffer to close when it reaches max size", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const service = createMemoryService(store, {
+    const service = createTestMemoryService(store, {
       topicBuilder: new SlidingTopicBuilder(
         {
           detectBoundary() {
@@ -1011,7 +1046,7 @@ describe("topic extraction layer", () => {
         };
       }
     };
-    const service = createMemoryService(store, {
+    const service = createTestMemoryService(store, {
       topicBuilder: new SlidingTopicBuilder(detector, new RuleBasedTopicMemoryGenerator(), { maxSize: 3, minConfidence: 0.7 })
     });
 
@@ -1028,7 +1063,7 @@ describe("topic extraction layer", () => {
 
   it("skips extraction when the turn is noise", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const service = createMemoryService(store, {
+    const service = createTestMemoryService(store, {
       topicBuilder: new SlidingTopicBuilder(
         {
           detectBoundary() {
@@ -1062,7 +1097,7 @@ describe("topic extraction layer", () => {
 
   it("reuses duplicate topic memories through resolver", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const service = createMemoryService(store);
+    const service = createTestMemoryService(store);
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     await service.ingestTurn({
@@ -1091,7 +1126,7 @@ describe("topic extraction layer", () => {
 describe("memory api", () => {
   it("writes turns, searches memories, manages status, lists relations, and runs dreaming", async () => {
     const db = createDatabase(":memory:");
-    const app = buildServer(db);
+    const app = buildServer(createTestMemoryService(new MemoryRepository(db)));
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     const first = await app.inject({
@@ -1173,7 +1208,7 @@ describe("memory api", () => {
 
   it("returns 400 when scope is missing", async () => {
     const db = createDatabase(":memory:");
-    const app = buildServer(db);
+    const app = buildServer(createTestMemoryService(new MemoryRepository(db)));
     const response = await app.inject({
       method: "POST",
       url: "/turns",
@@ -1186,7 +1221,7 @@ describe("memory api", () => {
 });
 
 describe("extractor strategies", () => {
-  it("keeps rule-based extractor compatible with extractMemories", () => {
+  it("extracts memory drafts with an LLM only", async () => {
     const store = new SqliteMemoryStore(createDatabase(":memory:"));
     const turn = store.createTurn({
       sessionId: "s1",
@@ -1199,10 +1234,29 @@ describe("extractor strategies", () => {
       metadata: {}
     });
 
-    expect(new RuleBasedMemoryExtractor().extract(turn, [])).toEqual(extractMemories(turn, []));
+    const extractor = new LlmMemoryExtractor({
+      complete: async () =>
+        JSON.stringify({
+          memories: [
+            {
+              level: "L2",
+              type: "fact",
+              subject: "项目 A",
+              predicate: "使用",
+              object: "PostgreSQL",
+              summary: "项目 A 使用 PostgreSQL",
+              confidence: 0.91
+            }
+          ]
+        })
+    });
+
+    await expect(extractor.extract(turn, [])).resolves.toEqual([
+      expect.objectContaining({ subject: "项目 A", predicate: "使用", object: "PostgreSQL" })
+    ]);
   });
 
-  it("validates LLM extractor JSON and falls back through hybrid extractor", async () => {
+  it("rejects invalid LLM extractor JSON without fallback", async () => {
     const store = new SqliteMemoryStore(createDatabase(":memory:"));
     const turn = store.createTurn({
       sessionId: "s1",
@@ -1214,18 +1268,36 @@ describe("extractor strategies", () => {
       channel: "default",
       metadata: {}
     });
-
     const invalid = new LlmMemoryExtractor({
       complete: async () => "not-json"
     });
-    await expect(invalid.extract(turn, [])).rejects.toThrow("Invalid LLM memory extraction response");
 
-    const hybrid = new HybridMemoryExtractor(invalid, new RuleBasedMemoryExtractor());
-    await expect(hybrid.extract(turn, [])).resolves.toEqual(extractMemories(turn, []));
+    await expect(invalid.extract(turn, [])).rejects.toThrow("Invalid LLM memory extraction response");
   });
 });
 
 describe("strategy compatibility", () => {
+  it("requires LLM configuration for default service strategies", () => {
+    const previous = {
+      baseUrl: process.env.LLM_BASE_URL,
+      apiKey: process.env.LLM_API_KEY,
+      model: process.env.LLM_MODEL
+    };
+    delete process.env.LLM_BASE_URL;
+    delete process.env.LLM_API_KEY;
+    delete process.env.LLM_MODEL;
+    const store = new SqliteMemoryStore(createDatabase(":memory:"));
+
+    expect(() => createMemoryService(store)).toThrow("LLM configuration is required");
+
+    if (previous.baseUrl === undefined) delete process.env.LLM_BASE_URL;
+    else process.env.LLM_BASE_URL = previous.baseUrl;
+    if (previous.apiKey === undefined) delete process.env.LLM_API_KEY;
+    else process.env.LLM_API_KEY = previous.apiKey;
+    if (previous.model === undefined) delete process.env.LLM_MODEL;
+    else process.env.LLM_MODEL = previous.model;
+  });
+
   it("keeps default strategies compatible with existing functions", async () => {
     const store = new SqliteMemoryStore(createDatabase(":memory:"));
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
@@ -1235,7 +1307,7 @@ describe("strategy compatibility", () => {
       content: "项目 A 使用 PostgreSQL",
       ...scope
     });
-    const draft = extractMemories(turn, [])[0];
+    const draft = projectUsageDraft(turn, "PostgreSQL");
     const resolved = new RuleBasedMemoryResolver().resolve(store, draft);
     store.createMemory({
       level: "topic",
@@ -1279,11 +1351,46 @@ describe("strategy compatibility", () => {
 
 describe("cli ingestion", () => {
   it("ingests one turn and imports a batch through MemoryService", async () => {
+    const previousEnv = {
+      baseUrl: process.env.LLM_BASE_URL,
+      apiKey: process.env.LLM_API_KEY,
+      model: process.env.LLM_MODEL
+    };
+    const previousFetch = globalThis.fetch;
+    process.env.LLM_BASE_URL = "https://llm.test";
+    process.env.LLM_API_KEY = "test-key";
+    process.env.LLM_MODEL = "test-model";
+    globalThis.fetch = async (_input, init) => {
+      const body = JSON.parse(String(init?.body)) as { messages: Array<{ content: string }> };
+      const prompt = JSON.parse(body.messages[0].content) as {
+        task: string;
+        turns?: Array<{ id: string; content: string }>;
+      };
+      const content = prompt.task.startsWith("Convert a closed conversation topic")
+        ? JSON.stringify({
+            title: prompt.turns?.at(-1)?.content ?? "topic",
+            summary: prompt.turns?.map((turn) => turn.content).join("\n") ?? "",
+            topicType: "project_work",
+            entities: ["项目 A"],
+            decisions: [],
+            tasks: [],
+            preferences: [],
+            confidence: 0.9,
+            reason: "test",
+            evidenceTurnIds: prompt.turns?.map((turn) => turn.id) ?? []
+          })
+        : JSON.stringify({ operation: "add", confidence: 0.9 });
+      return new Response(JSON.stringify({ choices: [{ message: { content } }] }), {
+        status: 200,
+        headers: { "content-type": "application/json" }
+      });
+    };
     const dir = mkdtempSync(join(tmpdir(), "oh-my-memory-"));
     const dbPath = join(dir, "memory.sqlite");
     const batchPath = join(dir, "batch.json");
 
-    const single = await runCli([
+    try {
+      const single = await runCli([
       "ingest",
       "--db",
       dbPath,
@@ -1302,9 +1409,9 @@ describe("cli ingestion", () => {
       "--channel",
       "default"
     ]);
-    expect(single.exitCode).toBe(0);
+      expect(single.exitCode).toBe(0);
 
-    writeFileSync(
+      writeFileSync(
       batchPath,
       JSON.stringify([
         {
@@ -1329,13 +1436,22 @@ describe("cli ingestion", () => {
       ])
     );
 
-    const imported = await runCli(["import", "--db", dbPath, batchPath]);
-    expect(imported.exitCode).toBe(1);
-    expect(imported.stdout).toContain('"success":1');
-    expect(imported.stdout).toContain('"failed":1');
+      const imported = await runCli(["import", "--db", dbPath, batchPath]);
+      expect(imported.exitCode).toBe(1);
+      expect(imported.stdout).toContain('"success":1');
+      expect(imported.stdout).toContain('"failed":1');
 
-    const store = new SqliteMemoryStore(createDatabase(dbPath));
-    expect(store.listMemories({ mis: "u1" }).some((memory) => memory.object.includes("PostgreSQL"))).toBe(true);
+      const store = new SqliteMemoryStore(createDatabase(dbPath));
+      expect(store.listMemories({ mis: "u1" }).some((memory) => memory.object.includes("PostgreSQL"))).toBe(true);
+    } finally {
+      globalThis.fetch = previousFetch;
+      if (previousEnv.baseUrl === undefined) delete process.env.LLM_BASE_URL;
+      else process.env.LLM_BASE_URL = previousEnv.baseUrl;
+      if (previousEnv.apiKey === undefined) delete process.env.LLM_API_KEY;
+      else process.env.LLM_API_KEY = previousEnv.apiKey;
+      if (previousEnv.model === undefined) delete process.env.LLM_MODEL;
+      else process.env.LLM_MODEL = previousEnv.model;
+    }
   });
 });
 
@@ -1533,7 +1649,7 @@ describe("project memory and dreaming", () => {
     });
 
     const scopesRun: string[] = [];
-    const service = createMemoryService(repo, {
+    const service = createTestMemoryService(repo, {
       projectMemoryBuilder: {
         rebuild(_store, scope) {
           scopesRun.push(`${scope.mis}:${scope.metadata.team as string}`);
@@ -1570,7 +1686,7 @@ describe("project memory and dreaming", () => {
       sourceTurnIds: ["t1"],
       ...scope
     });
-    const service = createMemoryService(repo, {
+    const service = createTestMemoryService(repo, {
       projectMemoryBuilder: {
         rebuild(memoryStore, scope) {
           return [
@@ -1610,7 +1726,7 @@ describe("project memory and dreaming", () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
     const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
-    const service = createMemoryService(repo);
+    const service = createTestMemoryService(repo);
     service.recordProjectBuildRun({
       startedAt: "2026-06-18T00:00:00.000Z",
       endedAt: "2026-06-18T00:00:01.000Z",
@@ -1701,6 +1817,48 @@ describe("project memory and dreaming", () => {
     });
     expect(project.summary).toContain("PostgreSQL");
     expect(project.summary).toContain("Node.js");
+  });
+
+  it("rejects project model output with unknown evidence memory ids", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const topic = repo.createMemory({
+      level: "topic",
+      type: "topic",
+      subject: "项目 A",
+      predicate: "topic",
+      object: "项目 A 使用 PostgreSQL",
+      summary: "项目 A 使用 PostgreSQL",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope
+    });
+    const extractor = new LlmProjectMemoryExtractor({
+      complete: async () =>
+        JSON.stringify({
+          projects: [
+            {
+              projectKey: "repository:oh-my-memory",
+              projectName: "oh-my-memory",
+              projectType: "repository",
+              purpose: "memory service",
+              currentState: "uses PostgreSQL",
+              decisions: [],
+              constraints: [],
+              openQuestions: [],
+              evidenceMemoryIds: ["missing"],
+              confidence: 0.9
+            }
+          ]
+        })
+    });
+
+    await expect(
+      extractor.extract({ topics: [topic], topicInputs: buildProjectTopicInputs([topic]), existingProjects: [], scope })
+    ).rejects.toThrow("unknown evidenceMemoryIds");
   });
 
   it("promotes preference topics into L3 profile memories", () => {
@@ -1796,6 +1954,43 @@ describe("project memory and dreaming", () => {
     ]);
   });
 
+  it("rejects model compressor output with unknown evidence memory ids", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    repo.createMemory({
+      level: "L2",
+      type: "project",
+      subject: "oh-my-memory",
+      predicate: "project",
+      object: "The project is a local memory service.",
+      summary: "oh-my-memory is a local memory service.",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope
+    });
+    const compressor = new LlmMemoryCompressor({
+      complete: async () =>
+        JSON.stringify({
+          memories: [
+            {
+              type: "profile",
+              subject: "oh-my-memory",
+              predicate: "定位",
+              object: "local memory service",
+              summary: "oh-my-memory is a local memory service.",
+              confidence: 0.91,
+              evidenceMemoryIds: ["missing"]
+            }
+          ]
+        })
+    });
+
+    await expect(compressor.compress(repo, scope)).rejects.toThrow("unknown evidenceMemoryIds");
+  });
+
   it("falls back to rule-based dreaming when model compressor output is invalid", async () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
@@ -1821,37 +2016,7 @@ describe("project memory and dreaming", () => {
   });
 });
 
-describe("memory extraction and resolution", () => {
-  it("filters noise and extracts valuable legacy facts", () => {
-    const db = createDatabase(":memory:");
-    const repo = new MemoryRepository(db);
-    const noiseTurn = repo.createTurn({
-      sessionId: "s1",
-      role: "user",
-      content: "谢谢",
-      mis: "u1",
-      source: "test",
-      agent: "agent",
-      channel: "default",
-      metadata: {}
-    });
-    const projectTurn = repo.createTurn({
-      sessionId: "s1",
-      role: "user",
-      content: "项目 A 使用 PostgreSQL",
-      mis: "u1",
-      source: "test",
-      agent: "agent",
-      channel: "default",
-      metadata: {}
-    });
-
-    expect(extractMemories(noiseTurn, [])).toEqual([]);
-    expect(extractMemories(projectTurn, [])).toMatchObject([
-      { subject: "项目 A", predicate: "使用", object: "PostgreSQL" }
-    ]);
-  });
-
+describe("memory resolution", () => {
   it("supersedes old memory when subject and predicate match with a new object", () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
@@ -1883,7 +2048,7 @@ describe("memory extraction and resolution", () => {
       metadata: {}
     });
 
-    const [draft] = extractMemories(turn, []);
+    const draft = projectUsageDraft(turn, "PostgreSQL");
     const newMemory = resolveMemory(repo, draft);
 
     expect(repo.getMemory(old.id)?.status).toBe("superseded");
@@ -1925,7 +2090,7 @@ describe("memory extraction and resolution", () => {
       metadata: {}
     });
 
-    const [draft] = extractMemories(turn, []);
+    const draft = projectUsageDraft(turn, "PostgreSQL");
     const merged = resolveMemory(repo, draft);
 
     expect(merged.id).toBe(old.id);
@@ -1966,7 +2131,7 @@ describe("memory extraction and resolution", () => {
       channel: "default",
       metadata: {}
     });
-    const [draft] = extractMemories(turn, []);
+    const draft = projectUsageDraft(turn, "PostgreSQL");
     const resolver = new LlmMemoryResolver({
       complete: async () => JSON.stringify({ operation: "update", targetMemoryId: old.id, confidence: 0.92 })
     });
@@ -2010,7 +2175,7 @@ describe("memory extraction and resolution", () => {
       channel: "default",
       metadata: {}
     });
-    const [draft] = extractMemories(turn, []);
+    const draft = projectUsageDraft(turn, "PostgreSQL");
     const resolver = new LlmMemoryResolver({
       complete: async () => JSON.stringify({ operation: "none", targetMemoryId: old.id, confidence: 0.96 })
     });
@@ -2055,7 +2220,7 @@ describe("memory extraction and resolution", () => {
       channel: "default",
       metadata: {}
     });
-    const [draft] = extractMemories(turn, []);
+    const draft = projectUsageDraft(turn, "PostgreSQL");
     const resolver = new HybridMemoryResolver(new LlmMemoryResolver({ complete: async () => "bad-json" }));
 
     const memory = await resolver.resolve(repo, draft);

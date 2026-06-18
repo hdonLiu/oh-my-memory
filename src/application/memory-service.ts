@@ -1,7 +1,5 @@
 import {
-  HybridMemoryCompressor,
   LlmMemoryCompressor,
-  RuleBasedMemoryCompressor,
   type DreamingResult,
   type MemoryCompressor
 } from "../domain/dreaming.js";
@@ -10,13 +8,12 @@ import { OpenAICompatibleCompletionClient } from "../domain/extractors.js";
 import {
   LlmProjectMemoryExtractor,
   ModelProjectMemoryBuilder,
-  NoopProjectMemoryExtractor,
   type ProjectMemoryBuilder
 } from "../domain/project-memory.js";
-import { HybridMemoryResolver, LlmMemoryResolver, RuleBasedMemoryResolver, type MemoryResolver } from "../domain/resolver.js";
+import { LlmMemoryResolver, type MemoryResolver } from "../domain/resolver.js";
 import { searchMemories, type SearchInput, type SearchResult } from "../domain/search.js";
-import { HybridTopicBoundaryDetector, LlmTopicBoundaryDetector, RuleBasedTopicBoundaryDetector } from "../domain/topic-boundary.js";
-import { LlmTopicMemoryGenerator, RuleBasedTopicMemoryGenerator, topicMemoryUnitToDraft } from "../domain/topic-memory.js";
+import { LlmTopicBoundaryDetector } from "../domain/topic-boundary.js";
+import { LlmTopicMemoryGenerator, topicMemoryUnitToDraft } from "../domain/topic-memory.js";
 import { SlidingTopicBuilder, type TopicBuilder } from "../domain/topics.js";
 import type {
   ConversationTurn,
@@ -231,57 +228,33 @@ function toScope(input: CreateTurnInput): Scope {
 }
 
 function createDefaultMemoryResolver(): MemoryResolver {
-  const baseUrl = process.env.LLM_BASE_URL;
-  const apiKey = process.env.LLM_API_KEY;
-  const model = process.env.LLM_MODEL;
-  if (!baseUrl || !apiKey || !model) {
-    return new RuleBasedMemoryResolver();
-  }
-  return new HybridMemoryResolver(
-    new LlmMemoryResolver(new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model })),
-    new RuleBasedMemoryResolver()
-  );
+  return new LlmMemoryResolver(createDefaultCompletionClient());
 }
 
 function createDefaultMemoryCompressor(resolver: MemoryResolver): MemoryCompressor {
-  const baseUrl = process.env.LLM_BASE_URL;
-  const apiKey = process.env.LLM_API_KEY;
-  const model = process.env.LLM_MODEL;
-  if (!baseUrl || !apiKey || !model) {
-    return new RuleBasedMemoryCompressor();
-  }
-  return new HybridMemoryCompressor(
-    new LlmMemoryCompressor(new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model }), resolver),
-    new RuleBasedMemoryCompressor()
-  );
+  return new LlmMemoryCompressor(createDefaultCompletionClient(), resolver);
 }
 
 function createDefaultProjectMemoryBuilder(resolver: MemoryResolver): ProjectMemoryBuilder {
-  const baseUrl = process.env.LLM_BASE_URL;
-  const apiKey = process.env.LLM_API_KEY;
-  const model = process.env.LLM_MODEL;
-  if (!baseUrl || !apiKey || !model) {
-    return new ModelProjectMemoryBuilder(new NoopProjectMemoryExtractor(), resolver);
-  }
   return new ModelProjectMemoryBuilder(
-    new LlmProjectMemoryExtractor(new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model })),
+    new LlmProjectMemoryExtractor(createDefaultCompletionClient()),
     resolver
   );
 }
 
 function createDefaultTopicBuilder(): TopicBuilder {
+  const client = createDefaultCompletionClient();
+  return new SlidingTopicBuilder(new LlmTopicBoundaryDetector(client), new LlmTopicMemoryGenerator(client), loadTopicWindowConfig());
+}
+
+function createDefaultCompletionClient(): OpenAICompatibleCompletionClient {
   const baseUrl = process.env.LLM_BASE_URL;
   const apiKey = process.env.LLM_API_KEY;
   const model = process.env.LLM_MODEL;
   if (!baseUrl || !apiKey || !model) {
-    return new SlidingTopicBuilder(new RuleBasedTopicBoundaryDetector(), new RuleBasedTopicMemoryGenerator(), loadTopicWindowConfig());
+    throw new Error("LLM configuration is required: set LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL");
   }
-  const client = new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model });
-  return new SlidingTopicBuilder(
-    new HybridTopicBoundaryDetector(new LlmTopicBoundaryDetector(client), new RuleBasedTopicBoundaryDetector()),
-    new LlmTopicMemoryGenerator(client),
-    loadTopicWindowConfig()
-  );
+  return new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model });
 }
 
 function topicToDraftFromSegment(topic: TopicSegment): CreateMemoryInput {

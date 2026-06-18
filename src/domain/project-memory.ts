@@ -89,6 +89,7 @@ export class LlmProjectMemoryExtractor implements ProjectMemoryExtractor {
     const raw = await this.client.complete(buildPrompt(input));
     const parsed = parseProjectResponse(raw);
     return parsed.projects.map((project) => {
+      assertKnownEvidenceIds(project.evidenceMemoryIds, input.topics.map((topic) => topic.id));
       const evidenceTopics = input.topics.filter((topic) => project.evidenceMemoryIds.includes(topic.id));
       return {
         level: "L2",
@@ -117,6 +118,14 @@ export class LlmProjectMemoryExtractor implements ProjectMemoryExtractor {
         }
       };
     });
+  }
+}
+
+function assertKnownEvidenceIds(evidenceMemoryIds: string[], knownIds: string[]): void {
+  const known = new Set(knownIds);
+  const unknown = evidenceMemoryIds.filter((id) => !known.has(id));
+  if (unknown.length > 0) {
+    throw new Error(`LLM project extraction returned unknown evidenceMemoryIds: ${unknown.join(", ")}`);
   }
 }
 

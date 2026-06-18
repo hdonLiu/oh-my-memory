@@ -60,6 +60,7 @@ export class SlidingTopicBuilder implements TopicBuilder {
       existingTurns: this.boundaryDetectionTurns(existingTurns),
       newTurn: latest
     });
+    assertKnownBoundaryTurnIds(boundary, [...existingTurns, latest]);
 
     if (boundary.shouldClose && boundary.confidence >= this.config.minConfidence) {
       const closed = await this.closeTurns(
@@ -187,6 +188,15 @@ export class SlidingTopicBuilder implements TopicBuilder {
       metadata: { ...scope.metadata, ...input.metadata }
     };
     return existing ? store.updateTopicSegment(existing.id, patch) : store.createTopicSegment(patch);
+  }
+}
+
+function assertKnownBoundaryTurnIds(boundary: TopicBoundaryDecision, turns: ConversationTurn[]): void {
+  const known = new Set(turns.map((turn) => turn.id));
+  const ids = [...(boundary.closedTurnIds ?? []), ...(boundary.carryOverTurnIds ?? [])];
+  const unknown = ids.filter((id) => !known.has(id));
+  if (unknown.length > 0) {
+    throw new Error(`LLM topic boundary returned unknown turn ids: ${unknown.join(", ")}`);
   }
 }
 

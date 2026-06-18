@@ -1,15 +1,10 @@
 import { z } from "zod";
-import { extractMemories, type MemoryDraft } from "./extractor.js";
-import type { ConversationTurn, MemoryLevel, MemoryType } from "./types.js";
+import type { ConversationTurn, CreateMemoryInput, MemoryLevel, MemoryType } from "./types.js";
+
+export type MemoryDraft = CreateMemoryInput;
 
 export interface MemoryExtractor {
   extract(turn: ConversationTurn, window: ConversationTurn[]): Promise<MemoryDraft[]> | MemoryDraft[];
-}
-
-export class RuleBasedMemoryExtractor implements MemoryExtractor {
-  extract(turn: ConversationTurn, window: ConversationTurn[]): MemoryDraft[] {
-    return extractMemories(turn, window);
-  }
 }
 
 export interface LlmCompletionClient {
@@ -92,21 +87,6 @@ export class LlmMemoryExtractor implements MemoryExtractor {
       channel: turn.channel,
       metadata: turn.metadata
     }));
-  }
-}
-
-export class HybridMemoryExtractor implements MemoryExtractor {
-  constructor(
-    private readonly primary: MemoryExtractor,
-    private readonly fallback: MemoryExtractor
-  ) {}
-
-  async extract(turn: ConversationTurn, window: ConversationTurn[]): Promise<MemoryDraft[]> {
-    try {
-      return await this.primary.extract(turn, window);
-    } catch {
-      return this.fallback.extract(turn, window);
-    }
   }
 }
 

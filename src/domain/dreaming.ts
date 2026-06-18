@@ -1,6 +1,6 @@
 import { z } from "zod";
 import type { LlmCompletionClient } from "./extractors.js";
-import { RuleBasedMemoryResolver, type MemoryResolver } from "./resolver.js";
+import type { MemoryResolver } from "./resolver.js";
 import type { CreateMemoryInput, Memory, MemoryType, Scope } from "./types.js";
 import type { MemoryStore } from "../storage/store.js";
 
@@ -14,6 +14,12 @@ export function runDreaming(repo: MemoryStore, scope: Scope): DreamingResult {
 
 export interface MemoryCompressor {
   compress(repo: MemoryStore, scope: Scope): DreamingResult | Promise<DreamingResult>;
+}
+
+class DirectMemoryResolver implements MemoryResolver {
+  resolve(repo: MemoryStore, draft: CreateMemoryInput): Memory {
+    return repo.createMemory(draft);
+  }
 }
 
 export class RuleBasedMemoryCompressor implements MemoryCompressor {
@@ -87,7 +93,7 @@ const llmDreamResponseSchema = z.object({
 export class LlmMemoryCompressor implements MemoryCompressor {
   constructor(
     private readonly client: LlmCompletionClient,
-    private readonly resolver: MemoryResolver = new RuleBasedMemoryResolver()
+    private readonly resolver: MemoryResolver = new DirectMemoryResolver()
   ) {}
 
   async compress(repo: MemoryStore, scope: Scope): Promise<DreamingResult> {
@@ -98,6 +104,7 @@ export class LlmMemoryCompressor implements MemoryCompressor {
     const parsed = parseDreamingResponse(raw);
     const createdOrUpdated: Memory[] = [];
     for (const memory of parsed.memories) {
+      assertKnownEvidenceIds(memory.evidenceMemoryIds, candidates.map((candidate) => candidate.id));
       const evidence = candidates.filter((candidate) => memory.evidenceMemoryIds.includes(candidate.id));
       const draft: CreateMemoryInput = {
         level: "L3",
@@ -122,6 +129,14 @@ export class LlmMemoryCompressor implements MemoryCompressor {
       createdOrUpdated.push(await this.resolver.resolve(repo, draft));
     }
     return { createdOrUpdated };
+  }
+}
+
+function assertKnownEvidenceIds(evidenceMemoryIds: string[], knownIds: string[]): void {
+  const known = new Set(knownIds);
+  const unknown = evidenceMemoryIds.filter((id) => !known.has(id));
+  if (unknown.length > 0) {
+    throw new Error(`LLM dreaming returned unknown evidenceMemoryIds: ${unknown.join(", ")}`);
   }
 }
 
