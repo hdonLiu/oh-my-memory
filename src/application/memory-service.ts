@@ -7,7 +7,7 @@ import {
   NoopProjectMemoryExtractor,
   type ProjectMemoryBuilder
 } from "../domain/project-memory.js";
-import { RuleBasedMemoryResolver, type MemoryResolver } from "../domain/resolver.js";
+import { HybridMemoryResolver, LlmMemoryResolver, RuleBasedMemoryResolver, type MemoryResolver } from "../domain/resolver.js";
 import { searchMemories, type SearchInput, type SearchResult } from "../domain/search.js";
 import { HybridTopicBoundaryDetector, LlmTopicBoundaryDetector, RuleBasedTopicBoundaryDetector } from "../domain/topic-boundary.js";
 import { LlmTopicMemoryGenerator, RuleBasedTopicMemoryGenerator, topicMemoryUnitToDraft } from "../domain/topic-memory.js";
@@ -56,7 +56,7 @@ export interface MemoryServiceOptions {
 }
 
 export function createMemoryService(store: MemoryStore, options: MemoryServiceOptions = {}): MemoryService {
-  const resolver = options.resolver ?? new RuleBasedMemoryResolver();
+  const resolver = options.resolver ?? createDefaultMemoryResolver();
   const projectMemoryBuilder = options.projectMemoryBuilder ?? createDefaultProjectMemoryBuilder(resolver);
   const compressor = options.compressor ?? new RuleBasedMemoryCompressor();
   const topicBuilder = options.topicBuilder ?? createDefaultTopicBuilder();
@@ -71,7 +71,7 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
       if (!topic || topic.status !== "complete") {
         return { turn, topic, memories: [] };
       }
-      const topicMemory = resolver.resolve(store, topicToDraftFromSegment(topic));
+      const topicMemory = await resolver.resolve(store, topicToDraftFromSegment(topic));
       const memories = [topicMemory];
       if (embeddingProvider && embeddingIndex) {
         await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
@@ -84,7 +84,7 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
       if (!topic || topic.status !== "complete") {
         return { topic, memories: [] };
       }
-      const topicMemory = resolver.resolve(store, topicToDraftFromSegment(topic));
+      const topicMemory = await resolver.resolve(store, topicToDraftFromSegment(topic));
       const memories = [topicMemory];
       if (embeddingProvider && embeddingIndex) {
         await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
@@ -203,6 +203,19 @@ function toScope(input: CreateTurnInput): Scope {
     channel: input.channel,
     metadata: input.metadata
   };
+}
+
+function createDefaultMemoryResolver(): MemoryResolver {
+  const baseUrl = process.env.LLM_BASE_URL;
+  const apiKey = process.env.LLM_API_KEY;
+  const model = process.env.LLM_MODEL;
+  if (!baseUrl || !apiKey || !model) {
+    return new RuleBasedMemoryResolver();
+  }
+  return new HybridMemoryResolver(
+    new LlmMemoryResolver(new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model })),
+    new RuleBasedMemoryResolver()
+  );
 }
 
 function createDefaultProjectMemoryBuilder(resolver: MemoryResolver): ProjectMemoryBuilder {

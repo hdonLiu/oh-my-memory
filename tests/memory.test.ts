@@ -18,7 +18,7 @@ import { HybridMemoryExtractor, LlmMemoryExtractor, RuleBasedMemoryExtractor } f
 import { runDreaming } from "../src/domain/dreaming.js";
 import { loadProjectBuildSchedulerConfig, runScheduledProjectBuild } from "../src/application/project-scheduler.js";
 import { ModelProjectMemoryBuilder, buildProjectTopicInputs, rebuildProjectMemories } from "../src/domain/project-memory.js";
-import { RuleBasedMemoryResolver, resolveMemory } from "../src/domain/resolver.js";
+import { HybridMemoryResolver, LlmMemoryResolver, RuleBasedMemoryResolver, resolveMemory } from "../src/domain/resolver.js";
 import { searchMemories } from "../src/domain/search.js";
 import { projectEvaluationFixtures } from "../src/domain/project-eval-fixtures.js";
 import { SlidingTopicBuilder } from "../src/domain/topics.js";
@@ -1751,5 +1751,133 @@ describe("memory extraction and resolution", () => {
     expect(repo.listRelations(old.id)).toEqual([
       expect.objectContaining({ relationType: "duplicate", fromMemoryId: old.id, toMemoryId: old.id })
     ]);
+  });
+
+  it("lets an LLM choose update for conflicting memories", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const old = repo.createMemory({
+      level: "L2",
+      type: "fact",
+      subject: "项目 A",
+      predicate: "使用",
+      object: "MySQL",
+      summary: "项目 A 使用 MySQL",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+    const turn = repo.createTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 已迁移到 PostgreSQL",
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+    const [draft] = extractMemories(turn, []);
+    const resolver = new LlmMemoryResolver({
+      complete: async () => JSON.stringify({ operation: "update", targetMemoryId: old.id, confidence: 0.92 })
+    });
+
+    const memory = await resolver.resolve(repo, draft);
+
+    expect(repo.getMemory(old.id)?.status).toBe("superseded");
+    expect(memory).toMatchObject({ object: "PostgreSQL", supersedesId: old.id, status: "active" });
+    expect(repo.listRelations(old.id)).toEqual([
+      expect.objectContaining({ relationType: "update", fromMemoryId: old.id, toMemoryId: memory.id })
+    ]);
+  });
+
+  it("lets an LLM choose none for duplicate memories", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const old = repo.createMemory({
+      level: "L2",
+      type: "fact",
+      subject: "项目 A",
+      predicate: "使用",
+      object: "PostgreSQL",
+      summary: "项目 A 使用 PostgreSQL",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+    const turn = repo.createTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 使用 PostgreSQL",
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+    const [draft] = extractMemories(turn, []);
+    const resolver = new LlmMemoryResolver({
+      complete: async () => JSON.stringify({ operation: "none", targetMemoryId: old.id, confidence: 0.96 })
+    });
+
+    const memory = await resolver.resolve(repo, draft);
+
+    expect(memory.id).toBe(old.id);
+    expect(memory.sourceTurnIds).toEqual(["t1", turn.id]);
+    expect(repo.listMemories()).toHaveLength(1);
+    expect(repo.listRelations(old.id)).toEqual([
+      expect.objectContaining({ relationType: "duplicate", fromMemoryId: old.id, toMemoryId: old.id })
+    ]);
+  });
+
+  it("falls back to rule-based resolution when LLM decision is invalid", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const old = repo.createMemory({
+      level: "L2",
+      type: "fact",
+      subject: "项目 A",
+      predicate: "使用",
+      object: "MySQL",
+      summary: "项目 A 使用 MySQL",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+    const turn = repo.createTurn({
+      sessionId: "s1",
+      role: "user",
+      content: "项目 A 已迁移到 PostgreSQL",
+      mis: "u1",
+      source: "test",
+      agent: "agent",
+      channel: "default",
+      metadata: {}
+    });
+    const [draft] = extractMemories(turn, []);
+    const resolver = new HybridMemoryResolver(new LlmMemoryResolver({ complete: async () => "bad-json" }));
+
+    const memory = await resolver.resolve(repo, draft);
+
+    expect(repo.getMemory(old.id)?.status).toBe("superseded");
+    expect(memory).toMatchObject({ object: "PostgreSQL", supersedesId: old.id });
   });
 });

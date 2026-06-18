@@ -55,7 +55,7 @@ export class ModelProjectMemoryBuilder implements ProjectMemoryBuilder {
       .filter((memory) => memory.level === "L2" && memory.type === "project" && memory.status === "active");
 
     const drafts = await this.extractor.extract({ topics, topicInputs: buildProjectTopicInputs(topics), existingProjects, scope });
-    return drafts.map((draft) => this.resolver.resolve(repo, draft));
+    return Promise.all(drafts.map((draft) => this.resolver.resolve(repo, draft)));
   }
 }
 
