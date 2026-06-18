@@ -18,6 +18,8 @@ import type {
   CreateTurnInput,
   Memory,
   MemoryStatus,
+  ProjectBuildRun,
+  ProjectBuildRunStatus,
   Scope,
   TopicSegment,
   TopicType
@@ -38,6 +40,15 @@ export interface MemoryService {
   listProjectMemories(
     scope: Partial<Scope> & { status?: MemoryStatus; projectType?: string; projectKey?: string }
   ): { projects: Memory[] };
+  recordProjectBuildRun(input: {
+    startedAt: string;
+    endedAt: string;
+    scopesRun: number;
+    createdOrUpdated: number;
+    status: ProjectBuildRunStatus;
+    errors: Array<{ scope: Scope; error: string }>;
+  }): { run: ProjectBuildRun };
+  listProjectBuildRuns(limit?: number): { runs: ProjectBuildRun[] };
   runProjectBuild(scope: Scope): Promise<{ createdOrUpdated: Memory[] }>;
   search(input: SearchInput): Promise<{ results: SearchResult[] }>;
   listMemories(scope: Partial<Scope>): { memories: Memory[] };
@@ -109,6 +120,14 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
         .filter((memory) => !projectType || memory.metadata.projectType === projectType)
         .filter((memory) => !projectKey || memory.metadata.projectKey === projectKey);
       return { projects };
+    },
+
+    recordProjectBuildRun(input) {
+      return { run: store.createProjectBuildRun(input) };
+    },
+
+    listProjectBuildRuns(limit) {
+      return { runs: store.listProjectBuildRuns(limit) };
     },
 
     async runProjectBuild(scope) {

@@ -1553,6 +1553,89 @@ describe("project memory and dreaming", () => {
     });
   });
 
+  it("records scheduled project build runs", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    repo.createMemory({
+      level: "topic",
+      type: "topic",
+      subject: "项目 A",
+      predicate: "topic",
+      object: "项目 A",
+      summary: "项目 A",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope
+    });
+    const service = createMemoryService(repo, {
+      projectMemoryBuilder: {
+        rebuild(memoryStore, scope) {
+          return [
+            memoryStore.createMemory({
+              level: "L2",
+              type: "project",
+              subject: "项目 A",
+              predicate: "project",
+              object: "项目 A 已聚合",
+              summary: "项目 A 已聚合",
+              confidence: 0.8,
+              status: "active",
+              supersedesId: null,
+              sourceTurnIds: ["t1"],
+              ...scope
+            })
+          ];
+        }
+      }
+    });
+
+    const result = await runScheduledProjectBuild(service);
+    const [run] = service.listProjectBuildRuns().runs;
+
+    expect(result.createdOrUpdated).toBe(1);
+    expect(run).toMatchObject({
+      scopesRun: 1,
+      createdOrUpdated: 1,
+      status: "success",
+      errors: []
+    });
+    expect(Date.parse(run.startedAt)).not.toBeNaN();
+    expect(Date.parse(run.endedAt)).not.toBeNaN();
+  });
+
+  it("exposes project build run records through HTTP", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const service = createMemoryService(repo);
+    service.recordProjectBuildRun({
+      startedAt: "2026-06-18T00:00:00.000Z",
+      endedAt: "2026-06-18T00:00:01.000Z",
+      scopesRun: 1,
+      createdOrUpdated: 2,
+      status: "success",
+      errors: []
+    });
+    const app = buildServer(service);
+
+    const response = await app.inject({ method: "GET", url: "/projects/runs?limit=1" });
+
+    expect(response.statusCode).toBe(200);
+    expect(response.json().runs).toEqual([
+      expect.objectContaining({
+        scopesRun: 1,
+        createdOrUpdated: 2,
+        status: "success",
+        errors: []
+      })
+    ]);
+
+    await app.close();
+  });
+
   it("builds L2 project memory from topic memories with a model extractor", async () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);

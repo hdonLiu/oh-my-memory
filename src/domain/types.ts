@@ -55,6 +55,18 @@ export interface MemoryRelation {
   createdAt: string;
 }
 
+export type ProjectBuildRunStatus = "success" | "partial_failure" | "failed";
+
+export interface ProjectBuildRun {
+  id: string;
+  startedAt: string;
+  endedAt: string;
+  scopesRun: number;
+  createdOrUpdated: number;
+  status: ProjectBuildRunStatus;
+  errors: Array<{ scope: Scope; error: string }>;
+}
+
 export interface TopicSegment extends Scope {
   id: string;
   sessionId: string;
@@ -73,3 +85,4 @@ export interface TopicSegment extends Scope {
 export type CreateTurnInput = Omit<ConversationTurn, "id" | "createdAt">;
 export type CreateMemoryInput = Omit<Memory, "id" | "createdAt" | "updatedAt">;
 export type CreateTopicSegmentInput = Omit<TopicSegment, "id" | "createdAt" | "updatedAt">;
+export type CreateProjectBuildRunInput = Omit<ProjectBuildRun, "id">;

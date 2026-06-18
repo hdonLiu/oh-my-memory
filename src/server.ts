@@ -52,6 +52,10 @@ const projectQuerySchema = z.object({
   projectKey: z.string().optional()
 });
 
+const projectRunQuerySchema = z.object({
+  limit: z.coerce.number().int().positive().max(100).optional()
+});
+
 export function buildServer(storage: Database.Database | MemoryStore | MemoryService) {
   const app = Fastify({ logger: false });
   const service = isMemoryService(storage)
@@ -136,6 +140,14 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
     });
   });
 
+  app.get("/projects/runs", async (request, reply) => {
+    const parsed = projectRunQuerySchema.safeParse(request.query);
+    if (!parsed.success) {
+      return reply.status(400).send({ error: parsed.error.flatten() });
+    }
+    return service.listProjectBuildRuns(parsed.data.limit);
+  });
+
   app.patch("/memories/:id", async (request, reply) => {
     const params = request.params as { id: string };
     const parsed = patchSchema.safeParse(request.body);
@@ -180,6 +192,7 @@ function isMemoryService(value: Database.Database | MemoryStore | MemoryService)
     typeof (value as MemoryService).flushSessionTopic === "function" &&
     typeof (value as MemoryService).listTopicSegments === "function" &&
     typeof (value as MemoryService).listProjectMemories === "function" &&
+    typeof (value as MemoryService).listProjectBuildRuns === "function" &&
     typeof (value as MemoryService).search === "function" &&
     typeof (value as MemoryService).runProjectBuild === "function" &&
     typeof (value as MemoryService).runDreaming === "function"

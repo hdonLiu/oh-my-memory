@@ -13,6 +13,7 @@ export interface ProjectBuildScheduler {
 
 export interface ProjectBuildRunResult {
   scopesRun: number;
+  createdOrUpdated: number;
   errors: Array<{ scope: Scope; error: string }>;
 }
 
@@ -31,16 +32,30 @@ export function loadProjectBuildSchedulerConfig(
 }
 
 export async function runScheduledProjectBuild(service: MemoryService): Promise<ProjectBuildRunResult> {
+  const startedAt = new Date().toISOString();
   const scopes = collectProjectBuildScopes(service.listMemories({}).memories);
   const errors: ProjectBuildRunResult["errors"] = [];
+  let createdOrUpdated = 0;
   for (const scope of scopes) {
     try {
-      await service.runProjectBuild(scope);
+      const result = await service.runProjectBuild(scope);
+      createdOrUpdated += result.createdOrUpdated.length;
     } catch (error) {
       errors.push({ scope, error: error instanceof Error ? error.message : "unknown error" });
     }
   }
-  return { scopesRun: scopes.length, errors };
+  const run = {
+    scopesRun: scopes.length,
+    createdOrUpdated,
+    errors
+  };
+  service.recordProjectBuildRun({
+    ...run,
+    startedAt,
+    endedAt: new Date().toISOString(),
+    status: errors.length === 0 ? "success" : errors.length === scopes.length ? "failed" : "partial_failure"
+  });
+  return run;
 }
 
 export function startProjectBuildScheduler(
