@@ -1,4 +1,10 @@
-import { RuleBasedMemoryCompressor, type DreamingResult, type MemoryCompressor } from "../domain/dreaming.js";
+import {
+  HybridMemoryCompressor,
+  LlmMemoryCompressor,
+  RuleBasedMemoryCompressor,
+  type DreamingResult,
+  type MemoryCompressor
+} from "../domain/dreaming.js";
 import type { EmbeddingIndex, EmbeddingProvider } from "../domain/embedding.js";
 import { OpenAICompatibleCompletionClient } from "../domain/extractors.js";
 import {
@@ -54,7 +60,7 @@ export interface MemoryService {
   listMemories(scope: Partial<Scope>): { memories: Memory[] };
   updateMemory(id: string, patch: { status?: MemoryStatus; summary?: string; confidence?: number }): { memory: Memory };
   listRelations(memoryId: string): { relations: ReturnType<MemoryStore["listRelations"]> };
-  runDreaming(scope: Scope): DreamingResult;
+  runDreaming(scope: Scope): DreamingResult | Promise<DreamingResult>;
 }
 
 export interface MemoryServiceOptions {
@@ -69,7 +75,7 @@ export interface MemoryServiceOptions {
 export function createMemoryService(store: MemoryStore, options: MemoryServiceOptions = {}): MemoryService {
   const resolver = options.resolver ?? createDefaultMemoryResolver();
   const projectMemoryBuilder = options.projectMemoryBuilder ?? createDefaultProjectMemoryBuilder(resolver);
-  const compressor = options.compressor ?? new RuleBasedMemoryCompressor();
+  const compressor = options.compressor ?? createDefaultMemoryCompressor(resolver);
   const topicBuilder = options.topicBuilder ?? createDefaultTopicBuilder();
   const embeddingProvider = options.embeddingProvider;
   const embeddingIndex = options.embeddingIndex;
@@ -234,6 +240,19 @@ function createDefaultMemoryResolver(): MemoryResolver {
   return new HybridMemoryResolver(
     new LlmMemoryResolver(new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model })),
     new RuleBasedMemoryResolver()
+  );
+}
+
+function createDefaultMemoryCompressor(resolver: MemoryResolver): MemoryCompressor {
+  const baseUrl = process.env.LLM_BASE_URL;
+  const apiKey = process.env.LLM_API_KEY;
+  const model = process.env.LLM_MODEL;
+  if (!baseUrl || !apiKey || !model) {
+    return new RuleBasedMemoryCompressor();
+  }
+  return new HybridMemoryCompressor(
+    new LlmMemoryCompressor(new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model }), resolver),
+    new RuleBasedMemoryCompressor()
   );
 }
 

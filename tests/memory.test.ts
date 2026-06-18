@@ -15,7 +15,7 @@ import {
 } from "../src/domain/embedding.js";
 import { extractMemories } from "../src/domain/extractor.js";
 import { HybridMemoryExtractor, LlmMemoryExtractor, RuleBasedMemoryExtractor } from "../src/domain/extractors.js";
-import { runDreaming } from "../src/domain/dreaming.js";
+import { HybridMemoryCompressor, LlmMemoryCompressor, runDreaming } from "../src/domain/dreaming.js";
 import { loadProjectBuildSchedulerConfig, runScheduledProjectBuild } from "../src/application/project-scheduler.js";
 import { ModelProjectMemoryBuilder, buildProjectTopicInputs, rebuildProjectMemories } from "../src/domain/project-memory.js";
 import { HybridMemoryResolver, LlmMemoryResolver, RuleBasedMemoryResolver, resolveMemory } from "../src/domain/resolver.js";
@@ -864,7 +864,7 @@ describe("memory application service", () => {
       ...scope
     });
     const result = await service.flushSessionTopic(scope, "s1");
-    const dreaming = service.runDreaming(scope);
+    const dreaming = await service.runDreaming(scope);
 
     const projects = await service.runProjectBuild(scope);
     expect(result.memories[0]).toMatchObject({ level: "topic" });
@@ -1745,6 +1745,79 @@ describe("project memory and dreaming", () => {
       predicate: "偏好",
       object: "TypeScript"
     });
+  });
+
+  it("extracts L3 memories with a model compressor", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const project = repo.createMemory({
+      level: "L2",
+      type: "project",
+      subject: "oh-my-memory",
+      predicate: "project",
+      object: "The project is a local memory service.",
+      summary: "oh-my-memory is a local memory service.",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope,
+      metadata: { projectKey: "repository:oh-my-memory" }
+    });
+    const compressor = new LlmMemoryCompressor({
+      complete: async () =>
+        JSON.stringify({
+          memories: [
+            {
+              type: "profile",
+              subject: "oh-my-memory",
+              predicate: "定位",
+              object: "local memory service",
+              summary: "oh-my-memory is a local memory service.",
+              confidence: 0.91,
+              evidenceMemoryIds: [project.id]
+            }
+          ]
+        })
+    });
+
+    const result = await compressor.compress(repo, scope);
+
+    expect(result.createdOrUpdated).toEqual([
+      expect.objectContaining({
+        level: "L3",
+        type: "profile",
+        subject: "oh-my-memory",
+        predicate: "定位",
+        object: "local memory service",
+        sourceTurnIds: ["t1"]
+      })
+    ]);
+  });
+
+  it("falls back to rule-based dreaming when model compressor output is invalid", async () => {
+    const db = createDatabase(":memory:");
+    const repo = new MemoryRepository(db);
+    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    repo.createMemory({
+      level: "topic",
+      type: "topic",
+      subject: "用户",
+      predicate: "topic",
+      object: "用户偏好 TypeScript",
+      summary: "用户偏好 TypeScript",
+      confidence: 0.8,
+      status: "active",
+      supersedesId: null,
+      sourceTurnIds: ["t1"],
+      ...scope
+    });
+    const compressor = new HybridMemoryCompressor(new LlmMemoryCompressor({ complete: async () => "bad-json" }));
+
+    const result = await compressor.compress(repo, scope);
+
+    expect(result.createdOrUpdated[0]).toMatchObject({ level: "L3", object: "TypeScript" });
   });
 });
 
