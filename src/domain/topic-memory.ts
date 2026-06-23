@@ -93,10 +93,20 @@ export class LlmTopicMemoryGenerator implements TopicMemoryGenerator {
       })
     );
     try {
-      return topicMemorySchema.parse(JSON.parse(raw) as unknown);
+      const unit = topicMemorySchema.parse(JSON.parse(raw) as unknown);
+      assertKnownTurnIds(unit.evidenceTurnIds, input.turns.map((turn) => turn.id));
+      return unit;
     } catch (error) {
       throw new Error(`Invalid LLM topic memory response: ${error instanceof Error ? error.message : "unknown"}`);
     }
+  }
+}
+
+function assertKnownTurnIds(evidenceTurnIds: string[], knownIds: string[]): void {
+  const known = new Set(knownIds);
+  const unknown = evidenceTurnIds.filter((id) => !known.has(id));
+  if (unknown.length > 0) {
+    throw new Error(`unknown evidenceTurnIds: ${unknown.join(", ")}`);
   }
 }
 

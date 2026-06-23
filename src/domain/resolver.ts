@@ -1,6 +1,5 @@
 import { z } from "zod";
-import type { MemoryDraft } from "./extractor.js";
-import type { LlmCompletionClient } from "./extractors.js";
+import type { LlmCompletionClient, MemoryDraft } from "./extractors.js";
 import type { Memory } from "./types.js";
 import { jaccard } from "./text.js";
 import { sameScope } from "../storage/repositories.js";

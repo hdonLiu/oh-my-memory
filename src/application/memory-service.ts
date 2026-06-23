@@ -1,22 +1,25 @@
 import {
-  HybridMemoryCompressor,
   LlmMemoryCompressor,
-  RuleBasedMemoryCompressor,
   type DreamingResult,
   type MemoryCompressor
 } from "../domain/dreaming.js";
-import type { EmbeddingIndex, EmbeddingProvider } from "../domain/embedding.js";
+import {
+  OpenAICompatibleEmbeddingProvider,
+  SqliteVectorIndex,
+  type EmbeddingIndex,
+  type EmbeddingProvider
+} from "../domain/embedding.js";
 import { OpenAICompatibleCompletionClient } from "../domain/extractors.js";
 import {
   LlmProjectMemoryExtractor,
   ModelProjectMemoryBuilder,
-  NoopProjectMemoryExtractor,
   type ProjectMemoryBuilder
 } from "../domain/project-memory.js";
-import { HybridMemoryResolver, LlmMemoryResolver, RuleBasedMemoryResolver, type MemoryResolver } from "../domain/resolver.js";
+import { LlmMemoryRecallPlanner, type MemoryRecallPlanner, type RecallInput } from "../domain/recall.js";
+import { LlmMemoryResolver, type MemoryResolver } from "../domain/resolver.js";
 import { searchMemories, type SearchInput, type SearchResult } from "../domain/search.js";
-import { HybridTopicBoundaryDetector, LlmTopicBoundaryDetector, RuleBasedTopicBoundaryDetector } from "../domain/topic-boundary.js";
-import { LlmTopicMemoryGenerator, RuleBasedTopicMemoryGenerator, topicMemoryUnitToDraft } from "../domain/topic-memory.js";
+import { LlmTopicBoundaryDetector } from "../domain/topic-boundary.js";
+import { LlmTopicMemoryGenerator, topicMemoryUnitToDraft } from "../domain/topic-memory.js";
 import { SlidingTopicBuilder, type TopicBuilder } from "../domain/topics.js";
 import type {
   ConversationTurn,
@@ -32,6 +35,7 @@ import type {
 } from "../domain/types.js";
 import type { MemoryStore } from "../storage/store.js";
 import { loadTopicWindowConfig } from "./topic-config.js";
+import type Database from "better-sqlite3";
 
 export interface IngestTurnResult {
   turn: ConversationTurn;
@@ -61,6 +65,7 @@ export interface MemoryService {
   updateMemory(id: string, patch: { status?: MemoryStatus; summary?: string; confidence?: number }): { memory: Memory };
   listRelations(memoryId: string): { relations: ReturnType<MemoryStore["listRelations"]> };
   runDreaming(scope: Scope): DreamingResult | Promise<DreamingResult>;
+  recall(input: RecallInput): Promise<{ shouldUseMemory: boolean; reason: string; memories: Memory[]; promptSnippets: string[] }>;
 }
 
 export interface MemoryServiceOptions {
@@ -70,6 +75,22 @@ export interface MemoryServiceOptions {
   topicBuilder?: TopicBuilder;
   embeddingProvider?: EmbeddingProvider;
   embeddingIndex?: EmbeddingIndex;
+  recallPlanner?: MemoryRecallPlanner;
+}
+
+export function createRuntimeMemoryService(
+  store: MemoryStore,
+  options: MemoryServiceOptions = {},
+  db?: Database.Database
+): MemoryService {
+  const embedding =
+    options.embeddingProvider || options.embeddingIndex || !db || !isEmbeddingConfigured()
+      ? {}
+      : {
+          embeddingProvider: new OpenAICompatibleEmbeddingProvider(),
+          embeddingIndex: new SqliteVectorIndex(db)
+        };
+  return createMemoryService(store, { ...embedding, ...options });
 }
 
 export function createMemoryService(store: MemoryStore, options: MemoryServiceOptions = {}): MemoryService {
@@ -79,6 +100,7 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
   const topicBuilder = options.topicBuilder ?? createDefaultTopicBuilder();
   const embeddingProvider = options.embeddingProvider;
   const embeddingIndex = options.embeddingIndex;
+  const recallPlanner = options.recallPlanner ?? createDefaultRecallPlanner();
 
   return {
     async ingestTurn(input) {
@@ -145,41 +167,7 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
     },
 
     async search(input) {
-      const lexicalResults = searchMemories(store, input);
-      if (!embeddingProvider || !embeddingIndex) {
-        return { results: lexicalResults };
-      }
-      const queryVector = await embeddingProvider.embed(input.query);
-      const vectorResults = await embeddingIndex.search(queryVector, {
-        limit: input.limit ?? 10,
-        filter: {
-          mis: input.mis,
-          source: input.source,
-          agent: input.agent,
-          channel: input.channel
-        }
-      });
-      const byId = new Map<string, SearchResult>();
-      for (const result of lexicalResults) {
-        byId.set(result.memory.id, result);
-      }
-      for (const vectorResult of vectorResults) {
-        const memory = store.getMemory(vectorResult.id);
-        if (!memory || (!input.includeInactive && memory.status !== "active")) {
-          continue;
-        }
-        const existing = byId.get(memory.id);
-        byId.set(memory.id, {
-          memory,
-          score: (existing?.score ?? 0) + vectorResult.score
-        });
-      }
-      return {
-        results: Array.from(byId.values())
-          .filter((result) => result.score > 0)
-          .sort((left, right) => right.score - left.score)
-          .slice(0, input.limit ?? 10)
-      };
+      return { results: await runSearch(store, input, embeddingProvider, embeddingIndex) };
     },
 
     listMemories(scope) {
@@ -196,8 +184,67 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
 
     runDreaming(scope) {
       return compressor.compress(store, scope);
+    },
+
+    async recall(input) {
+      const candidates = (
+        await runSearch(store, { ...input, includeInactive: false }, embeddingProvider, embeddingIndex)
+      ).map((result) => result.memory);
+      const plan = await recallPlanner.plan({ query: input.query, candidates, scope: toScope(input) });
+      const selected = plan.shouldUseMemory
+        ? plan.selectedMemoryIds
+            .map((id) => candidates.find((memory) => memory.id === id))
+            .filter((memory): memory is Memory => Boolean(memory))
+        : [];
+      return {
+        shouldUseMemory: plan.shouldUseMemory && selected.length > 0,
+        reason: plan.reason,
+        memories: selected,
+        promptSnippets: selected.map((memory) => memory.readableText)
+      };
     }
   };
+}
+
+async function runSearch(
+  store: MemoryStore,
+  input: SearchInput,
+  embeddingProvider?: EmbeddingProvider,
+  embeddingIndex?: EmbeddingIndex
+): Promise<SearchResult[]> {
+  const lexicalResults = searchMemories(store, input);
+  if (!embeddingProvider || !embeddingIndex) {
+    return lexicalResults;
+  }
+  const queryVector = await embeddingProvider.embed(input.query);
+  const vectorResults = await embeddingIndex.search(queryVector, {
+    limit: input.limit ?? 10,
+    filter: {
+      mis: input.mis,
+      source: input.source,
+      agent: input.agent,
+      channel: input.channel
+    }
+  });
+  const byId = new Map<string, SearchResult>();
+  for (const result of lexicalResults) {
+    byId.set(result.memory.id, result);
+  }
+  for (const vectorResult of vectorResults) {
+    const memory = store.getMemory(vectorResult.id);
+    if (!memory || (!input.includeInactive && memory.status !== "active")) {
+      continue;
+    }
+    const existing = byId.get(memory.id);
+    byId.set(memory.id, {
+      memory,
+      score: (existing?.score ?? 0) + vectorResult.score
+    });
+  }
+  return Array.from(byId.values())
+    .filter((result) => result.score > 0)
+    .sort((left, right) => right.score - left.score)
+    .slice(0, input.limit ?? 10);
 }
 
 async function indexMemory(
@@ -205,7 +252,7 @@ async function indexMemory(
   embeddingProvider: EmbeddingProvider,
   embeddingIndex: EmbeddingIndex
 ): Promise<void> {
-  const vector = await embeddingProvider.embed([memory.subject, memory.predicate, memory.object, memory.summary].join(" "));
+  const vector = await embeddingProvider.embed(memory.readableText);
   await embeddingIndex.upsert({
     id: memory.id,
     vector,
@@ -220,7 +267,11 @@ async function indexMemory(
   });
 }
 
-function toScope(input: CreateTurnInput): Scope {
+function isEmbeddingConfigured(): boolean {
+  return Boolean(process.env.EMBEDDING_API_KEY || process.env.EMBEDDING_BASE_URL || process.env.EMBEDDING_MODEL);
+}
+
+function toScope(input: Scope): Scope {
   return {
     mis: input.mis,
     source: input.source,
@@ -231,57 +282,37 @@ function toScope(input: CreateTurnInput): Scope {
 }
 
 function createDefaultMemoryResolver(): MemoryResolver {
-  const baseUrl = process.env.LLM_BASE_URL;
-  const apiKey = process.env.LLM_API_KEY;
-  const model = process.env.LLM_MODEL;
-  if (!baseUrl || !apiKey || !model) {
-    return new RuleBasedMemoryResolver();
-  }
-  return new HybridMemoryResolver(
-    new LlmMemoryResolver(new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model })),
-    new RuleBasedMemoryResolver()
-  );
+  return new LlmMemoryResolver(createDefaultCompletionClient());
 }
 
 function createDefaultMemoryCompressor(resolver: MemoryResolver): MemoryCompressor {
-  const baseUrl = process.env.LLM_BASE_URL;
-  const apiKey = process.env.LLM_API_KEY;
-  const model = process.env.LLM_MODEL;
-  if (!baseUrl || !apiKey || !model) {
-    return new RuleBasedMemoryCompressor();
-  }
-  return new HybridMemoryCompressor(
-    new LlmMemoryCompressor(new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model }), resolver),
-    new RuleBasedMemoryCompressor()
-  );
+  return new LlmMemoryCompressor(createDefaultCompletionClient(), resolver);
+}
+
+function createDefaultRecallPlanner(): MemoryRecallPlanner {
+  return new LlmMemoryRecallPlanner(createDefaultCompletionClient());
 }
 
 function createDefaultProjectMemoryBuilder(resolver: MemoryResolver): ProjectMemoryBuilder {
-  const baseUrl = process.env.LLM_BASE_URL;
-  const apiKey = process.env.LLM_API_KEY;
-  const model = process.env.LLM_MODEL;
-  if (!baseUrl || !apiKey || !model) {
-    return new ModelProjectMemoryBuilder(new NoopProjectMemoryExtractor(), resolver);
-  }
   return new ModelProjectMemoryBuilder(
-    new LlmProjectMemoryExtractor(new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model })),
+    new LlmProjectMemoryExtractor(createDefaultCompletionClient()),
     resolver
   );
 }
 
 function createDefaultTopicBuilder(): TopicBuilder {
+  const client = createDefaultCompletionClient();
+  return new SlidingTopicBuilder(new LlmTopicBoundaryDetector(client), new LlmTopicMemoryGenerator(client), loadTopicWindowConfig());
+}
+
+function createDefaultCompletionClient(): OpenAICompatibleCompletionClient {
   const baseUrl = process.env.LLM_BASE_URL;
   const apiKey = process.env.LLM_API_KEY;
   const model = process.env.LLM_MODEL;
   if (!baseUrl || !apiKey || !model) {
-    return new SlidingTopicBuilder(new RuleBasedTopicBoundaryDetector(), new RuleBasedTopicMemoryGenerator(), loadTopicWindowConfig());
+    throw new Error("LLM configuration is required: set LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL");
   }
-  const client = new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model });
-  return new SlidingTopicBuilder(
-    new HybridTopicBoundaryDetector(new LlmTopicBoundaryDetector(client), new RuleBasedTopicBoundaryDetector()),
-    new LlmTopicMemoryGenerator(client),
-    loadTopicWindowConfig()
-  );
+  return new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model });
 }
 
 function topicToDraftFromSegment(topic: TopicSegment): CreateMemoryInput {
