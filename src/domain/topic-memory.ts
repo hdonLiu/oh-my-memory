@@ -122,7 +122,7 @@ export function topicMemoryUnitToDraft(unit: TopicMemoryUnit, scope: Scope & { s
     status: "active",
     supersedesId: null,
     sourceTurnIds: unit.evidenceTurnIds,
-    mis: scope.mis,
+    uid: scope.uid,
     source: scope.source,
     agent: scope.agent,
     channel: scope.channel,

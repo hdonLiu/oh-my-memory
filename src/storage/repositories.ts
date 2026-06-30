@@ -17,13 +17,15 @@ import type {
   TopicStatus
 } from "../domain/types.js";
 import type { MemoryPatch, MemoryStore } from "./store.js";
+import { LayeredMemoryRepository } from "./layered-repository.js";
 
 type TurnRow = {
   id: string;
+  event_id: string;
   session_id: string;
   role: ConversationTurn["role"];
   content: string;
-  mis: string;
+  uid: string;
   source: string;
   agent: string;
   channel: string;
@@ -44,7 +46,7 @@ type MemoryRow = {
   status: MemoryStatus;
   supersedes_id: string | null;
   source_turn_ids: string;
-  mis: string;
+  uid: string;
   source: string;
   agent: string;
   channel: string;
@@ -73,7 +75,7 @@ type TopicSegmentRow = {
   reason: string;
   fingerprint: string;
   project_memory_ids: string;
-  mis: string;
+  uid: string;
   source: string;
   agent: string;
   channel: string;
@@ -93,22 +95,44 @@ type ProjectBuildRunRow = {
 };
 
 export class MemoryRepository implements MemoryStore {
-  constructor(private readonly db: Database.Database) {}
+  readonly layered: LayeredMemoryRepository;
+
+  constructor(private readonly db: Database.Database) {
+    this.layered = new LayeredMemoryRepository(db);
+  }
 
   createTurn(input: CreateTurnInput): ConversationTurn {
-    const turn: ConversationTurn = { ...input, id: nanoid(), createdAt: now() };
+    const eventId = input.eventId ?? nanoid();
+    const existing = this.db
+      .prepare("select * from conversation_turns where uid = ? and source = ? and event_id = ?")
+      .get(input.uid, input.source, eventId) as TurnRow | undefined;
+    if (existing) {
+      const turn = mapTurn(existing);
+      if (
+        turn.sessionId !== input.sessionId ||
+        turn.role !== input.role ||
+        turn.content !== input.content ||
+        turn.agent !== input.agent ||
+        turn.channel !== input.channel
+      ) {
+        throw new Error(`Idempotency conflict for eventId: ${eventId}`);
+      }
+      return turn;
+    }
+    const turn: ConversationTurn = { ...input, eventId, id: nanoid(), createdAt: now() };
     this.db
       .prepare(
         `insert into conversation_turns
-        (id, session_id, role, content, mis, source, agent, channel, metadata, created_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        (id, event_id, session_id, role, content, uid, source, agent, channel, metadata, created_at)
+        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         turn.id,
+        turn.eventId,
         turn.sessionId,
         turn.role,
         turn.content,
-        turn.mis,
+        turn.uid,
         turn.source,
         turn.agent,
         turn.channel,
@@ -145,7 +169,7 @@ export class MemoryRepository implements MemoryStore {
       .prepare(
         `insert into memories
         (id, level, type, subject, predicate, object, summary, readable_text, confidence, status, supersedes_id,
-         source_turn_ids, mis, source, agent, channel, metadata, created_at, updated_at)
+         source_turn_ids, uid, source, agent, channel, metadata, created_at, updated_at)
         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
@@ -161,7 +185,7 @@ export class MemoryRepository implements MemoryStore {
         memory.status,
         memory.supersedesId,
         JSON.stringify(memory.sourceTurnIds),
-        memory.mis,
+        memory.uid,
         memory.source,
         memory.agent,
         memory.channel,
@@ -186,7 +210,7 @@ export class MemoryRepository implements MemoryStore {
       .prepare(
         `update memories set
           level = ?, type = ?, subject = ?, predicate = ?, object = ?, summary = ?, readable_text = ?, confidence = ?,
-          status = ?, supersedes_id = ?, source_turn_ids = ?, mis = ?, source = ?, agent = ?,
+          status = ?, supersedes_id = ?, source_turn_ids = ?, uid = ?, source = ?, agent = ?,
           channel = ?, metadata = ?, updated_at = ?
         where id = ?`
       )
@@ -202,7 +226,7 @@ export class MemoryRepository implements MemoryStore {
         updated.status,
         updated.supersedesId,
         JSON.stringify(updated.sourceTurnIds),
-        updated.mis,
+        updated.uid,
         updated.source,
         updated.agent,
         updated.channel,
@@ -233,7 +257,7 @@ export class MemoryRepository implements MemoryStore {
       .prepare(
         `insert into topic_segments
         (id, session_id, title, summary, status, confidence, turn_ids, reason, fingerprint, project_memory_ids,
-         mis, source, agent, channel, metadata, created_at, updated_at)
+         uid, source, agent, channel, metadata, created_at, updated_at)
         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
@@ -247,7 +271,7 @@ export class MemoryRepository implements MemoryStore {
         topic.reason,
         topic.fingerprint,
         JSON.stringify(topic.projectMemoryIds),
-        topic.mis,
+        topic.uid,
         topic.source,
         topic.agent,
         topic.channel,
@@ -268,7 +292,7 @@ export class MemoryRepository implements MemoryStore {
       .prepare(
         `update topic_segments set
           session_id = ?, title = ?, summary = ?, status = ?, confidence = ?, turn_ids = ?, reason = ?, fingerprint = ?,
-          project_memory_ids = ?, mis = ?, source = ?, agent = ?, channel = ?, metadata = ?, updated_at = ?
+          project_memory_ids = ?, uid = ?, source = ?, agent = ?, channel = ?, metadata = ?, updated_at = ?
         where id = ?`
       )
       .run(
@@ -281,7 +305,7 @@ export class MemoryRepository implements MemoryStore {
         updated.reason,
         updated.fingerprint,
         JSON.stringify(updated.projectMemoryIds),
-        updated.mis,
+        updated.uid,
         updated.source,
         updated.agent,
         updated.channel,
@@ -379,7 +403,7 @@ export function sameScope(left: Scope, right: Partial<Scope>): boolean {
 
 function matchesScope(value: Scope, scope: Partial<Scope>): boolean {
   return (
-    (!scope.mis || value.mis === scope.mis) &&
+    (!scope.uid || value.uid === scope.uid) &&
     (!scope.source || value.source === scope.source) &&
     (!scope.agent || value.agent === scope.agent) &&
     (!scope.channel || value.channel === scope.channel)
@@ -389,10 +413,11 @@ function matchesScope(value: Scope, scope: Partial<Scope>): boolean {
 function mapTurn(row: TurnRow): ConversationTurn {
   return {
     id: row.id,
+    eventId: row.event_id,
     sessionId: row.session_id,
     role: row.role,
     content: row.content,
-    mis: row.mis,
+    uid: row.uid,
     source: row.source,
     agent: row.agent,
     channel: row.channel,
@@ -415,7 +440,7 @@ function mapMemory(row: MemoryRow): Memory {
     status: row.status,
     supersedesId: row.supersedes_id,
     sourceTurnIds: JSON.parse(row.source_turn_ids) as string[],
-    mis: row.mis,
+    uid: row.uid,
     source: row.source,
     agent: row.agent,
     channel: row.channel,
@@ -437,7 +462,7 @@ function mapTopicSegment(row: TopicSegmentRow): TopicSegment {
     reason: row.reason,
     fingerprint: row.fingerprint,
     projectMemoryIds: JSON.parse(row.project_memory_ids) as string[],
-    mis: row.mis,
+    uid: row.uid,
     source: row.source,
     agent: row.agent,
     channel: row.channel,

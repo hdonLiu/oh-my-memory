@@ -6,10 +6,11 @@ export function createDatabase(path = process.env.MEMORY_DB_PATH ?? "memory.sqli
   db.exec(`
     create table if not exists conversation_turns (
       id text primary key,
+      event_id text,
       session_id text not null,
       role text not null,
       content text not null,
-      mis text not null,
+      uid text not null,
       source text not null,
       agent text not null,
       channel text not null,
@@ -30,7 +31,7 @@ export function createDatabase(path = process.env.MEMORY_DB_PATH ?? "memory.sqli
       status text not null,
       supersedes_id text,
       source_turn_ids text not null,
-      mis text not null,
+      uid text not null,
       source text not null,
       agent text not null,
       channel text not null,
@@ -50,7 +51,7 @@ export function createDatabase(path = process.env.MEMORY_DB_PATH ?? "memory.sqli
       reason text not null,
       fingerprint text not null unique,
       project_memory_ids text not null,
-      mis text not null,
+      uid text not null,
       source text not null,
       agent text not null,
       channel text not null,
@@ -82,16 +83,212 @@ export function createDatabase(path = process.env.MEMORY_DB_PATH ?? "memory.sqli
       version integer primary key,
       applied_at text not null
     );
+
+    create table if not exists l1_topics (
+      id text primary key,
+      session_id text not null,
+      status text not null,
+      current_revision_id text not null,
+      uid text not null,
+      source text not null,
+      agent text not null,
+      channel text not null,
+      metadata text not null,
+      created_at text not null,
+      updated_at text not null
+    );
+
+    create table if not exists l1_topic_revisions (
+      id text primary key,
+      topic_id text not null,
+      version integer not null,
+      status text not null,
+      title text not null,
+      summary text not null,
+      source_turn_ids text not null,
+      source_segment_id text,
+      stable_sequence integer,
+      provider text,
+      model text,
+      prompt_version text not null,
+      schema_version text not null,
+      reason text not null,
+      confidence real not null,
+      created_at text not null,
+      unique(topic_id, version),
+      unique(source_segment_id)
+    );
+
+    create table if not exists l1_components (
+      id text primary key,
+      topic_revision_id text not null,
+      content text not null,
+      labels text not null,
+      evidence_turn_ids text not null,
+      provider text,
+      model text,
+      prompt_version text not null,
+      schema_version text not null,
+      reason text not null,
+      confidence real not null,
+      created_at text not null
+    );
+
+    create table if not exists l1_topic_lineage (
+      id text primary key,
+      from_topic_id text not null,
+      to_topic_id text,
+      operation text not null,
+      run_id text not null,
+      reason text not null,
+      created_at text not null
+    );
+
+    create table if not exists l1_maintenance_runs (
+      id text primary key,
+      idempotency_key text unique,
+      uid text not null,
+      source text not null,
+      agent text not null,
+      channel text not null,
+      session_id text not null,
+      input_cutoff text not null,
+      output_watermark integer,
+      status text not null,
+      plan text,
+      error text,
+      started_at text not null,
+      ended_at text
+    );
+
+    create table if not exists l1_stable_sequence (
+      sequence integer primary key autoincrement,
+      topic_revision_id text not null unique,
+      run_id text not null,
+      uid text not null,
+      agent text not null,
+      created_at text not null
+    );
+
+    create table if not exists l2_aggregates (
+      id text primary key,
+      uid text not null,
+      agent text not null,
+      status text not null,
+      current_revision_id text not null,
+      merged_into_id text,
+      created_at text not null,
+      updated_at text not null
+    );
+
+    create table if not exists l2_aggregate_revisions (
+      id text primary key,
+      aggregate_id text not null,
+      version integer not null,
+      aggregate_type text not null,
+      canonical_title text not null,
+      aliases text not null,
+      external_keys text not null,
+      labels text not null,
+      summary text not null,
+      facts text not null,
+      decisions text not null,
+      constraints text not null,
+      open_questions text not null,
+      source_l1_watermark integer not null,
+      provider text,
+      model text,
+      prompt_version text not null,
+      schema_version text not null,
+      reason text not null,
+      confidence real not null,
+      created_at text not null,
+      unique(aggregate_id, version)
+    );
+
+    create table if not exists l2_component_memberships (
+      aggregate_revision_id text not null,
+      component_id text not null,
+      aggregation_run_id text not null,
+      created_at text not null,
+      primary key(aggregate_revision_id, component_id)
+    );
+
+    create table if not exists l2_aggregate_lineage (
+      id text primary key,
+      from_aggregate_id text not null,
+      to_aggregate_id text,
+      operation text not null,
+      run_id text not null,
+      reason text not null,
+      created_at text not null
+    );
+
+    create table if not exists l2_aggregation_runs (
+      id text primary key,
+      idempotency_key text unique,
+      uid text not null,
+      agent text not null,
+      source_l1_watermark integer not null,
+      status text not null,
+      plan text,
+      error text,
+      started_at text not null,
+      ended_at text
+    );
   `);
   runMigrations(db);
   return db;
 }
 
 function runMigrations(db: Database.Database): void {
+  ensureUidColumns(db);
+  ensureTurnEventId(db);
+  ensureRunIdempotencyColumns(db);
+  ensureL2RevisionIdentityColumns(db);
   ensureTopicProjectMemoryColumn(db);
   ensureReadableMemoryColumn(db);
   ensureIndexes(db);
   recordMigration(db, 1);
+  recordMigration(db, 2);
+  recordMigration(db, 3);
+}
+
+function ensureL2RevisionIdentityColumns(db: Database.Database): void {
+  const columns = db.pragma("table_info(l2_aggregate_revisions)") as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "aggregate_type")) {
+    db.exec("alter table l2_aggregate_revisions add column aggregate_type text not null default 'topic'");
+  }
+  if (!columns.some((column) => column.name === "external_keys")) {
+    db.exec("alter table l2_aggregate_revisions add column external_keys text not null default '{}'");
+  }
+}
+
+function ensureRunIdempotencyColumns(db: Database.Database): void {
+  for (const table of ["l1_maintenance_runs", "l2_aggregation_runs"] as const) {
+    const columns = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === "idempotency_key")) {
+      db.exec(`alter table ${table} add column idempotency_key text`);
+    }
+    db.exec(`create unique index if not exists idx_${table}_idempotency on ${table} (idempotency_key)`);
+  }
+}
+
+function ensureUidColumns(db: Database.Database): void {
+  for (const table of ["conversation_turns", "memories", "topic_segments"] as const) {
+    const columns = db.pragma(`table_info(${table})`) as Array<{ name: string }>;
+    if (columns.some((column) => column.name === "mis") && !columns.some((column) => column.name === "uid")) {
+      db.exec(`alter table ${table} rename column mis to uid`);
+    }
+  }
+}
+
+function ensureTurnEventId(db: Database.Database): void {
+  const columns = db.pragma("table_info(conversation_turns)") as Array<{ name: string }>;
+  if (!columns.some((column) => column.name === "event_id")) {
+    db.exec("alter table conversation_turns add column event_id text");
+  }
+  db.exec("update conversation_turns set event_id = id where event_id is null or event_id = ''");
 }
 
 function ensureReadableMemoryColumn(db: Database.Database): void {
@@ -111,11 +308,31 @@ function ensureReadableMemoryColumn(db: Database.Database): void {
 function ensureIndexes(db: Database.Database): void {
   db.exec(`
     create index if not exists idx_memories_scope_status_level_type
-      on memories (mis, source, agent, channel, status, level, type);
+      on memories (uid, source, agent, channel, status, level, type);
     create index if not exists idx_topic_segments_scope_session_status
-      on topic_segments (mis, source, agent, channel, session_id, status);
+      on topic_segments (uid, source, agent, channel, session_id, status);
     create index if not exists idx_project_build_runs_started_at
       on project_build_runs (started_at);
+    create unique index if not exists idx_turns_uid_source_event
+      on conversation_turns (uid, source, event_id);
+    create index if not exists idx_l1_topics_scope_session_status
+      on l1_topics (uid, source, agent, channel, session_id, status);
+    create index if not exists idx_l1_revisions_topic_status
+      on l1_topic_revisions (topic_id, status, version);
+    create index if not exists idx_l1_components_revision
+      on l1_components (topic_revision_id);
+    create index if not exists idx_l1_runs_scope_session
+      on l1_maintenance_runs (uid, source, agent, channel, session_id, started_at);
+    create index if not exists idx_l1_stable_namespace
+      on l1_stable_sequence (uid, agent, sequence);
+    create index if not exists idx_l2_aggregates_namespace_status
+      on l2_aggregates (uid, agent, status);
+    create index if not exists idx_l2_revisions_aggregate
+      on l2_aggregate_revisions (aggregate_id, version);
+    create index if not exists idx_l2_memberships_component
+      on l2_component_memberships (component_id);
+    create index if not exists idx_l2_runs_namespace
+      on l2_aggregation_runs (uid, agent, started_at);
   `);
 }
 

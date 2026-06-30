@@ -1,6 +1,6 @@
 import cors from "@fastify/cors";
 import type Database from "better-sqlite3";
-import Fastify from "fastify";
+import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
 import { createMemoryService, type MemoryService } from "./application/memory-service.js";
 import type { MemoryStatus, Role, Scope, TopicStatus } from "./domain/types.js";
@@ -8,7 +8,7 @@ import { MemoryRepository } from "./storage/repositories.js";
 import type { MemoryStore } from "./storage/store.js";
 
 const scopeSchema = z.object({
-  mis: z.string().min(1),
+  uid: z.string().min(1),
   source: z.string().min(1),
   agent: z.string().min(1),
   channel: z.string().min(1),
@@ -16,6 +16,7 @@ const scopeSchema = z.object({
 });
 
 const turnSchema = scopeSchema.extend({
+  eventId: z.string().min(1).optional(),
   sessionId: z.string().min(1),
   role: z.enum(["user", "assistant", "system"]),
   content: z.string().min(1)
@@ -39,7 +40,7 @@ const patchSchema = z.object({
 });
 
 const topicQuerySchema = z.object({
-  mis: z.string().optional(),
+  uid: z.string().optional(),
   source: z.string().optional(),
   agent: z.string().optional(),
   channel: z.string().optional(),
@@ -48,7 +49,7 @@ const topicQuerySchema = z.object({
 });
 
 const projectQuerySchema = z.object({
-  mis: z.string().optional(),
+  uid: z.string().optional(),
   source: z.string().optional(),
   agent: z.string().optional(),
   channel: z.string().optional(),
@@ -61,6 +62,21 @@ const projectRunQuerySchema = z.object({
   limit: z.coerce.number().int().positive().max(100).optional()
 });
 
+const l2RunSchema = z.object({
+  uid: z.string().min(1),
+  agent: z.string().min(1),
+  watermark: z.number().int().nonnegative().optional()
+});
+
+const layeredRecallSchema = z.object({
+  uid: z.string().min(1),
+  agent: z.string().min(1),
+  query: z.string().min(1),
+  limit: z.number().int().positive().max(100).optional(),
+  sessionId: z.string().min(1).optional(),
+  includeProvisional: z.boolean().optional()
+});
+
 export function buildServer(storage: Database.Database | MemoryStore | MemoryService) {
   const app = Fastify({ logger: false });
   const service = isMemoryService(storage)
@@ -71,19 +87,22 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
 
   app.get("/health", async () => ({ ok: true }));
 
-  app.post("/turns", async (request, reply) => {
+  const ingestTurn = async (request: FastifyRequest, reply: FastifyReply) => {
     const parsed = turnSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.status(400).send({ error: parsed.error.flatten() });
     }
     const input = parsed.data;
     return service.ingestTurn({
+      eventId: input.eventId,
       sessionId: input.sessionId,
       role: input.role as Role,
       content: input.content,
       ...toScope(input)
     });
-  });
+  };
+  app.post("/turns", ingestTurn);
+  app.post("/v1/turns", ingestTurn);
 
   app.post("/sessions/:sessionId/topics/flush", async (request, reply) => {
     const params = request.params as { sessionId: string };
@@ -91,6 +110,13 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
     if (!parsed.success) {
       return reply.status(400).send({ error: parsed.error.flatten() });
     }
+    return service.flushSessionTopic(toScope(parsed.data), params.sessionId);
+  });
+
+  app.post("/v1/sessions/:sessionId/topics/flush", async (request, reply) => {
+    const params = request.params as { sessionId: string };
+    const parsed = scopeSchema.safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
     return service.flushSessionTopic(toScope(parsed.data), params.sessionId);
   });
 
@@ -114,7 +140,7 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
     const query = request.query as Partial<Record<keyof Scope, string>>;
     return {
       ...service.listMemories({
-        mis: query.mis,
+        uid: query.uid,
         source: query.source,
         agent: query.agent,
         channel: query.channel
@@ -128,7 +154,7 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
       return reply.status(400).send({ error: parsed.error.flatten() });
     }
     return service.listTopicSegments({
-      mis: parsed.data.mis,
+      uid: parsed.data.uid,
       source: parsed.data.source,
       agent: parsed.data.agent,
       channel: parsed.data.channel,
@@ -143,7 +169,7 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
       return reply.status(400).send({ error: parsed.error.flatten() });
     }
     return service.listProjectMemories({
-      mis: parsed.data.mis,
+      uid: parsed.data.uid,
       source: parsed.data.source,
       agent: parsed.data.agent,
       channel: parsed.data.channel,
@@ -196,6 +222,60 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
     return service.runProjectBuild(toScope(parsed.data));
   });
 
+  app.get("/v1/l1/topics", async (request, reply) => {
+    const parsed = z
+      .object({
+        uid: z.string().optional(),
+        source: z.string().optional(),
+        agent: z.string().optional(),
+        channel: z.string().optional(),
+        sessionId: z.string().optional(),
+        includeInactive: z.coerce.boolean().optional()
+      })
+      .safeParse(request.query);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+    return { topics: service.listL1Topics({ ...parsed.data, metadata: {} }) };
+  });
+
+  app.post("/v1/jobs/l1-maintenance/run", async (request, reply) => {
+    const parsed = scopeSchema.extend({ sessionId: z.string().min(1) }).safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+    const { sessionId, ...scope } = parsed.data;
+    return service.runL1Maintenance(toScope(scope), sessionId);
+  });
+
+  app.get("/v1/jobs/l1-maintenance/runs", async (request, reply) => {
+    const parsed = projectRunQuerySchema.safeParse(request.query);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+    return { runs: service.listL1MaintenanceRuns(parsed.data.limit) };
+  });
+
+  app.get("/v1/l2/aggregates", async (request, reply) => {
+    const parsed = z
+      .object({ uid: z.string().min(1), agent: z.string().min(1), includeInactive: z.coerce.boolean().optional() })
+      .safeParse(request.query);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+    return { aggregates: service.listL2Aggregates(parsed.data.uid, parsed.data.agent, parsed.data.includeInactive) };
+  });
+
+  app.post("/v1/jobs/l2-aggregation/run", async (request, reply) => {
+    const parsed = l2RunSchema.safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+    return service.runL2Aggregation(parsed.data.uid, parsed.data.agent, parsed.data.watermark);
+  });
+
+  app.get("/v1/jobs/l2-aggregation/runs", async (request, reply) => {
+    const parsed = projectRunQuerySchema.safeParse(request.query);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+    return { runs: service.listL2AggregationRuns(parsed.data.limit) };
+  });
+
+  app.post("/v1/recall", async (request, reply) => {
+    const parsed = layeredRecallSchema.safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+    return service.recallV2(parsed.data);
+  });
+
   return app;
 }
 
@@ -209,7 +289,9 @@ function isMemoryService(value: Database.Database | MemoryStore | MemoryService)
     typeof (value as MemoryService).search === "function" &&
     typeof (value as MemoryService).recall === "function" &&
     typeof (value as MemoryService).runProjectBuild === "function" &&
-    typeof (value as MemoryService).runDreaming === "function"
+    typeof (value as MemoryService).runDreaming === "function" &&
+    typeof (value as MemoryService).runL1Maintenance === "function" &&
+    typeof (value as MemoryService).runL2Aggregation === "function"
   );
 }
 
@@ -223,7 +305,7 @@ function isMemoryStore(value: Database.Database | MemoryStore | MemoryService): 
 
 function toScope(input: z.infer<typeof scopeSchema>): Scope {
   return {
-    mis: input.mis,
+    uid: input.uid,
     source: input.source,
     agent: input.agent,
     channel: input.channel,

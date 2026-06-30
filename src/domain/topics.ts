@@ -172,7 +172,12 @@ export class SlidingTopicBuilder implements TopicBuilder {
     existingTopic?: TopicSegment | null
   ): TopicSegment {
     const turnIds = turns.map((turn) => turn.id);
-    const fingerprint = topicFingerprintWithSession(scope, sessionId, input.title, input.summary);
+    const fingerprint = topicFingerprintWithSession(
+      scope,
+      sessionId,
+      input.title,
+      [input.summary, ...turnIds].join("\0")
+    );
     const existing = existingTopic ?? store.getTopicSegmentByFingerprint(fingerprint);
     const patch = {
       sessionId,
@@ -206,7 +211,7 @@ export function topicFingerprint(scope: Scope, title: string, summary: string): 
 
 export function topicFingerprintWithSession(scope: Scope, sessionId: string, title: string, summary: string): string {
   return createHash("sha256")
-    .update([scope.mis, scope.source, scope.agent, scope.channel, sessionId, title.trim(), summary.trim()].join("\0"))
+    .update([scope.uid, scope.source, scope.agent, scope.channel, sessionId, title.trim(), summary.trim()].join("\0"))
     .digest("hex");
 }
 
@@ -226,7 +231,7 @@ export function topicToMemoryDraft(topic: TopicSegment): CreateMemoryInput {
     },
     {
       sessionId: topic.sessionId,
-      mis: topic.mis,
+      uid: topic.uid,
       source: topic.source,
       agent: topic.agent,
       channel: topic.channel,

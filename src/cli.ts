@@ -67,7 +67,7 @@ export async function runCli(argv: string[]): Promise<CliResult> {
 
 function toScope(input: CreateTurnInput): Omit<CreateTurnInput, "sessionId" | "role" | "content"> {
   return {
-    mis: input.mis,
+    uid: input.uid,
     source: input.source,
     agent: input.agent,
     channel: input.channel,
@@ -76,7 +76,7 @@ function toScope(input: CreateTurnInput): Omit<CreateTurnInput, "sessionId" | "r
 }
 
 function sessionFlushKey(input: CreateTurnInput): string {
-  return [input.mis, input.source, input.agent, input.channel, input.sessionId].join("\0");
+  return [input.uid, input.source, input.agent, input.channel, input.sessionId].join("\0");
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
@@ -118,9 +118,10 @@ function parseOptions(args: string[]): ParsedOptions {
 function turnFromOptions(options: ParsedOptions): CreateTurnInput {
   return validateTurn({
     sessionId: getRequiredOption(options, "session-id"),
+    eventId: getOption(options, "event-id"),
     role: getOption(options, "role") ?? "user",
     content: getRequiredOption(options, "content"),
-    mis: getRequiredOption(options, "mis"),
+    uid: getRequiredOption(options, "uid"),
     source: getRequiredOption(options, "source"),
     agent: getRequiredOption(options, "agent"),
     channel: getRequiredOption(options, "channel"),
@@ -130,17 +131,18 @@ function turnFromOptions(options: ParsedOptions): CreateTurnInput {
 
 function validateTurn(value: unknown): CreateTurnInput {
   const input = value as Partial<CreateTurnInput>;
-  if (!input.sessionId || !input.role || !input.content || !input.mis || !input.source || !input.agent || !input.channel) {
-    throw new Error("turn requires sessionId, role, content, mis, source, agent, and channel");
+  if (!input.sessionId || !input.role || !input.content || !input.uid || !input.source || !input.agent || !input.channel) {
+    throw new Error("turn requires sessionId, role, content, uid, source, agent, and channel");
   }
   if (!["user", "assistant", "system"].includes(input.role)) {
     throw new Error(`invalid role: ${input.role}`);
   }
   return {
     sessionId: input.sessionId,
+    eventId: input.eventId,
     role: input.role as Role,
     content: input.content,
-    mis: input.mis,
+    uid: input.uid,
     source: input.source,
     agent: input.agent,
     channel: input.channel,

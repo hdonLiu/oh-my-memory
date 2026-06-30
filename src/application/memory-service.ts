@@ -35,6 +35,14 @@ import type {
 } from "../domain/types.js";
 import type { MemoryStore } from "../storage/store.js";
 import { loadTopicWindowConfig } from "./topic-config.js";
+import {
+  LayeredMemoryService,
+  LlmL1MaintenancePlanner,
+  LlmL2MembershipPlanner,
+  LlmL2RevisionSynthesizer,
+  LlmLayeredRecallPlanner,
+  type LayeredRecallResult
+} from "./layered-memory-service.js";
 import type Database from "better-sqlite3";
 
 export interface IngestTurnResult {
@@ -66,6 +74,17 @@ export interface MemoryService {
   listRelations(memoryId: string): { relations: ReturnType<MemoryStore["listRelations"]> };
   runDreaming(scope: Scope): DreamingResult | Promise<DreamingResult>;
   recall(input: RecallInput): Promise<{ shouldUseMemory: boolean; reason: string; memories: Memory[]; promptSnippets: string[] }>;
+  listL1Topics(scope: Partial<Scope> & { sessionId?: string; includeInactive?: boolean }): ReturnType<LayeredMemoryService["listL1Topics"]>;
+  runL1Maintenance(scope: Scope, sessionId: string): ReturnType<LayeredMemoryService["runL1Maintenance"]>;
+  listL1MaintenanceRuns(limit?: number): ReturnType<MemoryStore["layered"]["listL1MaintenanceRuns"]>;
+  listL2Aggregates(uid: string, agent: string, includeInactive?: boolean): ReturnType<MemoryStore["layered"]["listL2AggregateViews"]>;
+  runL2Aggregation(uid: string, agent: string, watermark?: number): ReturnType<LayeredMemoryService["runL2Aggregation"]>;
+  listL2AggregationRuns(limit?: number): ReturnType<MemoryStore["layered"]["listL2AggregationRuns"]>;
+  recallV2(input: { uid: string; agent: string; query: string; limit?: number; sessionId?: string; includeProvisional?: boolean }): Promise<{
+    shouldUseMemory: boolean;
+    reason: string;
+    results: LayeredRecallResult[];
+  }>;
 }
 
 export interface MemoryServiceOptions {
@@ -76,6 +95,7 @@ export interface MemoryServiceOptions {
   embeddingProvider?: EmbeddingProvider;
   embeddingIndex?: EmbeddingIndex;
   recallPlanner?: MemoryRecallPlanner;
+  layeredService?: LayeredMemoryService;
 }
 
 export function createRuntimeMemoryService(
@@ -101,6 +121,7 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
   const embeddingProvider = options.embeddingProvider;
   const embeddingIndex = options.embeddingIndex;
   const recallPlanner = options.recallPlanner ?? createDefaultRecallPlanner();
+  const layeredService = options.layeredService ?? (isLlmConfigured() ? createDefaultLayeredService(store) : undefined);
 
   return {
     async ingestTurn(input) {
@@ -110,7 +131,8 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
       if (!topic || topic.status !== "complete") {
         return { turn, topic, memories: [] };
       }
-      const topicMemory = await resolver.resolve(store, topicToDraftFromSegment(topic));
+      const topicMemory = store.createMemory(topicToDraftFromSegment(topic));
+      appendProvisionalTopic(store, layeredService, topic);
       const memories = [topicMemory];
       if (embeddingProvider && embeddingIndex) {
         await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
@@ -123,7 +145,8 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
       if (!topic || topic.status !== "complete") {
         return { topic, memories: [] };
       }
-      const topicMemory = await resolver.resolve(store, topicToDraftFromSegment(topic));
+      const topicMemory = store.createMemory(topicToDraftFromSegment(topic));
+      appendProvisionalTopic(store, layeredService, topic);
       const memories = [topicMemory];
       if (embeddingProvider && embeddingIndex) {
         await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
@@ -202,8 +225,54 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
         memories: selected,
         promptSnippets: selected.map((memory) => memory.readableText)
       };
+    },
+
+    listL1Topics(scope) {
+      return store.layered.listL1TopicViews(scope);
+    },
+
+    runL1Maintenance(scope, sessionId) {
+      return requireLayeredService(layeredService).runL1Maintenance(scope, sessionId);
+    },
+
+    listL1MaintenanceRuns(limit) {
+      return store.layered.listL1MaintenanceRuns(limit);
+    },
+
+    listL2Aggregates(uid, agent, includeInactive) {
+      return store.layered.listL2AggregateViews(uid, agent, includeInactive);
+    },
+
+    runL2Aggregation(uid, agent, watermark) {
+      return requireLayeredService(layeredService).runL2Aggregation(uid, agent, watermark);
+    },
+
+    listL2AggregationRuns(limit) {
+      return store.layered.listL2AggregationRuns(limit);
+    },
+
+    recallV2(input) {
+      return requireLayeredService(layeredService).recall(input);
     }
   };
+}
+
+function appendProvisionalTopic(store: MemoryStore, service: LayeredMemoryService | undefined, topic: TopicSegment): void {
+  if (service) {
+    service.appendProvisionalTopic(topic);
+    return;
+  }
+  store.layered.appendProvisionalTopic(topic, {
+    promptVersion: "online-topic-v1",
+    schemaVersion: "v2",
+    reason: topic.reason,
+    confidence: topic.confidence
+  });
+}
+
+function requireLayeredService(service: LayeredMemoryService | undefined): LayeredMemoryService {
+  if (!service) throw new Error("LLM configuration is required for layered maintenance and recall");
+  return service;
 }
 
 async function runSearch(
@@ -220,7 +289,7 @@ async function runSearch(
   const vectorResults = await embeddingIndex.search(queryVector, {
     limit: input.limit ?? 10,
     filter: {
-      mis: input.mis,
+      uid: input.uid,
       source: input.source,
       agent: input.agent,
       channel: input.channel
@@ -259,7 +328,7 @@ async function indexMemory(
     metadata: {
       level: memory.level,
       type: memory.type,
-      mis: memory.mis,
+      uid: memory.uid,
       source: memory.source,
       agent: memory.agent,
       channel: memory.channel
@@ -271,9 +340,13 @@ function isEmbeddingConfigured(): boolean {
   return Boolean(process.env.EMBEDDING_API_KEY || process.env.EMBEDDING_BASE_URL || process.env.EMBEDDING_MODEL);
 }
 
+function isLlmConfigured(): boolean {
+  return Boolean(process.env.LLM_BASE_URL && process.env.LLM_API_KEY && process.env.LLM_MODEL);
+}
+
 function toScope(input: Scope): Scope {
   return {
-    mis: input.mis,
+    uid: input.uid,
     source: input.source,
     agent: input.agent,
     channel: input.channel,
@@ -315,6 +388,24 @@ function createDefaultCompletionClient(): OpenAICompatibleCompletionClient {
   return new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model });
 }
 
+function createDefaultLayeredService(store: MemoryStore): LayeredMemoryService {
+  const client = createDefaultCompletionClient();
+  return new LayeredMemoryService(store, {
+    l1Planner: new LlmL1MaintenancePlanner(client),
+    l2Planner: new LlmL2MembershipPlanner(client),
+    l2Synthesizer: new LlmL2RevisionSynthesizer(client),
+    recallPlanner: new LlmLayeredRecallPlanner(client),
+    provenance: {
+      provider: "openai-compatible",
+      model: process.env.LLM_MODEL,
+      promptVersion: "v2",
+      schemaVersion: "v2",
+      reason: "runtime",
+      confidence: 1
+    }
+  });
+}
+
 function topicToDraftFromSegment(topic: TopicSegment): CreateMemoryInput {
   return topicMemoryUnitToDraft(
     {
@@ -331,7 +422,7 @@ function topicToDraftFromSegment(topic: TopicSegment): CreateMemoryInput {
     },
     {
       sessionId: topic.sessionId,
-      mis: topic.mis,
+      uid: topic.uid,
       source: topic.source,
       agent: topic.agent,
       channel: topic.channel,

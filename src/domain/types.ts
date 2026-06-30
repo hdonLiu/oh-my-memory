@@ -15,7 +15,7 @@ export type Role = "user" | "assistant" | "system";
 export type TopicStatus = "complete" | "partial" | "noise";
 
 export interface Scope {
-  mis: string;
+  uid: string;
   source: string;
   agent: string;
   channel: string;
@@ -24,10 +24,176 @@ export interface Scope {
 
 export interface ConversationTurn extends Scope {
   id: string;
+  eventId?: string;
   sessionId: string;
   role: Role;
   content: string;
   createdAt: string;
+}
+
+export type RevisionStatus = "provisional" | "canonical" | "superseded" | "deleted";
+export type EntityStatus = "active" | "superseded" | "merged" | "deleted";
+export type OfflineRunStatus = "running" | "success" | "failed";
+
+export interface GenerationProvenance {
+  provider?: string;
+  model?: string;
+  promptVersion: string;
+  schemaVersion: string;
+  reason: string;
+  confidence: number;
+}
+
+export interface L1Topic extends Scope {
+  id: string;
+  sessionId: string;
+  status: EntityStatus;
+  currentRevisionId: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface L1TopicRevision extends GenerationProvenance {
+  id: string;
+  topicId: string;
+  version: number;
+  status: RevisionStatus;
+  title: string;
+  summary: string;
+  sourceTurnIds: string[];
+  sourceSegmentId: string | null;
+  stableSequence: number | null;
+  createdAt: string;
+}
+
+export interface L1Component extends GenerationProvenance {
+  id: string;
+  topicRevisionId: string;
+  content: string;
+  labels: string[];
+  evidenceTurnIds: string[];
+  createdAt: string;
+}
+
+export type L1MaintenanceOperation = "keep" | "revise" | "merge" | "split" | "delete" | "noop";
+
+export interface L1MaintenancePlanItem {
+  operation: L1MaintenanceOperation;
+  sourceTopicIds: string[];
+  targetTopicId?: string;
+  title?: string;
+  summary?: string;
+  sourceTurnIds?: string[];
+  components?: Array<{
+    content: string;
+    labels?: string[];
+    evidenceTurnIds: string[];
+    confidence?: number;
+  }>;
+  reason: string;
+  confidence: number;
+}
+
+export interface L1MaintenancePlan {
+  items: L1MaintenancePlanItem[];
+}
+
+export interface L1MaintenanceRun {
+  id: string;
+  uid: string;
+  source: string;
+  agent: string;
+  channel: string;
+  sessionId: string;
+  inputCutoff: string;
+  outputWatermark: number | null;
+  status: OfflineRunStatus;
+  plan: L1MaintenancePlan | null;
+  error: string | null;
+  startedAt: string;
+  endedAt: string | null;
+}
+
+export interface L2Aggregate {
+  id: string;
+  uid: string;
+  agent: string;
+  status: EntityStatus;
+  currentRevisionId: string;
+  mergedIntoId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface L2Statement {
+  content: string;
+  evidenceComponentIds: string[];
+  confidence: number;
+  qualifier?: string;
+}
+
+export interface L2AggregateContent {
+  aggregateType: string;
+  canonicalTitle: string;
+  aliases: string[];
+  externalKeys: Record<string, string>;
+  labels: string[];
+  summary: string;
+  facts: L2Statement[];
+  decisions: L2Statement[];
+  constraints: L2Statement[];
+  openQuestions: L2Statement[];
+}
+
+export interface L2AggregateRevision extends GenerationProvenance, L2AggregateContent {
+  id: string;
+  aggregateId: string;
+  version: number;
+  sourceL1Watermark: number;
+  createdAt: string;
+}
+
+export type L2MembershipOperation =
+  | "attach"
+  | "create"
+  | "reassign"
+  | "merge"
+  | "split"
+  | "remove"
+  | "ignore"
+  | "unchanged";
+
+export interface L2MembershipPlanOperation {
+  operation: L2MembershipOperation;
+  targetAggregateId?: string;
+  sourceAggregateIds?: string[];
+  componentIds: string[];
+  reason: string;
+  confidence: number;
+}
+
+export interface L2DesiredMembership {
+  aggregateId?: string;
+  sourceAggregateIds?: string[];
+  componentIds: string[];
+}
+
+export interface L2MembershipPlan {
+  operations: L2MembershipPlanOperation[];
+  desiredMemberships: L2DesiredMembership[];
+  retireAggregateIds: string[];
+}
+
+export interface L2AggregationRun {
+  id: string;
+  uid: string;
+  agent: string;
+  sourceL1Watermark: number;
+  status: OfflineRunStatus;
+  plan: L2MembershipPlan | null;
+  error: string | null;
+  startedAt: string;
+  endedAt: string | null;
 }
 
 export interface Memory extends Scope {
@@ -83,7 +249,7 @@ export interface TopicSegment extends Scope {
   updatedAt: string;
 }
 
-export type CreateTurnInput = Omit<ConversationTurn, "id" | "createdAt">;
+export type CreateTurnInput = Omit<ConversationTurn, "id" | "eventId" | "createdAt"> & { eventId?: string };
 export type CreateMemoryInput = Omit<Memory, "id" | "createdAt" | "updatedAt" | "readableText"> & {
   readableText?: string;
 };

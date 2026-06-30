@@ -1,5 +1,11 @@
 # oh-my-memory Implementation Plan
 
+Status: Historical implementation plan
+
+Current target: [oh-my-memory Architecture v2](../../architecture/oh-my-memory-architecture-v2.md)
+
+This plan describes the original MVP implementation and must not be used as the current architecture contract.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build a local oh-my-memory-inspired memory service with L0/L1/L2/L3 storage, memory extraction, supersede evolution, relation handling, Dreaming compression, and search APIs.

@@ -1,5 +1,11 @@
 # oh-my-memory 设计 v1
 
+Status: Superseded historical design
+
+Current target: [oh-my-memory Architecture v2](../../architecture/oh-my-memory-architecture-v2.md)
+
+This document preserves the original MVP design and is not authoritative for new implementation work.
+
 ## 目标
 
 实现一个本地 Memory 服务。它不是简单检索库，而是支持记忆筛选、事实演化、关联关系、自动压缩、多级检索和多维隔离的记忆系统。

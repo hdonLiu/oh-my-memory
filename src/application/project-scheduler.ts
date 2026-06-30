@@ -99,7 +99,7 @@ export function collectProjectBuildScopes(memories: Memory[]): Scope[] {
       continue;
     }
     const scope = {
-      mis: memory.mis,
+      uid: memory.uid,
       source: memory.source,
       agent: memory.agent,
       channel: memory.channel,
@@ -111,7 +111,7 @@ export function collectProjectBuildScopes(memories: Memory[]): Scope[] {
 }
 
 function scopeKey(scope: Scope): string {
-  return [scope.mis, scope.source, scope.agent, scope.channel, JSON.stringify(scope.metadata)].join("\0");
+  return [scope.uid, scope.source, scope.agent, scope.channel, JSON.stringify(scope.metadata)].join("\0");
 }
 
 function parseBoolean(raw: string | undefined, fallback: boolean, name: string): boolean {

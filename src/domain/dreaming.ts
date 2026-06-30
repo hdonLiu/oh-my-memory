@@ -117,7 +117,7 @@ export class LlmMemoryCompressor implements MemoryCompressor {
         status: "active",
         supersedesId: null,
         sourceTurnIds: Array.from(new Set(evidence.flatMap((item) => item.sourceTurnIds))),
-        mis: scope.mis,
+        uid: scope.uid,
         source: scope.source,
         agent: scope.agent,
         channel: scope.channel,

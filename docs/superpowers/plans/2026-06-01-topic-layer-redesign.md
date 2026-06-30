@@ -1,5 +1,11 @@
 # Topic Layer Redesign Implementation Plan
 
+Status: Historical implementation plan; superseded as an architecture contract
+
+Current target: [oh-my-memory Architecture v2](../../architecture/oh-my-memory-architecture-v2.md)
+
+The sliding-buffer implementation remains useful history, but online Topic resolution and Project-only L2 assumptions are no longer target behavior.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Rework L0 -> Topic so the server uses a session sliding buffer, LLM boundary detection, structured Topic Memory generation, MemoryResolver reconciliation, and explicit session flush.

@@ -11,10 +11,12 @@ import type {
   Scope,
   TopicSegment
 } from "../domain/types.js";
+import type { LayeredMemoryRepository } from "./layered-repository.js";
 
 export type MemoryPatch = Partial<Omit<Memory, "id" | "createdAt">>;
 
 export interface MemoryStore {
+  readonly layered: LayeredMemoryRepository;
   createTurn(input: CreateTurnInput): ConversationTurn;
   listTurns(): ConversationTurn[];
   recentTurns(scope: Partial<Scope> & { sessionId?: string }, limit: number): ConversationTurn[];

@@ -85,7 +85,7 @@ function projectUsageDraft(turn: ConversationTurn, object: string): CreateMemory
     status: "active",
     supersedesId: null,
     sourceTurnIds: [turn.id],
-    mis: turn.mis,
+    uid: turn.uid,
     source: turn.source,
     agent: turn.agent,
     channel: turn.channel,
@@ -94,7 +94,7 @@ function projectUsageDraft(turn: ConversationTurn, object: string): CreateMemory
 }
 
 describe("topic boundary detection", () => {
-  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+  const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
   it("keeps related messages in the same open topic", async () => {
     const detector = new RuleBasedTopicBoundaryDetector();
@@ -188,7 +188,7 @@ describe("topic boundary detection", () => {
 });
 
 describe("topic memory generation", () => {
-  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+  const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
   it("generates structured topic units from closed turns", async () => {
     const generator = new RuleBasedTopicMemoryGenerator();
@@ -272,7 +272,7 @@ describe("topic memory generation", () => {
 });
 
 describe("session sliding topic builder", () => {
-  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+  const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
   it("keeps topic partial until boundary closes the previous buffer", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
@@ -322,10 +322,10 @@ describe("session sliding topic builder", () => {
   });
 });
 
-describe("topic resolver integration", () => {
-  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+describe("online topic append boundary", () => {
+  const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
-  it("runs MemoryResolver only when a topic closes", async () => {
+  it("does not run MemoryResolver when a topic closes", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
     const resolvedSubjects: string[] = [];
     const service = createTestMemoryService(store, {
@@ -351,12 +351,13 @@ describe("topic resolver integration", () => {
     expect(resolvedSubjects).toEqual([]);
 
     await service.ingestTurn({ sessionId: "s1", role: "user", content: "换个话题，健身计划", ...scope });
-    expect(resolvedSubjects).toEqual(["项目 A"]);
+    expect(resolvedSubjects).toEqual([]);
+    expect(store.layered.listL1TopicViews({ ...scope, sessionId: "s1" })[0]?.revision.status).toBe("provisional");
   });
 });
 
 describe("session topic flush", () => {
-  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+  const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
   it("flushes an open partial topic into a memory", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
@@ -414,7 +415,7 @@ describe("default topic LLM wiring", () => {
 });
 
 describe("topic configuration and debug api", () => {
-  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+  const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
   it("loads topic window config from environment values", () => {
     expect(
@@ -444,7 +445,7 @@ describe("topic configuration and debug api", () => {
 
     const partial = await app.inject({
       method: "GET",
-      url: "/topics?mis=u1&source=test&agent=agent&channel=default&sessionId=s1&status=partial"
+      url: "/topics?uid=u1&source=test&agent=agent&channel=default&sessionId=s1&status=partial"
     });
 
     expect(partial.statusCode).toBe(200);
@@ -460,7 +461,7 @@ describe("topic configuration and debug api", () => {
 
     const complete = await app.inject({
       method: "GET",
-      url: "/topics?mis=u1&source=test&agent=agent&channel=default&sessionId=s1&status=complete"
+      url: "/topics?uid=u1&source=test&agent=agent&channel=default&sessionId=s1&status=complete"
     });
 
     expect(complete.statusCode).toBe(200);
@@ -471,7 +472,7 @@ describe("topic configuration and debug api", () => {
 });
 
 describe("project debug api and eval fixtures", () => {
-  const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+  const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
   it("returns L2 project memories with project metadata filters", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
@@ -507,7 +508,7 @@ describe("project debug api and eval fixtures", () => {
 
     const response = await app.inject({
       method: "GET",
-      url: "/projects?mis=u1&source=test&agent=agent&channel=default&projectType=repository&projectKey=repo%3Aoh-my-memory"
+      url: "/projects?uid=u1&source=test&agent=agent&channel=default&projectType=repository&projectKey=repo%3Aoh-my-memory"
     });
 
     expect(response.statusCode).toBe(200);
@@ -606,19 +607,19 @@ describe("embedding abstraction", () => {
     await index.upsert({
       id: "m1",
       vector: [1, 0, 0],
-      metadata: { mis: "u1", level: "L2" }
+      metadata: { uid: "u1", level: "L2" }
     });
     await index.upsert({
       id: "m2",
       vector: [0, 1, 0],
-      metadata: { mis: "u2", level: "L2" }
+      metadata: { uid: "u2", level: "L2" }
     });
 
-    const scoped = await index.search([1, 0, 0], { limit: 3, filter: { mis: "u1" } });
-    expect(scoped).toEqual([expect.objectContaining({ id: "m1", metadata: { mis: "u1", level: "L2" } })]);
+    const scoped = await index.search([1, 0, 0], { limit: 3, filter: { uid: "u1" } });
+    expect(scoped).toEqual([expect.objectContaining({ id: "m1", metadata: { uid: "u1", level: "L2" } })]);
 
     await index.delete("m1");
-    expect(await index.search([1, 0, 0], { filter: { mis: "u1" } })).toEqual([]);
+    expect(await index.search([1, 0, 0], { filter: { uid: "u1" } })).toEqual([]);
   });
 
   it("validates OpenAI-compatible embedding dimensions and reports provider failures", async () => {
@@ -699,7 +700,7 @@ describe("runtime service wiring", () => {
         },
         db
       );
-      const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+      const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
       await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 使用 PostgreSQL", ...scope });
       const flushed = await service.flushSessionTopic(scope, "s1");
@@ -729,7 +730,7 @@ describe("memory storage", () => {
       sessionId: "s1",
       role: "user",
       content: "项目 A 使用 PostgreSQL",
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -747,7 +748,7 @@ describe("memory storage", () => {
       status: "active",
       supersedesId: null,
       sourceTurnIds: [turn.id],
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -756,7 +757,7 @@ describe("memory storage", () => {
 
     expect(store.getMemory(memory.id)).toEqual(memory);
     expect(memory.readableText).toBe("L2 fact: 项目 A 使用 PostgreSQL\n项目 A 使用 PostgreSQL");
-    expect(store.listMemories({ mis: "u1" })).toEqual([memory]);
+    expect(store.listMemories({ uid: "u1" })).toEqual([memory]);
   });
 
   it("migrates databases to readable text and indexed schema", () => {
@@ -768,10 +769,18 @@ describe("memory storage", () => {
     const versions = db.prepare("select version from schema_migrations").all() as Array<{ version: number }>;
 
     expect(columns.map((column) => column.name)).toContain("readable_text");
+    expect(columns.map((column) => column.name)).toContain("uid");
     expect(memoryIndexes.map((index) => index.name)).toContain("idx_memories_scope_status_level_type");
     expect(topicIndexes.map((index) => index.name)).toContain("idx_topic_segments_scope_session_status");
     expect(runIndexes.map((index) => index.name)).toContain("idx_project_build_runs_started_at");
     expect(versions.map((version) => version.version)).toContain(1);
+    expect(versions.map((version) => version.version)).toContain(2);
+    expect((db.pragma("table_info(l1_topic_revisions)") as Array<{ name: string }>).map((column) => column.name)).toContain(
+      "stable_sequence"
+    );
+    expect((db.pragma("table_info(l2_component_memberships)") as Array<{ name: string }>).map((column) => column.name)).toContain(
+      "component_id"
+    );
   });
 
   it("persists turns, memories, and relations", () => {
@@ -782,7 +791,7 @@ describe("memory storage", () => {
       sessionId: "s1",
       role: "user",
       content: "项目 A 使用 PostgreSQL",
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -800,7 +809,7 @@ describe("memory storage", () => {
       status: "active",
       supersedesId: null,
       sourceTurnIds: [turn.id],
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -810,7 +819,7 @@ describe("memory storage", () => {
     const relation = repo.createRelation(memory.id, memory.id, "related", 0.5);
 
     expect(repo.listTurns()).toHaveLength(1);
-    expect(repo.listMemories({ mis: "u1" })).toHaveLength(1);
+    expect(repo.listMemories({ uid: "u1" })).toHaveLength(1);
     expect(repo.listRelations(memory.id)).toEqual([relation]);
   });
 });
@@ -819,7 +828,7 @@ describe("memory application service", () => {
   it("ingests turns without depending on HTTP transport", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
     const service = createTestMemoryService(store);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     const first = await service.ingestTurn({
       sessionId: "s1",
@@ -856,14 +865,14 @@ describe("memory application service", () => {
       sessionId: "s1",
       role: "user",
       content: "项目 A 使用 PostgreSQL",
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
       metadata: {}
     });
     const result = await service.flushSessionTopic(
-      { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} },
+      { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} },
       "s1"
     );
 
@@ -874,10 +883,10 @@ describe("memory application service", () => {
     expect(store.listMemories().map((memory): string => memory.level)).not.toContain("L1");
   });
 
-  it("resolves topic memory updates and relations before rebuilding L2", async () => {
+  it("appends online topic memories without reconciling historical topics", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
     const service = createTestMemoryService(store);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 使用 MySQL", ...scope });
     const first = await service.flushSessionTopic(scope, "s1");
@@ -889,14 +898,15 @@ describe("memory application service", () => {
     });
     const second = await service.flushSessionTopic(scope, "s1");
 
-    expect(store.getMemory(first.memories[0].id)?.status).toBe("superseded");
+    expect(store.getMemory(first.memories[0].id)?.status).toBe("active");
     expect(second.memories[0]).toMatchObject({
       level: "topic",
       type: "topic",
       subject: "项目 A",
-      supersedesId: first.memories[0].id
+      supersedesId: null
     });
-    expect(store.listRelations(first.memories[0].id)).toEqual([expect.objectContaining({ relationType: "update" })]);
+    expect(store.listRelations(first.memories[0].id)).toEqual([]);
+    expect(store.layered.listL1TopicViews({ ...scope, sessionId: "s1" })).toHaveLength(2);
     expect(store.listMemories(scope).some((memory) => memory.level === "L2")).toBe(false);
   });
 
@@ -917,7 +927,7 @@ describe("memory application service", () => {
     const service = createTestMemoryService(store, {
       topicBuilder: new SlidingTopicBuilder(detector, new RuleBasedTopicMemoryGenerator(), { maxSize: 3, minConfidence: 0.7 })
     });
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     await service.ingestTurn({ sessionId: "s2", role: "user", content: "项目 B 使用 Redis", ...scope });
     await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 使用 MySQL", ...scope });
@@ -971,7 +981,7 @@ describe("memory application service", () => {
       }
     });
 
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     await service.ingestTurn({
       sessionId: "s1",
       role: "user",
@@ -997,7 +1007,7 @@ describe("memory application service", () => {
       embeddingIndex
     });
 
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     await service.ingestTurn({
       sessionId: "s1",
       role: "user",
@@ -1020,7 +1030,7 @@ describe("memory application service", () => {
 describe("topic extraction layer", () => {
   it("closes the current session buffer when a new unrelated instruction starts", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     const detector: TopicBoundaryDetector = {
       detectBoundary({ existingTurns, newTurn }) {
         const unrelated = newTurn.content.includes("项目 B");
@@ -1098,7 +1108,7 @@ describe("topic extraction layer", () => {
         { maxSize: 2, minConfidence: 0.7 }
       )
     });
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     await service.ingestTurn({ sessionId: "s1", role: "user", content: "项目 A 使用 MySQL", ...scope });
     const result = await service.ingestTurn({
@@ -1114,7 +1124,7 @@ describe("topic extraction layer", () => {
 
   it("keeps growing the open L0 buffer until max window creates topic memory", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     const sizes: number[] = [];
     const detector: TopicBoundaryDetector = {
       async detectBoundary({ existingTurns, newTurn }) {
@@ -1163,7 +1173,7 @@ describe("topic extraction layer", () => {
       sessionId: "s1",
       role: "user",
       content: "好的",
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -1175,10 +1185,10 @@ describe("topic extraction layer", () => {
     expect(store.listMemories()).toEqual([]);
   });
 
-  it("reuses duplicate topic memories through resolver", async () => {
+  it("keeps duplicate-looking online topics separate until offline maintenance", async () => {
     const store: MemoryStore = new SqliteMemoryStore(createDatabase(":memory:"));
     const service = createTestMemoryService(store);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     await service.ingestTurn({
       sessionId: "s1",
@@ -1196,9 +1206,10 @@ describe("topic extraction layer", () => {
     const duplicate = await service.flushSessionTopic(scope, "s1");
 
     expect(first.memories).toHaveLength(1);
-    expect(duplicate.memories[0].id).toBe(first.memories[0].id);
+    expect(duplicate.memories[0].id).not.toBe(first.memories[0].id);
     expect(store.listMemories(scope).map((memory): string => memory.level)).not.toContain("L1");
-    expect(store.listMemories(scope).filter((memory) => memory.level === "topic")).toHaveLength(1);
+    expect(store.listMemories(scope).filter((memory) => memory.level === "topic")).toHaveLength(2);
+    expect(store.layered.listL1TopicViews({ ...scope, sessionId: "s1" })).toHaveLength(2);
     expect(store.listMemories(scope).filter((memory) => memory.level === "L2")).toHaveLength(0);
   });
 });
@@ -1207,7 +1218,7 @@ describe("memory api", () => {
   it("writes turns, searches memories, manages status, lists relations, and runs dreaming", async () => {
     const db = createDatabase(":memory:");
     const app = buildServer(createTestMemoryService(new MemoryRepository(db)));
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     const first = await app.inject({
       method: "POST",
@@ -1259,7 +1270,7 @@ describe("memory api", () => {
 
     const relations = await app.inject({ method: "GET", url: `/memories/${activeId}/relations` });
     expect(relations.statusCode).toBe(200);
-    expect(relations.json().relations).toEqual([expect.objectContaining({ relationType: "update" })]);
+    expect(relations.json().relations).toEqual([]);
 
     await app.inject({
       method: "POST",
@@ -1279,7 +1290,7 @@ describe("memory api", () => {
     expect(dreaming.statusCode).toBe(200);
     expect(dreaming.json().createdOrUpdated[0]).toMatchObject({ level: "L3", object: "TypeScript" });
 
-    const list = await app.inject({ method: "GET", url: "/memories?mis=u1&source=test&agent=agent&channel=default" });
+    const list = await app.inject({ method: "GET", url: "/memories?uid=u1&source=test&agent=agent&channel=default" });
     expect(list.statusCode).toBe(200);
     expect(list.json().memories.length).toBeGreaterThan(0);
 
@@ -1302,7 +1313,7 @@ describe("memory api", () => {
   it("recalls selected memories through an LLM-guided service", async () => {
     const db = createDatabase(":memory:");
     const store = new MemoryRepository(db);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     const memory = store.createMemory({
       level: "L3",
       type: "profile",
@@ -1352,7 +1363,7 @@ describe("extractor strategies", () => {
       sessionId: "s1",
       role: "user",
       content: "项目 A 使用 PostgreSQL",
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -1387,7 +1398,7 @@ describe("extractor strategies", () => {
       sessionId: "s1",
       role: "user",
       content: "项目 A 使用 PostgreSQL",
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -1425,7 +1436,7 @@ describe("strategy compatibility", () => {
 
   it("keeps default strategies compatible with existing functions", async () => {
     const store = new SqliteMemoryStore(createDatabase(":memory:"));
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     const turn = store.createTurn({
       sessionId: "s1",
       role: "user",
@@ -1525,7 +1536,7 @@ describe("cli ingestion", () => {
       "user",
       "--content",
       "项目 A 使用 MySQL",
-      "--mis",
+      "--uid",
       "u1",
       "--source",
       "cli",
@@ -1543,7 +1554,7 @@ describe("cli ingestion", () => {
           sessionId: "s1",
           role: "user",
           content: "项目 A 已迁移到 PostgreSQL",
-          mis: "u1",
+          uid: "u1",
           source: "cli",
           agent: "demo",
           channel: "default",
@@ -1552,7 +1563,7 @@ describe("cli ingestion", () => {
         {
           role: "user",
           content: "missing session id",
-          mis: "u1",
+          uid: "u1",
           source: "cli",
           agent: "demo",
           channel: "default",
@@ -1567,7 +1578,7 @@ describe("cli ingestion", () => {
       expect(imported.stdout).toContain('"failed":1');
 
       const store = new SqliteMemoryStore(createDatabase(dbPath));
-      expect(store.listMemories({ mis: "u1" }).some((memory) => memory.object.includes("PostgreSQL"))).toBe(true);
+      expect(store.listMemories({ uid: "u1" }).some((memory) => memory.object.includes("PostgreSQL"))).toBe(true);
     } finally {
       globalThis.fetch = previousFetch;
       if (previousEnv.baseUrl === undefined) delete process.env.LLM_BASE_URL;
@@ -1584,7 +1595,7 @@ describe("memory search", () => {
   it("searches L3 and L2 but excludes superseded and deleted memories", () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     repo.createMemory({
       level: "L2",
@@ -1635,7 +1646,7 @@ describe("memory search", () => {
   it("prefers same scope and active current facts", () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     repo.createMemory({
       level: "L2",
@@ -1661,7 +1672,7 @@ describe("memory search", () => {
       status: "active",
       supersedesId: null,
       sourceTurnIds: ["t2"],
-      mis: "u2",
+      uid: "u2",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -1709,7 +1720,7 @@ describe("project memory and dreaming", () => {
   it("passes structured topic inputs into the L2 project extractor", async () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     const topic = repo.createMemory({
       level: "topic",
       type: "topic",
@@ -1761,8 +1772,8 @@ describe("project memory and dreaming", () => {
   it("runs scheduled project builds for scopes with active topic memories", async () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
-    const scopeA = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: { team: "a" } };
-    const scopeB = { mis: "u2", source: "test", agent: "agent", channel: "default", metadata: { team: "b" } };
+    const scopeA = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: { team: "a" } };
+    const scopeB = { uid: "u2", source: "test", agent: "agent", channel: "default", metadata: { team: "b" } };
     repo.createMemory({
       level: "topic",
       type: "topic",
@@ -1807,7 +1818,7 @@ describe("project memory and dreaming", () => {
     const service = createTestMemoryService(repo, {
       projectMemoryBuilder: {
         rebuild(_store, scope) {
-          scopesRun.push(`${scope.mis}:${scope.metadata.team as string}`);
+          scopesRun.push(`${scope.uid}:${scope.metadata.team as string}`);
           return [];
         }
       }
@@ -1827,7 +1838,7 @@ describe("project memory and dreaming", () => {
   it("records scheduled project build runs", async () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     repo.createMemory({
       level: "topic",
       type: "topic",
@@ -1880,7 +1891,7 @@ describe("project memory and dreaming", () => {
   it("exposes project build run records through HTTP", async () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     const service = createTestMemoryService(repo);
     service.recordProjectBuildRun({
       startedAt: "2026-06-18T00:00:00.000Z",
@@ -1910,7 +1921,7 @@ describe("project memory and dreaming", () => {
   it("builds L2 project memory from topic memories with a model extractor", async () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     repo.createMemory({
       level: "topic",
@@ -1977,7 +1988,7 @@ describe("project memory and dreaming", () => {
   it("rejects project model output with unknown evidence memory ids", async () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     const topic = repo.createMemory({
       level: "topic",
       type: "topic",
@@ -2019,7 +2030,7 @@ describe("project memory and dreaming", () => {
   it("promotes preference topics into L3 profile memories", () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
     repo.createMemory({
       level: "topic",
@@ -2063,7 +2074,7 @@ describe("project memory and dreaming", () => {
   it("extracts L3 memories with a model compressor", async () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     const project = repo.createMemory({
       level: "L2",
       type: "project",
@@ -2112,7 +2123,7 @@ describe("project memory and dreaming", () => {
   it("rejects model compressor output with unknown evidence memory ids", async () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     repo.createMemory({
       level: "L2",
       type: "project",
@@ -2149,7 +2160,7 @@ describe("project memory and dreaming", () => {
   it("falls back to rule-based dreaming when model compressor output is invalid", async () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     repo.createMemory({
       level: "topic",
       type: "topic",
@@ -2186,7 +2197,7 @@ describe("memory resolution", () => {
       status: "active",
       supersedesId: null,
       sourceTurnIds: ["t1"],
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -2196,7 +2207,7 @@ describe("memory resolution", () => {
       sessionId: "s1",
       role: "user",
       content: "项目 A 已迁移到 PostgreSQL",
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -2228,7 +2239,7 @@ describe("memory resolution", () => {
       status: "active",
       supersedesId: null,
       sourceTurnIds: ["t1"],
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -2238,7 +2249,7 @@ describe("memory resolution", () => {
       sessionId: "s1",
       role: "user",
       content: "项目 A 使用 PostgreSQL",
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -2270,7 +2281,7 @@ describe("memory resolution", () => {
       status: "active",
       supersedesId: null,
       sourceTurnIds: ["t1"],
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -2280,7 +2291,7 @@ describe("memory resolution", () => {
       sessionId: "s1",
       role: "user",
       content: "项目 A 已迁移到 PostgreSQL",
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -2314,7 +2325,7 @@ describe("memory resolution", () => {
       status: "active",
       supersedesId: null,
       sourceTurnIds: ["t1"],
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -2324,7 +2335,7 @@ describe("memory resolution", () => {
       sessionId: "s1",
       role: "user",
       content: "项目 A 使用 PostgreSQL",
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -2359,7 +2370,7 @@ describe("memory resolution", () => {
       status: "active",
       supersedesId: null,
       sourceTurnIds: ["t1"],
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -2369,7 +2380,7 @@ describe("memory resolution", () => {
       sessionId: "s1",
       role: "user",
       content: "项目 A 已迁移到 PostgreSQL",
-      mis: "u1",
+      uid: "u1",
       source: "test",
       agent: "agent",
       channel: "default",
@@ -2387,7 +2398,7 @@ describe("memory resolution", () => {
   it("updates project memories by projectKey even when project names change", () => {
     const db = createDatabase(":memory:");
     const repo = new MemoryRepository(db);
-    const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+    const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
     const old = repo.createMemory({
       level: "L2",
       type: "project",

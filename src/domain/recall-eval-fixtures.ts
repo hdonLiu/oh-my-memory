@@ -13,7 +13,7 @@ export interface RecallEvaluationFixture {
   expected: RecallEvaluationExpected;
 }
 
-const scope = { mis: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
+const scope = { uid: "u1", source: "test", agent: "agent", channel: "default", metadata: {} };
 
 export const recallEvaluationFixtures: RecallEvaluationFixture[] = [
   {

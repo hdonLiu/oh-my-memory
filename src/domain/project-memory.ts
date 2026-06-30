@@ -102,7 +102,7 @@ export class LlmProjectMemoryExtractor implements ProjectMemoryExtractor {
         status: "active",
         supersedesId: null,
         sourceTurnIds: Array.from(new Set(evidenceTopics.flatMap((topic) => topic.sourceTurnIds))),
-        mis: input.scope.mis,
+        uid: input.scope.uid,
         source: input.scope.source,
         agent: input.scope.agent,
         channel: input.scope.channel,

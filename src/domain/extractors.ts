@@ -81,7 +81,7 @@ export class LlmMemoryExtractor implements MemoryExtractor {
       status: "active",
       supersedesId: null,
       sourceTurnIds: [turn.id],
-      mis: turn.mis,
+      uid: turn.uid,
       source: turn.source,
       agent: turn.agent,
       channel: turn.channel,
