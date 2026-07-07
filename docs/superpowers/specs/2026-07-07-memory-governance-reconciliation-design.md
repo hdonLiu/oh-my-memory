@@ -334,6 +334,8 @@ run_mode text not null default 'incremental'
 caller_idempotency_key text
 prompt_version text
 schema_version text
+context_expansion_rounds integer not null default 0
+context_request_json text
 ```
 
 L2 Statement JSON stored in `facts`, `decisions`, `constraints`, and `open_questions` gains the fields defined in section 6.3, including `evidenceCorrectionIds`.
@@ -541,7 +543,22 @@ corrections: CorrectionRecord[];
 handledCorrectionIds: string[];
 ```
 
-Every due `ready_l2` Correction in the input snapshot must be handled exactly once.
+Membership planning returns either a complete plan or an explicit context-expansion request:
+
+```ts
+export type L2MembershipPlanningResult =
+  | { status: "complete"; plan: L2MembershipPlan }
+  | {
+      status: "needs_more_context";
+      expansionQueries: string[];
+      expansionSeedIds: string[];
+      reason: string;
+    };
+```
+
+Every due `ready_l2` Correction selected into the input snapshot must be supplied to the Planner. A `complete` result must handle each of them exactly once.
+
+`handledCorrectionIds` is validated only on a `complete` result. `needs_more_context` commits no semantic change, advances no checkpoint, and leaves Corrections `ready_l2`.
 
 The L2 synthesizer receives the relevant Corrections for each desired membership. It must:
 
@@ -629,6 +646,8 @@ agent
 L1 stable watermark
 ready governance watermark
 ready Correction IDs and immutable payload hashes
+mandatory and optional candidate IDs and content hashes
+context-expansion round and normalized request hash
 prompt version
 schema version
 run mode
@@ -724,24 +743,44 @@ Initial configuration:
 
 ```text
 L2_MAX_COMPONENTS_PER_AGGREGATE=12
-L2_MEMBERSHIP_CANDIDATE_LIMIT=40
+L2_MEMBERSHIP_OPTIONAL_CANDIDATE_LIMIT=40
 RECALL_CANDIDATE_LIMIT=30
 ```
 
-These are configurable safety budgets, not semantic truth. The default Aggregate ceiling is inspired by xMemory and must later be calibrated using project evaluations.
+These are configurable safety budgets, not semantic truth or completeness guarantees. The default Aggregate ceiling is inspired by xMemory and must later be calibrated using project evaluations.
 
-Candidate generation:
+Membership context has two distinct pools.
 
-- use embedding neighbours when an embedding provider/index is configured;
-- otherwise use lexical similarity and recency;
-- include current Aggregate members even when they fall outside the nearest-neighbour pool;
-- include Components referenced by due Corrections;
-- for an L2 Statement correction, include its current Aggregate and validated membership together with the Correction Record;
-- never pass the entire namespace unbounded to a single LLM prompt.
+Mandatory context is never displaced by similarity ranking and does not consume `L2_MEMBERSHIP_OPTIONAL_CANDIDATE_LIMIT`:
+
+- every current member of an Aggregate being reconsidered;
+- every Component directly referenced by a due Correction in the fixed job snapshot;
+- the target Statement's current Component evidence for an L2 Statement Correction;
+- each due Correction Record and its pinned target occurrence.
+
+Optional candidates are retrieved with independent, deduplicated quotas from:
+
+- embedding neighbours when an embedding provider/index is configured;
+- lexical similarity and recency when embeddings are unavailable;
+- neighbours of corrected Components and target Statement evidence;
+- neighbours of the current Aggregate centroid and current members;
+- relevant lineage, conflict, and recently unassigned Components.
+
+Mandatory and optional pools remain subject to a hard prompt-token budget. The system must never silently truncate mandatory context. If mandatory context alone would exceed the budget, the scheduler partitions due Corrections into deterministic bounded job snapshots before fixing each snapshot, or enters bounded full reconciliation using stable intermediate summaries.
+
+When the initial context is insufficient, the Membership Planner returns `needs_more_context`. The system retrieves from the supplied semantic queries and seed IDs, deduplicates the results, and reruns planning within configurable per-round and cumulative candidate/token budgets. Expansion changes available evidence only; the system does not infer merge, split, or assignment from retrieval scores.
+
+If the bounded expansion rounds are exhausted:
+
+- incremental mode escalates to bounded full reconciliation using batched Component and Aggregate summaries;
+- if full reconciliation still cannot produce a complete plan, the run is persisted as `needs_context` with its expansion request;
+- no Aggregate Revision, Membership, Correction status, or checkpoint is changed;
+- retries use backoff and persisted context state rather than immediately repeating the same calls;
+- Recall continues to expose pending reconciliation.
+
+No single prompt receives the entire namespace. Full reconciliation scans all active Components in bounded batches, builds stable intermediate summaries, and supplies focused neighbourhoods to final planning.
 
 If a desired Aggregate exceeds the configured hard ceiling, the Plan must split or reassign it. The system rejects an over-limit commit but does not determine the semantic partition itself.
-
-Full reconciliation scans all active Components in bounded batches and candidate neighbourhoods; it does not construct one unbounded prompt.
 
 ## 14. API Compatibility
 
@@ -800,6 +839,8 @@ The run fails without advancing state when:
 - the database commit fails.
 
 A failed L1 run leaves Corrections `pending_l1`. A failed L2 run leaves them `ready_l2`. Schedulers rediscover both states after restart.
+
+`needs_context` is a non-successful, non-error L2 terminal state for the current bounded attempt. It preserves the normalized expansion request and round count for backoff, restart recovery, and later full reconciliation. It is never eligible for successful-snapshot idempotency reuse.
 
 ## 16. Migration
 
@@ -862,6 +903,12 @@ All implementation follows test-first development.
 - no evidence-count threshold or deterministic latest-wins rule decides conflict status;
 - an applied correction produces supported output only when no independent active contradiction remains;
 - conflicting human Corrections remain contested;
+- mandatory membership context is never displaced by optional Top-K candidates;
+- adding corrected Components does not reduce the configured optional candidate quota;
+- `needs_more_context` retrieves only in-scope query/seed expansions and remains within cumulative budgets;
+- exhausted incremental expansion escalates to bounded full reconciliation;
+- exhausted full reconciliation persists `needs_context` without changing Membership, Correction state, or checkpoint;
+- retry after `needs_context` uses persisted expansion state and backoff;
 - Statement identity is preserved only by a validated `continue` operation from a known source occurrence;
 - evidence authority is derived correctly;
 - success moves Corrections to applied and advances checkpoint atomically;
@@ -910,6 +957,10 @@ The implementation adds deterministic fixtures and reporting interfaces for:
 - correction convergence latency;
 - stale Recall rate while reconciliation is pending;
 - L2 membership precision;
+- mandatory-context retention rate;
+- membership candidate coverage;
+- context-expansion trigger rate and decision-change rate;
+- `needs_context` backlog and convergence latency;
 - split/merge/reassignment precision;
 - contested detection accuracy;
 - contested evidence-reference validity;
@@ -949,6 +1000,8 @@ The feature is complete when all of the following are true:
 - replacement content remains directly traceable to an immutable Correction Record;
 - LLMs propose Statement lineage operations but never allocate, copy, or reassign Statement IDs;
 - every Statement identity transition is system-validated and auditable through explicit lineage;
+- mandatory correction and current-membership context is never evicted by optional candidate limits;
+- bounded context expansion may defer a decision but never commits a destructive membership change from an explicitly incomplete plan;
 - L1 and L2 independently discover and consume the Corrections due to their own stage;
 - a Correction cannot reach `applied` until every stage required by its target type commits successfully: L1 then L2 for Turn/Component targets, L2 only for Statement targets;
 - a scheduler run makes no LLM call when its identical input snapshot already has a successful run; new governance events, failed retries, and explicitly keyed reruns are excluded from this guarantee;
