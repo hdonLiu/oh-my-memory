@@ -97,6 +97,16 @@ flowchart TD
 
 Correction writes persistent work state only. The L1 and L2 schedulers discover that work independently. No correction data write invokes the next stage directly.
 
+### 5.1 Canonical Architecture Milestone
+
+Governance changes the canonical system model from pipeline plus storage to three orthogonal concerns:
+
+1. the online/offline L0→L1→L2 semantic pipeline;
+2. immutable revisioned Memory storage and lineage;
+3. the Governance Plane for correction evidence, reconciliation lifecycle, freshness, checkpoints, and audit.
+
+Before implementation begins, the project must add a Governance Plane ADR and publish canonical Architecture v2.1. Those documents must preserve the three-stage pipeline, show Governance as orthogonal rather than L3, define ownership of every state transition, and link back to this specification. README and production-backlog updates remain delivery documentation, but the ADR and v2.1 architecture are an implementation prerequisite and architecture milestone.
+
 ## 6. Core Types
 
 ### 6.1 Evidence References
@@ -468,6 +478,21 @@ For an L2 Statement target, the offline L2 Planner and synthesizer receive the C
 
 The system fixes the evidence authority to `human_correction`, but does not assign semantic `confidence=1`. Confidence remains an output of the owning L1 or L2 semantic job. This preserves the distinction between who asserted the correction and how strongly the resulting claim is supported.
 
+### 8.4 Multiple and Subsequent Corrections
+
+Correction Records are evidence roots, not Memory entities, and cannot themselves be correction targets in v1. The API accepts only the target types declared by `CorrectionTargetType`; therefore no Correction is converted into a Turn and no recursive correction cascade is created.
+
+Multiple Corrections may pin the same still-current target occurrence before reconciliation:
+
+- every distinct `eventId` remains an immutable sibling governance event;
+- compatible siblings may be incorporated together by the owning semantic job;
+- incompatible human Corrections remain active evidence and produce a `contested` result rather than deterministic latest-wins behaviour;
+- retract and replace siblings targeting the same occurrence must both be presented to the LLM and cannot be silently ordered by timestamp.
+
+After a Correction is applied, a later Correction targets the resulting current Turn-derived Component or current L2 Statement occurrence, not the earlier Correction Record. This creates an auditable chain through Memory and Statement lineage without mutating governance history.
+
+Undo and redo are excluded from v1. A future design must append an explicit `cancel` or `supersede` governance event with a reference to the earlier Correction; it must not delete, edit, or retarget the original record.
+
 ## 9. Offline L1 Reconciliation
 
 ### 9.1 Work Discovery
@@ -616,7 +641,7 @@ The normalized request payload is hashed to detect conflicting reuse. The immuta
 
 Retries must reuse the same `eventId`. Distinct event IDs always represent distinct governance events even when their normalized payloads are identical. The system performs no semantic deduplication across Correction Records: collapsing separate events would lose chronology and would require a nondeterministic semantic decision before the idempotency boundary.
 
-This version has no Correction delete, undo, or redo operation. A future undo design must append an explicit `cancel` or `supersede` governance event and retain lineage; it must not delete and recreate Correction Records.
+Correction deletion remains forbidden. Multiple, subsequent, undo, and redo semantics follow section 8.4.
 
 ### 11.2 L1 Snapshot
 
@@ -680,6 +705,34 @@ Schedulers may coalesce multiple durable pending Corrections for the same L1 ses
 - a configurable maximum wait prevents indefinite postponement under a continuous correction stream;
 - restart discovery uses persisted Correction state rather than an in-memory timer;
 - manual reconciliation may bypass the coalescing delay.
+
+### 11.6 Correction Cost Envelope
+
+Correction cost is bounded per job snapshot, not promised as a fixed number of LLM calls per Correction. Batching amortizes one job across multiple Corrections.
+
+| Correction target | Required semantic stages | Normal path |
+| --- | --- | --- |
+| Turn | L1 then L2 | one L1 plan, then one L2 membership pass plus synthesis for affected Aggregates |
+| L1 Component | L1 then L2 | one L1 plan, then one L2 membership pass plus synthesis for affected Aggregates |
+| L2 Statement | L2 only | one L2 membership pass plus synthesis for the owning or reassigned Aggregate |
+
+Retries, context expansion, bounded full reconciliation, and multiple affected Aggregates can increase calls. The implementation must expose and enforce configurable operational ceilings:
+
+```text
+CORRECTION_MAX_BATCH_SIZE
+L1_JOB_MAX_INPUT_TOKENS
+L1_JOB_MAX_OUTPUT_TOKENS
+L2_JOB_MAX_INPUT_TOKENS
+L2_JOB_MAX_OUTPUT_TOKENS
+L2_MAX_CONTEXT_EXPANSION_ROUNDS
+L2_MAX_SYNTHESIS_CALLS_PER_RUN
+```
+
+Every deployment must provide finite positive values; zero, missing, or unlimited ceilings are invalid startup configuration. The active values and a `budgetPolicyVersion` are returned by Correction inspection so operators can understand the effective boundary without relying on model-provider pricing.
+
+Crossing a ceiling never permits a partial semantic commit. The run becomes `needs_context` or fails retryably while Correction state and checkpoints remain unchanged.
+
+Correction create and inspect responses expose the required stage path and current lifecycle state. Run telemetry records model, prompt/schema version, input/output tokens, LLM call count, expansion rounds, affected Aggregate count, and batch size. Usage is attributed both to the batch and amortized across its Correction IDs; exact currency estimates remain an observability concern because provider prices are external and time-varying.
 
 ## 12. Recall Contract
 
@@ -844,7 +897,43 @@ A failed L1 run leaves Corrections `pending_l1`. A failed L2 run leaves them `re
 
 ## 16. Migration
 
-The schema migration must be idempotent and preserve all existing v2 entities.
+The schema migration must be idempotent, recoverable, and preserve all existing v2 entities. It is an additive forward migration; rollback after commit is performed by restoring the verified pre-migration database backup rather than by a destructive down migration.
+
+### 16.1 Deterministic Legacy Statement IDs
+
+Existing Statement occurrences without IDs receive UUIDv5 identifiers using namespace UUID `7b7b6c5e-1cbf-5f9c-a7ef-2ddad0a0e6c4`. The UUID and canonical-name version are permanent migration constants.
+
+The UUIDv5 name is the UTF-8 encoding of `omm:legacy-statement:v1`, followed by each field encoded as `|<UTF-8-byte-length>:<exact-stored-value>` in this order:
+
+```text
+uid | agent | aggregateId | aggregateRevisionId | statementCategory | originalArrayIndex
+```
+
+Rules:
+
+- an existing syntactically valid ID is preserved;
+- a missing ID is generated as `UUIDv5(fixedNamespace, canonicalOccurrenceLocator)`;
+- the locator uses stored immutable IDs and the original pre-migration category/index, never content, evidence ordering, timestamps, or mutable text;
+- the migration precomputes every generated ID and aborts on duplicate locators, ID collisions, missing locator fields, or an existing ID assigned to another occurrence;
+- legacy semantic continuity across different Revisions is not inferred; each unlinked historical occurrence receives its own logical ID and no fabricated lineage edge;
+- rerunning after success preserves existing IDs, while rerunning after rollback regenerates the same IDs.
+
+Content-derived IDs are forbidden because content edits, normalization, or duplicate claims would make identity unstable or ambiguous.
+
+### 16.2 Recovery Procedure
+
+Before writing, migration must:
+
+1. acquire an application maintenance lock and stop new writers;
+2. checkpoint the SQLite WAL;
+3. create a consistent backup through the SQLite backup API and record its checksum, size, schema version, and row counts;
+4. run all schema, locator, ID-collision, JSON-parse, and ownership preflight checks without mutation.
+
+Migration then runs schema additions, JSON transformation, checkpoint initialization, and validation inside one database transaction. Before commit it verifies row counts, JSON decoding, generated-ID uniqueness, evidence references, namespace ownership, and checkpoint coverage. The schema version is written last.
+
+Any pre-commit failure rolls back the entire transaction and leaves the old database active. The backup is retained until post-migration verification succeeds. A failure discovered after commit is recovered by stopping writers and restoring the checksummed backup; partially reversing JSON or schema changes in place is unsupported.
+
+### 16.3 Forward Steps
 
 Migration steps:
 
@@ -853,7 +942,7 @@ Migration steps:
 3. extend L1/L2 run tables with snapshot, mode, version, and governance fields;
 4. create Correction, namespace change, checkpoint, and Statement lineage tables and indexes;
 5. transform existing Statement JSON:
-   - generate a stable ID for every existing Statement;
+   - generate each missing Statement ID using section 16.1;
    - set `semanticOrigin=derived`;
    - set `evidenceAuthority=conversation` when all referenced Components are ordinary, otherwise derive it;
    - set `evidenceCorrectionIds=[]`;
@@ -876,6 +965,9 @@ All implementation follows test-first development.
 - retract/replace validation is enforced;
 - replacement creates no synthetic Turn, session, Topic, or Component;
 - Correction authority is fixed by the service, and unknown or out-of-scope Correction evidence IDs are rejected;
+- a Correction Record cannot be used as a correction target;
+- compatible sibling Corrections are processed together while incompatible siblings remain contested;
+- a later Correction targets the applied successor rather than mutating the prior Correction;
 - transaction failure leaves no partial rows.
 
 ### 17.2 L1 Tests
@@ -944,10 +1036,22 @@ All implementation follows test-first development.
 ### 17.6 Migration Tests
 
 - pre-governance v2 database upgrades without data loss;
-- old Statements receive stable IDs and default governance fields;
+- old Statements receive deterministic occurrence-based UUIDv5 IDs and default governance fields;
+- content-identical Statements at different occurrence locators receive different IDs;
+- rerun after rollback regenerates the same missing IDs;
+- duplicate locators, generated collisions, malformed JSON, and missing ownership fail during preflight without mutation;
+- any injected migration-step failure rolls back schema and JSON changes atomically;
+- a checksummed SQLite backup restores the exact pre-migration schema and row counts after a simulated post-commit failure;
 - pre-governance Statements remain immutable and future transitions receive lineage edges;
 - existing successful L2 runs seed checkpoints;
 - repeated migration does not duplicate Statements, Corrections, changes, or checkpoints.
+
+### 17.7 Cost and Architecture Tests
+
+- Turn/Component Corrections report an L1→L2 path while Statement Corrections report L2 only;
+- input/output token, call, expansion, Aggregate, and batch ceilings prevent partial commits;
+- batched telemetry reconciles batch totals with per-Correction amortized attribution;
+- the Governance ADR and canonical Architecture v2.1 exist and agree with this specification's stages and state ownership.
 
 ## 18. Evaluation
 
@@ -969,6 +1073,8 @@ The implementation adds deterministic fixtures and reporting interfaces for:
 - unknown evidence rejection rate;
 - Recall@K and Precision@K;
 - token cost;
+- LLM calls and tokens by Correction target type;
+- budget-exhaustion and `needs_context` rate;
 - repeated no-op LLM call count;
 - Corrections processed per LLM call and batching delay.
 
@@ -978,25 +1084,28 @@ This version does not define release-blocking thresholds. Threshold selection re
 
 Implementation should proceed in this order:
 
-1. schema and migration;
-2. Correction repository and API;
-3. first-class correction evidence and authority propagation;
-4. L1 correction state machine;
-5. Statement identity and conflict status;
-6. L2 correction state machine and checkpoint;
-7. pre-LLM snapshot idempotency;
-8. scheduler incremental discovery;
-9. Recall governance contract;
-10. bounded candidate retrieval;
-11. migration, API, workflow, restart, and failure tests;
-12. README, canonical architecture, and production backlog updates;
-13. full verification, commit, and push.
+1. Governance Plane ADR and canonical Architecture v2.1;
+2. schema, deterministic migration, backup, and recovery path;
+3. Correction repository and API;
+4. first-class correction evidence and authority propagation;
+5. L1 correction state machine;
+6. Statement identity and conflict status;
+7. L2 correction state machine and checkpoint;
+8. pre-LLM snapshot idempotency;
+9. scheduler incremental discovery, batching, and cost ceilings;
+10. Recall governance contract;
+11. bounded and expandable candidate retrieval;
+12. migration, API, workflow, restart, recovery, and failure tests;
+13. README and production backlog updates;
+14. full verification, commit, and push.
 
 ## 20. Acceptance Criteria
 
 The feature is complete when all of the following are true:
 
 - an explicit correction is persisted idempotently without invoking L1/L2 inline;
+- Correction cost is bounded per job, observable per batch and target type, and never controlled by partial semantic commits;
+- sibling and subsequent Correction semantics are explicit without synthetic Turns or governance-record mutation;
 - replacement content remains directly traceable to an immutable Correction Record;
 - LLMs propose Statement lineage operations but never allocate, copy, or reassign Statement IDs;
 - every Statement identity transition is system-validated and auditable through explicit lineage;
@@ -1010,5 +1119,7 @@ The feature is complete when all of the following are true:
 - every contested Statement carries validated supporting evidence, conflicting evidence, a summary, and alternatives;
 - Recall never silently converts a contested Statement into an unqualified settled fact;
 - existing v2 data migrates safely;
+- legacy Statement IDs are deterministic by immutable occurrence locator, and migration supports verified rollback and backup restoration;
+- the Governance Plane ADR and canonical Architecture v2.1 are complete before implementation;
 - all type checks and tests pass;
 - documentation accurately distinguishes implemented governance from excluded privacy erasure and Policy/Skill authority.
