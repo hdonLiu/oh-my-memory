@@ -21,7 +21,7 @@ The implementation must provide:
 
 - explicit, idempotent human `retract` and `replace` corrections;
 - immutable correction records with stable lifecycle state;
-- correction evidence represented as L0 Turns rather than untraceable metadata;
+- correction evidence represented as a first-class governance evidence root rather than a synthetic Turn or untraceable metadata;
 - propagation of correction authority through L1 Components and L2 Statements;
 - eventual L1/L2 reconciliation without synchronously triggering either job;
 - explicit Recall freshness while reconciliation is pending;
@@ -66,8 +66,6 @@ The following invariants are binding:
 ```mermaid
 flowchart TD
   C["Explicit Correction API"] --> CR["Immutable Correction Record"]
-  C --> CT["Human-correction L0 Turn when replacing"]
-  CT --> PT["Provisional L1 Topic"]
   CR --> NC["Namespace Change Sequence"]
 
   subgraph Online["Stage 1 · Online"]
@@ -76,7 +74,6 @@ flowchart TD
   end
 
   subgraph L1Job["Stage 2 · Offline L1"]
-    PT --> L1P["LLM L1 Plan + due corrections"]
     PT2 --> L1P
     CR --> L1P
     L1P --> L1C["Canonical Topics + Components"]
@@ -85,6 +82,7 @@ flowchart TD
 
   subgraph L2Job["Stage 3 · Offline L2"]
     L1C --> L2P["LLM Membership Plan + ready corrections"]
+    CR --> L2P
     READY --> L2P
     L2P --> L2S["LLM Revision Synthesis"]
     L2S --> L2C["Aggregate Revision + Checkpoint"]
@@ -101,25 +99,27 @@ Correction writes persistent work state only. The L1 and L2 schedulers discover 
 
 ## 6. Core Types
 
-### 6.1 Turn Origin
+### 6.1 Evidence References
 
 ```ts
-export type TurnOriginKind = "conversation" | "human_correction";
+export type EvidenceRef =
+  | { kind: "turn"; id: string }
+  | { kind: "correction"; id: string };
 ```
 
-`ConversationTurn` gains `originKind`. Existing rows migrate to `conversation`.
+Conversation Turns and explicit Correction Records are parallel immutable evidence roots. A Correction is governance data, not an L0 Turn and not a fourth Memory layer.
 
-Only the correction service can create a Turn with `originKind=human_correction`. Public generic Turn ingestion must reject or ignore a caller-supplied origin kind.
+For storage and validation, L1 Components expose `evidenceTurnIds` and `evidenceCorrectionIds`. At least one of the two lists must be non-empty. Existing Components keep their Turn evidence and migrate with an empty correction-evidence list.
 
 ### 6.2 Evidence Authority
 
 ```ts
-export type EvidenceAuthority = "conversation" | "human_correction" | "derived";
+export type EvidenceAuthority = "conversation" | "human_correction";
 ```
 
 Authority is system-derived:
 
-- an L1 Component supported by at least one human-correction Turn has `human_correction` authority;
+- an L1 Component that cites at least one valid Correction Record has `human_correction` authority;
 - an L1 Component supported only by ordinary Turns has `conversation` authority;
 - an L2 Statement is model-derived content and records `derived` as its own semantic origin while separately exposing the strongest supporting evidence authority;
 - the LLM cannot output or elevate evidence authority;
@@ -141,6 +141,7 @@ export interface L2Statement {
   id: string;
   content: string;
   evidenceComponentIds: string[];
+  evidenceCorrectionIds: string[];
   semanticOrigin: "derived";
   evidenceAuthority: "conversation" | "human_correction";
   status: StatementStatus;
@@ -175,9 +176,9 @@ export interface CorrectionRecord {
   action: CorrectionAction;
   correctedContent: string | null;
   reason: string;
+  authority: "human_correction";
   status: CorrectionStatus;
   affectedSessionId: string | null;
-  correctionTurnId: string | null;
   changeSequence: number;
   error: string | null;
   createdAt: string;
@@ -195,7 +196,9 @@ Initial status is determined as follows:
 | L1 Component | retract | `pending_l1` | Owning Topic must be revised |
 | L1 Component | replace | `pending_l1` | Owning Topic must incorporate correction evidence |
 | L2 Statement | retract | `ready_l2` | L2 can remove the derived claim directly |
-| L2 Statement | replace | `pending_l1` | Corrected content must first become stable L1 evidence |
+| L2 Statement | replace | `ready_l2` | L2 consumes the Correction Record directly as authoritative evidence |
+
+Corrections targeting a Turn or L1 Component follow `pending_l1 → ready_l2 → applied`. Corrections targeting an L2 Statement follow `ready_l2 → applied`; they never enter `pending_l1`. These transitions are performed only by the independent offline jobs that own the corresponding layer.
 
 ### 6.5 Namespace Change
 
@@ -242,16 +245,11 @@ The checkpoint advances only in the same transaction that commits all L2 Revisio
 
 ### 7.1 Existing Table Changes
 
-`conversation_turns`:
-
-```text
-origin_kind text not null default 'conversation'
-```
-
 `l1_components`:
 
 ```text
 evidence_authority text not null default 'conversation'
+evidence_correction_ids text not null default '[]'
 ```
 
 `l1_maintenance_runs`:
@@ -275,7 +273,7 @@ prompt_version text
 schema_version text
 ```
 
-L2 Statement JSON stored in `facts`, `decisions`, `constraints`, and `open_questions` gains the fields defined in section 6.3.
+L2 Statement JSON stored in `facts`, `decisions`, `constraints`, and `open_questions` gains the fields defined in section 6.3, including `evidenceCorrectionIds`.
 
 ### 7.2 New Tables
 
@@ -290,9 +288,9 @@ create table correction_records (
   action text not null,
   corrected_content text,
   reason text not null,
+  authority text not null,
   status text not null,
   affected_session_id text,
-  correction_turn_id text,
   change_sequence integer not null,
   error text,
   created_at text not null,
@@ -366,7 +364,7 @@ Validation rules:
 - duplicate `eventId` with the same normalized payload returns the existing Correction;
 - duplicate `eventId` with a different normalized payload returns conflict.
 
-The write transaction performs no LLM call. It validates the target, inserts the Correction and namespace change, and optionally creates replacement evidence.
+The write transaction performs no LLM call. It validates the target, then inserts the Correction and namespace change. The Correction Record itself is the replacement evidence; the request creates no synthetic Turn, session, Topic, or Component.
 
 ### 8.2 List and Inspect
 
@@ -379,33 +377,13 @@ List access requires both `uid` and `agent`. Inspection enforces namespace owner
 
 ### 8.3 Replacement Evidence
 
-`replace` creates an immutable `human_correction` Turn.
+`replace` stores corrected content only in the immutable Correction Record. It does not disguise that assertion as conversational or topical evidence.
 
-For Turn or Component targets:
+For Turn or L1 Component targets, the owning session's offline L1 Planner receives the Correction Record. Any resulting Component may cite the Correction ID directly alongside any retained Turn evidence.
 
-- use the owning Topic's full L1 scope and session;
-- use the correction creation timestamp;
-- use a derived event ID scoped to the Correction ID.
+For an L2 Statement target, the offline L2 Planner and synthesizer receive the Correction Record directly. A replacement Statement cites the Correction ID; it does not need to pass through L1 first.
 
-For L2 Statement targets:
-
-```text
-source = governance
-channel = correction
-sessionId = correction:<correctionId>
-role = user
-```
-
-The service also appends a provisional L1 Topic containing the explicit corrected content:
-
-```text
-title = Human correction
-summary = correctedContent
-reason = explicit correction
-confidence = 1
-```
-
-This wrapper does not make a semantic decision. The offline L1 job remains responsible for canonical Topic and Component generation.
+The system fixes the evidence authority to `human_correction`, but does not assign semantic `confidence=1`. Confidence remains an output of the owning L1 or L2 semantic job. This preserves the distinction between who asserted the correction and how strongly the resulting claim is supported.
 
 ## 9. Offline L1 Reconciliation
 
@@ -438,7 +416,7 @@ Semantic requirements communicated to the LLM:
 
 - retracting a Turn requires new active Topic Revisions to omit that Turn from their evidence;
 - retracting a Component requires the new canonical view to remove that claim unless another independent Turn supports it;
-- replacement Components must cite the correction Turn;
+- replacement Components must cite the Correction Record directly;
 - explicit correction outranks ordinary conflicting evidence;
 - ordinary contradictions remain evidence and should not be silently discarded;
 - correction handling remains limited to the owning L1 session.
@@ -487,10 +465,11 @@ Every due `ready_l2` Correction in the input snapshot must be handled exactly on
 The L2 synthesizer receives the relevant Corrections for each desired membership. It must:
 
 - omit or replace explicitly retracted Statements;
-- prefer correction Components for replacement content;
+- use a directly cited Correction Record for an L2 Statement replacement;
 - preserve ordinary contradictions as contested or temporally qualified knowledge;
 - preserve existing Statement IDs only when continuing the same logical claim;
-- cite only Components from the validated membership.
+- cite only Components from the validated membership and Corrections from the fixed job snapshot;
+- produce at least one valid evidence reference across `evidenceComponentIds` and `evidenceCorrectionIds` for every Statement.
 
 ### 10.3 Commit
 
@@ -590,7 +569,8 @@ export interface LayeredRecallResponse {
 Each result gains:
 
 ```ts
-evidenceAuthority: "conversation" | "human_correction" | "derived";
+evidenceAuthority: "conversation" | "human_correction";
+evidenceCorrectionIds: string[];
 statementIds: string[];
 statementStatuses: Array<"supported" | "contested">;
 sourceL1Watermark?: number;
@@ -632,6 +612,7 @@ Candidate generation:
 - otherwise use lexical similarity and recency;
 - include current Aggregate members even when they fall outside the nearest-neighbour pool;
 - include Components referenced by due Corrections;
+- for an L2 Statement correction, include its current Aggregate and validated membership together with the Correction Record;
 - never pass the entire namespace unbounded to a single LLM prompt.
 
 If a desired Aggregate exceeds the configured hard ceiling, the Plan must split or reassign it. The system rejects an over-limit commit but does not determine the semantic partition itself.
@@ -675,7 +656,7 @@ GET  /v1/corrections/:id
 - unknown target: HTTP 404;
 - namespace mismatch: HTTP 404;
 - duplicate event ID with different payload: HTTP 409;
-- transaction failure: no partial Correction, Turn, Topic, or change sequence.
+- transaction failure: no partial Correction or change sequence.
 
 ### 15.2 Offline Jobs
 
@@ -684,7 +665,7 @@ The run fails without advancing state when:
 - an LLM call times out or returns malformed JSON;
 - a due Correction is missing from `handledCorrectionIds`;
 - the Plan references an unknown or out-of-scope Correction, Turn, Topic, Component, Aggregate, or Statement;
-- an L2 Statement cites evidence outside Membership;
+- an L2 Statement cites a Component outside Membership or a Correction outside the fixed job snapshot;
 - claimed correction authority cannot be derived from evidence;
 - an Aggregate remains above the hard member limit;
 - the database commit fails.
@@ -697,14 +678,15 @@ The schema migration must be idempotent and preserve all existing v2 entities.
 
 Migration steps:
 
-1. add `conversation_turns.origin_kind` and backfill `conversation`;
-2. add `l1_components.evidence_authority` and backfill `conversation`;
+1. add `l1_components.evidence_authority` and backfill `conversation`;
+2. add `l1_components.evidence_correction_ids` and backfill `[]`;
 3. extend L1/L2 run tables with snapshot, mode, version, and governance fields;
 4. create Correction, namespace change, and checkpoint tables and indexes;
 5. transform existing Statement JSON:
    - generate a stable ID for every existing Statement;
    - set `semanticOrigin=derived`;
    - set `evidenceAuthority=conversation` when all referenced Components are ordinary, otherwise derive it;
+   - set `evidenceCorrectionIds=[]`;
    - set `status=supported`;
 6. initialize one L2 checkpoint per namespace from its latest successful run;
 7. retain historical runs without snapshot hashes, but exclude them from new snapshot-idempotency lookup;
@@ -720,15 +702,15 @@ All implementation follows test-first development.
 - same event ID and different payload conflicts;
 - cross-namespace target is hidden as not found;
 - retract/replace validation is enforced;
-- replacement creates a correction Turn and provisional L1 Topic;
-- generic Turn ingestion cannot forge correction origin;
+- replacement creates no synthetic Turn, session, Topic, or Component;
+- Correction authority is fixed by the service, and unknown or out-of-scope Correction evidence IDs are rejected;
 - transaction failure leaves no partial rows.
 
 ### 17.2 L1 Tests
 
 - Turn retract removes the Turn from new canonical evidence;
 - Component retract removes the claim from the new canonical view;
-- replacement Component cites the correction Turn;
+- replacement Component cites the Correction Record;
 - correction authority is derived rather than accepted from LLM output;
 - omitted due Correction fails the run;
 - successful reconciliation moves all handled Corrections to `ready_l2` atomically;
@@ -738,7 +720,7 @@ All implementation follows test-first development.
 
 - every ready Correction must be handled;
 - retract removes the targeted Statement from the new current Revision;
-- replacement uses a correction-backed Component;
+- L2 Statement replacement cites the Correction Record directly without an L1 wrapper;
 - ordinary conflict can remain contested;
 - Statement identity is preserved only for known current Statements;
 - evidence authority is derived correctly;
@@ -796,7 +778,7 @@ Implementation should proceed in this order:
 
 1. schema and migration;
 2. Correction repository and API;
-3. Turn origin and authority propagation;
+3. first-class correction evidence and authority propagation;
 4. L1 correction state machine;
 5. Statement identity and conflict status;
 6. L2 correction state machine and checkpoint;
@@ -813,9 +795,9 @@ Implementation should proceed in this order:
 The feature is complete when all of the following are true:
 
 - an explicit correction is persisted idempotently without invoking L1/L2 inline;
-- replacement content becomes traceable human-correction evidence;
-- L1 and L2 independently discover and consume due Corrections;
-- a Correction cannot reach `applied` unless both required stages commit successfully;
+- replacement content remains directly traceable to an immutable Correction Record;
+- L1 and L2 independently discover and consume the Corrections due to their own stage;
+- a Correction cannot reach `applied` until every stage required by its target type commits successfully: L1 then L2 for Turn/Component targets, L2 only for Statement targets;
 - repeated unchanged scheduler runs make no LLM calls;
 - Recall always identifies Memory as reference-only and exposes governance freshness;
 - ordinary contradictions are not deterministically overwritten;
