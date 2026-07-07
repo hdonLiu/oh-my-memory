@@ -685,6 +685,10 @@ LLM Plans are outputs and never participate in job identity. Mutable operational
 
 Snapshot idempotency guarantees only that a previously successful identical input snapshot does not invoke the LLM again. A new governance event, a changed semantic input, a failed run retry, or an explicitly keyed rerun is real work and is not classified as a no-op.
 
+The canonical snapshot projection, serializer, hash function, and successful-run lookup are state-machine prerequisites. L1/L2 orchestration must first load the complete semantic input, build its snapshot, and check prior success before entering any Planner-calling transition. No state machine may independently reconstruct a partial task identity after it has started.
+
+The common snapshot foundation is implemented before either correction state machine. L1 then binds its full Topic/Turn/Correction projection. L2 binds its base watermark/Correction projection first and adds the deterministic mandatory/optional candidate projection when bounded retrieval is implemented, before L2 state-machine orchestration is enabled.
+
 ### 11.4 Run Modes
 
 ```ts
@@ -1008,8 +1012,10 @@ All implementation follows test-first development.
 
 ### 17.4 Idempotency and Scheduler Tests
 
+- L1 and L2 orchestration build and check the complete snapshot before any Planner transition;
 - a previously successful identical L1 snapshot does not call the Planner twice;
 - a previously successful identical L2 snapshot does not call Planner or Synthesizer twice;
+- changing only the bounded L2 candidate projection changes the L2 snapshot hash;
 - nondeterministic LLM output cannot bypass snapshot idempotency;
 - changes only to `updatedAt`, retry metadata, or last error do not change a snapshot hash;
 - a failed snapshot remains retryable and may call the LLM again;
@@ -1088,13 +1094,13 @@ Implementation should proceed in this order:
 2. schema, deterministic migration, backup, and recovery path;
 3. Correction repository and API;
 4. first-class correction evidence and authority propagation;
-5. L1 correction state machine;
-6. Statement identity and conflict status;
-7. L2 correction state machine and checkpoint;
-8. pre-LLM snapshot idempotency;
-9. scheduler incremental discovery, batching, and cost ceilings;
-10. Recall governance contract;
-11. bounded and expandable candidate retrieval;
+5. canonical snapshot projection, hashing, successful-run lookup, and pre-LLM idempotency foundation;
+6. complete L1 snapshot binding, then the L1 correction state machine;
+7. Statement identity and conflict status;
+8. bounded and expandable candidate retrieval plus complete L2 candidate-snapshot binding;
+9. L2 correction state machine and checkpoint;
+10. scheduler incremental discovery, batching, and cost ceilings;
+11. Recall governance contract;
 12. migration, API, workflow, restart, recovery, and failure tests;
 13. README and production backlog updates;
 14. full verification, commit, and push.
