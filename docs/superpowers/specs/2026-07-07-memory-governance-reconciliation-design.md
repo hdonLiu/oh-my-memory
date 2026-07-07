@@ -75,14 +75,14 @@ flowchart TD
 
   subgraph L1Job["Stage 2 · Offline L1"]
     PT2 --> L1P
-    CR --> L1P
+    CR -->|"Turn / Component correction"| L1P
     L1P --> L1C["Canonical Topics + Components"]
     L1C --> READY["Correction ready_l2"]
   end
 
   subgraph L2Job["Stage 3 · Offline L2"]
     L1C --> L2P["LLM Membership Plan + ready corrections"]
-    CR --> L2P
+    CR -->|"Statement correction"| L2P
     READY --> L2P
     L2P --> L2S["LLM Revision Synthesis"]
     L2S --> L2C["Aggregate Revision + Checkpoint"]
@@ -120,6 +120,13 @@ export type EvidenceRef =
 Conversation Turns and explicit Correction Records are parallel immutable evidence roots. A Correction is governance data, not an L0 Turn and not a fourth Memory layer.
 
 For storage and validation, L1 Components expose `evidenceTurnIds` and `evidenceCorrectionIds`. At least one of the two lists must be non-empty. Existing Components keep their Turn evidence and migrate with an empty correction-evidence list.
+
+Correction evidence is namespace- and scope-bound:
+
+- every referenced Correction must exist and match the enclosing entity's `uid + agent`;
+- an L1 Component may cite a Correction only when its `affectedSessionId` matches the Component's owning Topic session;
+- an L2 Statement may add a Correction reference only from the fixed L2 job snapshot for the same namespace, or retain a previously validated reference from its direct predecessor;
+- authority derivation runs only after all existence, namespace, session, lifecycle, and snapshot-scope checks succeed.
 
 ### 6.2 Evidence Authority
 
@@ -322,8 +329,10 @@ The checkpoint advances only in the same transaction that commits all L2 Revisio
 
 ```text
 evidence_authority text not null default 'conversation'
-evidence_correction_ids text not null default '[]'
+evidence_correction_ids text not null default '[]' check(case when json_valid(evidence_correction_ids) then json_type(evidence_correction_ids) = 'array' else 0 end)
 ```
+
+The JSON column follows the existing `evidence_turn_ids` representation for compatibility. SQLite validates JSON syntax and array shape, while the application resolves every ID and enforces namespace/session scope in the same transaction that commits the Component. The JSON column cannot provide foreign keys; if multi-writer ingestion or reference cardinality grows beyond the current single-writer model, this field must migrate to a normalized Component-to-Correction join table rather than weakening application validation.
 
 `l1_maintenance_runs`:
 
@@ -451,13 +460,15 @@ Validation rules:
 - `retract` rejects `correctedContent`;
 - target must exist and belong to the requested `uid + agent` namespace;
 - an L2 Statement correction requires `targetRevisionId`, and the `(targetRevisionId, targetId)` occurrence must be current when the Correction is created;
-- a stale or non-current L2 occurrence returns conflict with no Correction write;
+- a stale or non-current L2 occurrence returns HTTP 409 with `retryable=true` and the current same-namespace occurrence reference, with no Correction write;
 - namespace mismatch returns not-found semantics rather than disclosing cross-namespace existence;
 - the target must have enough stored ownership information to locate its L1 session or L2 Aggregate;
 - duplicate `eventId` with the same normalized payload returns the existing Correction;
 - duplicate `eventId` with a different normalized payload returns conflict.
 
 The write transaction performs no LLM call. It validates and pins the target occurrence, then inserts the Correction and namespace change. The Correction Record itself is the replacement evidence; the request creates no synthetic Turn, session, Topic, or Component.
+
+Callers should treat a stale-target 409 as ordinary optimistic concurrency: refresh Recall or the target Aggregate, obtain the new current Revision reference, let the user-visible correction intent remain unchanged, and retry with the same `eventId` only after rebuilding the normalized request for that current target. Because reusing an event ID with a different payload conflicts, a stale request that was never persisted may reuse its event ID; an already persisted Correction must never be retargeted.
 
 ### 8.2 List and Inspect
 
@@ -596,6 +607,8 @@ The L2 synthesizer receives the relevant Corrections for each desired membership
 
 The system binds source references to immutable `(revisionId, statementId)` occurrences before the LLM call. It validates complete, single consumption of the required source set and then assigns result IDs. The LLM cannot copy, invent, or reassign an ID.
 
+Concurrent L2 runs may bind the same ordinary source occurrence even when no Correction reserves it. The first valid commit advances the namespace sequence and current Revision; every competing stale commit fails optimistic validation, discards its generated Plan, refreshes the snapshot and source bindings, and retries under scheduler backoff. This prevents duplicate consumption or corruption but may create harmless retry churn in multi-worker deployments. V1 optimizes for the normal single-scheduler deployment and does not add pessimistic Aggregate locks.
+
 A due L2 Statement Correction reserves its pinned source occurrence within the synthesis snapshot:
 
 - `replace` requires exactly one `continue` from the reserved source, preserves its logical Statement ID, and requires the resulting Statement to cite that Correction ID;
@@ -730,9 +743,10 @@ L2_JOB_MAX_INPUT_TOKENS
 L2_JOB_MAX_OUTPUT_TOKENS
 L2_MAX_CONTEXT_EXPANSION_ROUNDS
 L2_MAX_SYNTHESIS_CALLS_PER_RUN
+L2_FULL_RECONCILIATION_FALLBACK_ENABLED
 ```
 
-Every deployment must provide finite positive values; zero, missing, or unlimited ceilings are invalid startup configuration. The active values and a `budgetPolicyVersion` are returned by Correction inspection so operators can understand the effective boundary without relying on model-provider pricing.
+Every numeric deployment ceiling must be finite. Token, batch, and synthesis-call ceilings must be positive; `L2_MAX_CONTEXT_EXPANSION_ROUNDS` may be zero to disable expansion. Missing or unlimited ceilings are invalid startup configuration. The active values, fallback flag, and a `budgetPolicyVersion` are returned by Correction inspection so operators can understand the effective boundary without relying on model-provider pricing.
 
 Crossing a ceiling never permits a partial semantic commit. The run becomes `needs_context` or fails retryably while Correction state and checkpoints remain unchanged.
 
@@ -829,7 +843,8 @@ When the initial context is insufficient, the Membership Planner returns `needs_
 
 If the bounded expansion rounds are exhausted:
 
-- incremental mode escalates to bounded full reconciliation using batched Component and Aggregate summaries;
+- when `L2_FULL_RECONCILIATION_FALLBACK_ENABLED=true`, incremental mode escalates to bounded full reconciliation using batched Component and Aggregate summaries;
+- when fallback is disabled, including a zero-round deployment, the run enters `needs_context` directly;
 - if full reconciliation still cannot produce a complete plan, the run is persisted as `needs_context` with its expansion request;
 - no Aggregate Revision, Membership, Correction status, or checkpoint is changed;
 - retries use backoff and persisted context state rather than immediately repeating the same calls;
@@ -886,6 +901,8 @@ The run fails without advancing state when:
 - an LLM call times out or returns malformed JSON;
 - a due Correction is missing from `handledCorrectionIds`;
 - the Plan references an unknown or out-of-scope Correction, Turn, Topic, Component, Aggregate, or Statement;
+- an L1 Component or L2 Statement cites a Correction whose `uid + agent` differs from its enclosing Topic or Aggregate namespace;
+- an L1 Component cites a Correction whose `affectedSessionId` differs from its owning Topic session;
 - an L2 Statement cites a Component outside Membership or a Correction outside the fixed job snapshot;
 - a `supported` Statement contains conflict data, or a `contested` Statement lacks a valid, disjoint, in-scope conflict assessment;
 - a Statement operation invents a source reference, consumes a source twice, leaves a required source unhandled, or violates the system ID-allocation rules;
@@ -910,14 +927,15 @@ Existing Statement occurrences without IDs receive UUIDv5 identifiers using name
 The UUIDv5 name is the UTF-8 encoding of `omm:legacy-statement:v1`, followed by each field encoded as `|<UTF-8-byte-length>:<exact-stored-value>` in this order:
 
 ```text
-uid | agent | aggregateId | aggregateRevisionId | statementCategory | originalArrayIndex
+uid | agent | aggregateId | aggregateRevisionId | statementCategory | storedArrayIndex
 ```
 
 Rules:
 
 - an existing syntactically valid ID is preserved;
 - a missing ID is generated as `UUIDv5(fixedNamespace, canonicalOccurrenceLocator)`;
-- the locator uses stored immutable IDs and the original pre-migration category/index, never content, evidence ordering, timestamps, or mutable text;
+- `storedArrayIndex` is the Statement's persisted position inside the immutable Revision's category array at migration read time;
+- the locator uses stored immutable IDs and the persisted category/index, never content, evidence ordering, timestamps, or mutable text;
 - the migration precomputes every generated ID and aborts on duplicate locators, ID collisions, missing locator fields, or an existing ID assigned to another occurrence;
 - legacy semantic continuity across different Revisions is not inferred; each unlinked historical occurrence receives its own logical ID and no fabricated lineage edge;
 - rerunning after success preserves existing IDs, while rerunning after rollback regenerates the same IDs.
@@ -966,9 +984,12 @@ All implementation follows test-first development.
 - same event ID and different payload conflicts;
 - cross-namespace target is hidden as not found;
 - stale or non-current L2 Statement occurrence conflicts without creating a Correction;
+- stale-target conflict returns a retryable current occurrence reference, and a refreshed request can succeed without retargeting a persisted Correction;
 - retract/replace validation is enforced;
 - replacement creates no synthetic Turn, session, Topic, or Component;
 - Correction authority is fixed by the service, and unknown or out-of-scope Correction evidence IDs are rejected;
+- cross-namespace and cross-session Correction evidence references are rejected before authority derivation;
+- malformed or non-array `evidence_correction_ids` is rejected by SQLite shape validation;
 - a Correction Record cannot be used as a correction target;
 - compatible sibling Corrections are processed together while incompatible siblings remain contested;
 - a later Correction targets the applied successor rather than mutating the prior Correction;
@@ -994,6 +1015,7 @@ All implementation follows test-first development.
 - merge and split persist explicit Statement lineage edges;
 - a corrected source is reserved and cannot be consumed by another operation;
 - a pre-correction synthesis snapshot cannot commit after the Correction is written;
+- concurrent L2 runs bound to the same ordinary source allow one commit and force stale competitors to refresh and retry without duplicate lineage;
 - ordinary conflict can become contested only with valid supporting and conflicting evidence groups;
 - supported Statements reject conflict data and contested Statements reject missing, overlapping, or out-of-scope conflict references;
 - no evidence-count threshold or deterministic latest-wins rule decides conflict status;
@@ -1002,6 +1024,8 @@ All implementation follows test-first development.
 - mandatory membership context is never displaced by optional Top-K candidates;
 - adding corrected Components does not reduce the configured optional candidate quota;
 - `needs_more_context` retrieves only in-scope query/seed expansions and remains within cumulative budgets;
+- zero expansion rounds with full fallback disabled enters `needs_context` without an expansion call;
+- the initial delivery path supports at most one expansion and direct non-destructive exhaustion independently of full fallback;
 - exhausted incremental expansion escalates to bounded full reconciliation;
 - exhausted full reconciliation persists `needs_context` without changing Membership, Correction state, or checkpoint;
 - retry after `needs_context` uses persisted expansion state and backoff;
@@ -1081,6 +1105,7 @@ The implementation adds deterministic fixtures and reporting interfaces for:
 - token cost;
 - LLM calls and tokens by Correction target type;
 - budget-exhaustion and `needs_context` rate;
+- optimistic L2 commit-conflict and retry rate;
 - repeated no-op LLM call count;
 - Corrections processed per LLM call and batching delay.
 
@@ -1097,13 +1122,14 @@ Implementation should proceed in this order:
 5. canonical snapshot projection, hashing, successful-run lookup, and pre-LLM idempotency foundation;
 6. complete L1 snapshot binding, then the L1 correction state machine;
 7. Statement identity and conflict status;
-8. bounded and expandable candidate retrieval plus complete L2 candidate-snapshot binding;
-9. L2 correction state machine and checkpoint;
-10. scheduler incremental discovery, batching, and cost ceilings;
-11. Recall governance contract;
-12. migration, API, workflow, restart, recovery, and failure tests;
-13. README and production backlog updates;
-14. full verification, commit, and push.
+8. initial bounded retrieval, complete L2 candidate-snapshot binding, at most one expansion, and direct `needs_context` exhaustion;
+9. core L2 correction state machine and checkpoint against that bounded path;
+10. configurable multi-round expansion, optional full-reconciliation fallback, and persisted expansion recovery;
+11. scheduler incremental discovery, batching, retry backoff, and cost ceilings;
+12. Recall governance contract;
+13. migration, API, workflow, restart, recovery, and failure tests;
+14. README and production backlog updates;
+15. full verification, commit, and push.
 
 ## 20. Acceptance Criteria
 
@@ -1115,6 +1141,8 @@ The feature is complete when all of the following are true:
 - replacement content remains directly traceable to an immutable Correction Record;
 - LLMs propose Statement lineage operations but never allocate, copy, or reassign Statement IDs;
 - every Statement identity transition is system-validated and auditable through explicit lineage;
+- stale concurrent L2 commits never consume a source or write lineage and are retried from refreshed bindings;
+- Correction evidence authority is never derived across namespace boundaries or, for L1, across session boundaries;
 - mandatory correction and current-membership context is never evicted by optional candidate limits;
 - bounded context expansion may defer a decision but never commits a destructive membership change from an explicitly incomplete plan;
 - L1 and L2 independently discover and consume the Corrections due to their own stage;
