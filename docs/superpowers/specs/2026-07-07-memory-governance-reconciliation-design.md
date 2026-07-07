@@ -150,12 +150,52 @@ export interface L2Statement {
 }
 ```
 
-Statement IDs are generated and validated by the system:
+`L2Statement.id` identifies a logical Statement across Revisions. The containing Aggregate Revision ID identifies one immutable occurrence of that Statement. Identity control is system-owned:
 
-- a synthesis response may preserve an ID from the current Revision;
-- it may not provide an ID from another Aggregate or an unknown historical context;
-- a new Statement without a reusable ID receives a new system-generated ID;
-- IDs remain present in historical immutable Revisions and can be correction targets.
+- the LLM never supplies an output Statement ID;
+- the system gives each synthesis input an opaque source reference bound to one Statement occurrence in the fixed snapshot;
+- the LLM proposes a lineage operation using only those source references;
+- the system preserves or allocates IDs according to the operation and records explicit lineage;
+- historical occurrences remain immutable and auditable, but only a current occurrence can become a new correction target.
+
+```ts
+export interface StatementDraft {
+  content: string;
+  evidenceComponentIds: string[];
+  evidenceCorrectionIds: string[];
+  status: StatementStatus;
+  confidence: number;
+  qualifier?: string;
+}
+
+export type StatementOperation =
+  | { op: "continue"; sourceRef: string; statement: StatementDraft }
+  | { op: "create"; statement: StatementDraft }
+  | { op: "merge"; sourceRefs: string[]; statement: StatementDraft }
+  | { op: "split"; sourceRef: string; statements: StatementDraft[] }
+  | { op: "retire"; sourceRef: string };
+
+export interface StatementLineageEdge {
+  fromRevisionId: string;
+  fromStatementId: string;
+  toRevisionId: string | null;
+  toStatementId: string | null;
+  operation: "continue" | "merge" | "split" | "retire";
+}
+```
+
+System identity rules:
+
+- `continue` consumes exactly one source occurrence and preserves its logical Statement ID;
+- `create` receives a new system-generated ID;
+- `merge` consumes two or more source occurrences and receives one new ID;
+- `split` consumes one source occurrence and every output receives a new ID;
+- `retire` consumes one source occurrence and creates no successor;
+- each source occurrence is consumed at most once in a synthesis commit;
+- source references outside the fixed synthesis snapshot are rejected;
+- sources from multiple Aggregates are allowed only when the system explicitly includes them in the same merge/reassignment synthesis scope.
+
+The LLM still decides the semantic relationship. The system does not use text equality, similarity thresholds, or content hashes to decide identity. Its role is to constrain identity allocation and make every transition auditable.
 
 Ordinary contradictory evidence should normally produce a `contested` Statement or multiple temporally qualified Statements. The system must not implement a deterministic latest-wins semantic rule.
 
@@ -173,6 +213,7 @@ export interface CorrectionRecord {
   agent: string;
   targetType: CorrectionTargetType;
   targetId: string;
+  targetRevisionId: string | null;
   action: CorrectionAction;
   correctedContent: string | null;
   reason: string;
@@ -285,6 +326,7 @@ create table correction_records (
   agent text not null,
   target_type text not null,
   target_id text not null,
+  target_revision_id text,
   action text not null,
   corrected_content text,
   reason text not null,
@@ -297,6 +339,18 @@ create table correction_records (
   updated_at text not null,
   applied_at text,
   unique(uid, agent, event_id)
+);
+
+create table statement_lineage_edges (
+  id text primary key,
+  uid text not null,
+  agent text not null,
+  from_revision_id text not null,
+  from_statement_id text not null,
+  to_revision_id text,
+  to_statement_id text,
+  operation text not null,
+  created_at text not null
 );
 
 create table namespace_changes (
@@ -330,6 +384,7 @@ Required indexes:
 - namespace changes by `uid + agent + sequence`;
 - L1/L2 successful input snapshot lookup;
 - correction target by `target_type + target_id`.
+- Statement lineage source and destination occurrences.
 
 ## 8. Correction API
 
@@ -348,6 +403,7 @@ Request:
   "agent": "codex",
   "targetType": "l2_statement",
   "targetId": "statement-id",
+  "targetRevisionId": "aggregate-revision-id",
   "action": "replace",
   "correctedContent": "项目当前使用 SQLite，不再使用 PostgreSQL。",
   "reason": "用户明确纠正"
@@ -359,12 +415,14 @@ Validation rules:
 - `replace` requires non-empty `correctedContent`;
 - `retract` rejects `correctedContent`;
 - target must exist and belong to the requested `uid + agent` namespace;
+- an L2 Statement correction requires `targetRevisionId`, and the `(targetRevisionId, targetId)` occurrence must be current when the Correction is created;
+- a stale or non-current L2 occurrence returns conflict with no Correction write;
 - namespace mismatch returns not-found semantics rather than disclosing cross-namespace existence;
 - the target must have enough stored ownership information to locate its L1 session or L2 Aggregate;
 - duplicate `eventId` with the same normalized payload returns the existing Correction;
 - duplicate `eventId` with a different normalized payload returns conflict.
 
-The write transaction performs no LLM call. It validates the target, then inserts the Correction and namespace change. The Correction Record itself is the replacement evidence; the request creates no synthetic Turn, session, Topic, or Component.
+The write transaction performs no LLM call. It validates and pins the target occurrence, then inserts the Correction and namespace change. The Correction Record itself is the replacement evidence; the request creates no synthetic Turn, session, Topic, or Component.
 
 ### 8.2 List and Inspect
 
@@ -467,21 +525,31 @@ The L2 synthesizer receives the relevant Corrections for each desired membership
 - omit or replace explicitly retracted Statements;
 - use a directly cited Correction Record for an L2 Statement replacement;
 - preserve ordinary contradictions as contested or temporally qualified knowledge;
-- preserve existing Statement IDs only when continuing the same logical claim;
+- return `StatementOperation[]` using only system-issued source references;
 - cite only Components from the validated membership and Corrections from the fixed job snapshot;
 - produce at least one valid evidence reference across `evidenceComponentIds` and `evidenceCorrectionIds` for every Statement.
+
+The system binds source references to immutable `(revisionId, statementId)` occurrences before the LLM call. It validates complete, single consumption of the required source set and then assigns result IDs. The LLM cannot copy, invent, or reassign an ID.
+
+A due L2 Statement Correction reserves its pinned source occurrence within the synthesis snapshot:
+
+- `replace` requires exactly one `continue` from the reserved source, preserves its logical Statement ID, and requires the resulting Statement to cite that Correction ID;
+- `retract` requires `retire` for the reserved source;
+- no other operation in the same result may consume that source;
+- an L2 commit built from a snapshot older than the Correction's namespace sequence fails optimistic validation and must be retried with the Correction included.
 
 ### 10.3 Commit
 
 One transaction commits:
 
 1. new Aggregate Revisions and Statement IDs;
-2. complete Component Memberships;
-3. Aggregate lineage and retirement state;
-4. handled Corrections moving to `applied`;
-5. `correction_applied` NamespaceChanges;
-6. the successful run;
-7. the new L2 checkpoint.
+2. Statement lineage edges for every continued, merged, split, or retired source occurrence;
+3. complete Component Memberships;
+4. Aggregate lineage and retirement state;
+5. handled Corrections moving to `applied`;
+6. `correction_applied` NamespaceChanges;
+7. the successful run;
+8. the new L2 checkpoint.
 
 Any validation or persistence failure leaves the previous current Revisions, Correction states, and checkpoint unchanged.
 
@@ -655,6 +723,7 @@ GET  /v1/corrections/:id
 - malformed action/content combination: HTTP 400;
 - unknown target: HTTP 404;
 - namespace mismatch: HTTP 404;
+- stale or non-current L2 Statement occurrence: HTTP 409;
 - duplicate event ID with different payload: HTTP 409;
 - transaction failure: no partial Correction or change sequence.
 
@@ -666,6 +735,9 @@ The run fails without advancing state when:
 - a due Correction is missing from `handledCorrectionIds`;
 - the Plan references an unknown or out-of-scope Correction, Turn, Topic, Component, Aggregate, or Statement;
 - an L2 Statement cites a Component outside Membership or a Correction outside the fixed job snapshot;
+- a Statement operation invents a source reference, consumes a source twice, leaves a required source unhandled, or violates the system ID-allocation rules;
+- a due Statement correction is not mapped to its required `continue` or `retire` operation;
+- the namespace sequence changed after the job snapshot was fixed;
 - claimed correction authority cannot be derived from evidence;
 - an Aggregate remains above the hard member limit;
 - the database commit fails.
@@ -681,7 +753,7 @@ Migration steps:
 1. add `l1_components.evidence_authority` and backfill `conversation`;
 2. add `l1_components.evidence_correction_ids` and backfill `[]`;
 3. extend L1/L2 run tables with snapshot, mode, version, and governance fields;
-4. create Correction, namespace change, and checkpoint tables and indexes;
+4. create Correction, namespace change, checkpoint, and Statement lineage tables and indexes;
 5. transform existing Statement JSON:
    - generate a stable ID for every existing Statement;
    - set `semanticOrigin=derived`;
@@ -701,6 +773,7 @@ All implementation follows test-first development.
 - same event ID and payload returns the original Correction;
 - same event ID and different payload conflicts;
 - cross-namespace target is hidden as not found;
+- stale or non-current L2 Statement occurrence conflicts without creating a Correction;
 - retract/replace validation is enforced;
 - replacement creates no synthetic Turn, session, Topic, or Component;
 - Correction authority is fixed by the service, and unknown or out-of-scope Correction evidence IDs are rejected;
@@ -721,8 +794,13 @@ All implementation follows test-first development.
 - every ready Correction must be handled;
 - retract removes the targeted Statement from the new current Revision;
 - L2 Statement replacement cites the Correction Record directly without an L1 wrapper;
+- `continue` preserves the source ID while `create`, `merge`, and `split` receive system-generated IDs;
+- an invented, duplicated, or omitted source reference fails the run;
+- merge and split persist explicit Statement lineage edges;
+- a corrected source is reserved and cannot be consumed by another operation;
+- a pre-correction synthesis snapshot cannot commit after the Correction is written;
 - ordinary conflict can remain contested;
-- Statement identity is preserved only for known current Statements;
+- Statement identity is preserved only by a validated `continue` operation from a known source occurrence;
 - evidence authority is derived correctly;
 - success moves Corrections to applied and advances checkpoint atomically;
 - failure preserves the previous Revision, Correction state, and checkpoint.
@@ -751,6 +829,7 @@ All implementation follows test-first development.
 
 - pre-governance v2 database upgrades without data loss;
 - old Statements receive stable IDs and default governance fields;
+- pre-governance Statements remain immutable and future transitions receive lineage edges;
 - existing successful L2 runs seed checkpoints;
 - repeated migration does not duplicate Statements, Corrections, changes, or checkpoints.
 
@@ -796,6 +875,8 @@ The feature is complete when all of the following are true:
 
 - an explicit correction is persisted idempotently without invoking L1/L2 inline;
 - replacement content remains directly traceable to an immutable Correction Record;
+- LLMs propose Statement lineage operations but never allocate, copy, or reassign Statement IDs;
+- every Statement identity transition is system-validated and auditable through explicit lineage;
 - L1 and L2 independently discover and consume the Corrections due to their own stage;
 - a Correction cannot reach `applied` until every stage required by its target type commits successfully: L1 then L2 for Turn/Component targets, L2 only for Statement targets;
 - repeated unchanged scheduler runs make no LLM calls;
