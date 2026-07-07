@@ -230,6 +230,7 @@ export type CorrectionStatus = "pending_l1" | "ready_l2" | "applied";
 export interface CorrectionRecord {
   id: string;
   eventId: string;
+  payloadHash: string;
   uid: string;
   agent: string;
   targetType: CorrectionTargetType;
@@ -343,6 +344,7 @@ L2 Statement JSON stored in `facts`, `decisions`, `constraints`, and `open_quest
 create table correction_records (
   id text primary key,
   event_id text not null,
+  payload_hash text not null,
   uid text not null,
   agent text not null,
   target_type text not null,
@@ -593,7 +595,11 @@ Correction identity is:
 uid + agent + eventId
 ```
 
-The normalized request payload is hashed to detect conflicting reuse.
+The normalized request payload is hashed to detect conflicting reuse. The immutable payload hash covers namespace, target type and pinned target occurrence, action, corrected content, reason, and authority.
+
+Retries must reuse the same `eventId`. Distinct event IDs always represent distinct governance events even when their normalized payloads are identical. The system performs no semantic deduplication across Correction Records: collapsing separate events would lose chronology and would require a nondeterministic semantic decision before the idempotency boundary.
+
+This version has no Correction delete, undo, or redo operation. A future undo design must append an explicit `cancel` or `supersede` governance event and retain lineage; it must not delete and recreate Correction Records.
 
 ### 11.2 L1 Snapshot
 
@@ -604,7 +610,7 @@ scope
 sessionId
 current Topic and Revision IDs
 input Turn IDs and content hashes
-pending Correction IDs and updated timestamps
+pending Correction IDs, immutable payload hashes, and change sequences
 prompt version
 schema version
 run mode
@@ -622,6 +628,7 @@ uid
 agent
 L1 stable watermark
 ready governance watermark
+ready Correction IDs and immutable payload hashes
 prompt version
 schema version
 run mode
@@ -630,7 +637,9 @@ caller idempotency key when supplied
 
 The service checks for a successful matching run before calling either the Membership Planner or Revision Synthesizer.
 
-LLM Plans are outputs and never participate in job identity.
+LLM Plans are outputs and never participate in job identity. Mutable operational fields such as `updatedAt`, retry count, and last error are excluded because they do not change the semantic Planner input.
+
+Snapshot idempotency guarantees only that a previously successful identical input snapshot does not invoke the LLM again. A new governance event, a changed semantic input, a failed run retry, or an explicitly keyed rerun is real work and is not classified as a no-op.
 
 ### 11.4 Run Modes
 
@@ -642,6 +651,16 @@ export type ReconciliationMode = "incremental" | "full";
 - manual APIs may request `full`;
 - the same full snapshot remains idempotent;
 - a caller that intentionally wants another evaluation of the same snapshot supplies a new caller idempotency key.
+
+### 11.5 Correction Batching
+
+Schedulers may coalesce multiple durable pending Corrections for the same L1 session or L2 namespace during a configurable short batch window. Batching changes dispatch timing only:
+
+- every Correction is persisted and visible to Recall immediately;
+- all Corrections in the fixed snapshot must still be handled exactly once;
+- a configurable maximum wait prevents indefinite postponement under a continuous correction stream;
+- restart discovery uses persisted Correction state rather than an in-memory timer;
+- manual reconciliation may bypass the coalescing delay.
 
 ## 12. Recall Contract
 
@@ -850,13 +869,18 @@ All implementation follows test-first development.
 
 ### 17.4 Idempotency and Scheduler Tests
 
-- identical L1 snapshot does not call the Planner twice;
-- identical L2 snapshot does not call Planner or Synthesizer twice;
+- a previously successful identical L1 snapshot does not call the Planner twice;
+- a previously successful identical L2 snapshot does not call Planner or Synthesizer twice;
 - nondeterministic LLM output cannot bypass snapshot idempotency;
+- changes only to `updatedAt`, retry metadata, or last error do not change a snapshot hash;
+- a failed snapshot remains retryable and may call the LLM again;
+- distinct Correction event IDs remain distinct work even when their payload hashes match;
+- multiple Corrections within the batch window share one fixed job snapshot;
+- continuous arrivals cannot postpone reconciliation beyond the configured maximum wait;
 - governance-only changes schedule L2;
 - a namespace with no remaining active Topic is still discoverable through governance work;
 - restart rediscovery finds pending L1 and ready L2 Corrections;
-- unchanged namespaces produce no LLM calls.
+- unchanged namespaces with no due work produce no LLM calls.
 
 ### 17.5 Recall Tests
 
@@ -894,7 +918,8 @@ The implementation adds deterministic fixtures and reporting interfaces for:
 - unknown evidence rejection rate;
 - Recall@K and Precision@K;
 - token cost;
-- repeated no-op LLM call count.
+- repeated no-op LLM call count;
+- Corrections processed per LLM call and batching delay.
 
 This version does not define release-blocking thresholds. Threshold selection requires real project data and is tracked as production-readiness work.
 
@@ -926,7 +951,7 @@ The feature is complete when all of the following are true:
 - every Statement identity transition is system-validated and auditable through explicit lineage;
 - L1 and L2 independently discover and consume the Corrections due to their own stage;
 - a Correction cannot reach `applied` until every stage required by its target type commits successfully: L1 then L2 for Turn/Component targets, L2 only for Statement targets;
-- repeated unchanged scheduler runs make no LLM calls;
+- a scheduler run makes no LLM call when its identical input snapshot already has a successful run; new governance events, failed retries, and explicitly keyed reruns are excluded from this guarantee;
 - Recall always identifies Memory as reference-only and exposes governance freshness;
 - ordinary contradictions are not deterministically overwritten;
 - every contested Statement carries validated supporting evidence, conflicting evidence, a summary, and alternatives;
