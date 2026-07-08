@@ -3,7 +3,7 @@ import type Database from "better-sqlite3";
 import Fastify, { type FastifyReply, type FastifyRequest } from "fastify";
 import { z } from "zod";
 import { createMemoryService, type MemoryService } from "./application/memory-service.js";
-import type { MemoryStatus, Role, Scope, TopicStatus } from "./domain/types.js";
+import type { CorrectionStatus, MemoryStatus, Role, Scope, TopicStatus } from "./domain/types.js";
 import { MemoryRepository } from "./storage/repositories.js";
 import type { MemoryStore } from "./storage/store.js";
 
@@ -66,6 +66,28 @@ const l2RunSchema = z.object({
   uid: z.string().min(1),
   agent: z.string().min(1),
   watermark: z.number().int().nonnegative().optional()
+});
+
+const correctionCreateSchema = z.object({
+  eventId: z.string().min(1),
+  uid: z.string().min(1),
+  agent: z.string().min(1),
+  source: z.string().min(1).optional(),
+  channel: z.string().min(1).optional(),
+  sessionId: z.string().min(1).optional(),
+  targetType: z.enum(["turn", "l1_component", "l2_statement"]),
+  targetId: z.string().min(1),
+  targetRevisionId: z.string().min(1).nullable(),
+  action: z.enum(["retract", "replace"]),
+  correctedContent: z.string().min(1).nullable(),
+  reason: z.string().min(1)
+});
+
+const correctionQuerySchema = z.object({
+  uid: z.string().min(1),
+  agent: z.string().min(1),
+  status: z.enum(["pending_l1", "ready_l2", "applied"]).optional(),
+  limit: z.coerce.number().int().positive().max(500).optional()
 });
 
 const layeredRecallSchema = z.object({
@@ -270,6 +292,37 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
     return { runs: service.listL2AggregationRuns(parsed.data.limit) };
   });
 
+  app.post("/v1/corrections", async (request, reply) => {
+    const parsed = correctionCreateSchema.safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+    try {
+      return service.createCorrection(parsed.data);
+    } catch (error) {
+      const mapped = mapCorrectionError(error);
+      return reply.status(mapped.status).send(mapped.body);
+    }
+  });
+
+  app.get("/v1/corrections", async (request, reply) => {
+    const parsed = correctionQuerySchema.safeParse(request.query);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+    return service.listCorrections({
+      uid: parsed.data.uid,
+      agent: parsed.data.agent,
+      status: parsed.data.status as CorrectionStatus | undefined,
+      limit: parsed.data.limit
+    });
+  });
+
+  app.get("/v1/corrections/:id", async (request, reply) => {
+    const params = request.params as { id: string };
+    const parsed = correctionQuerySchema.pick({ uid: true, agent: true }).safeParse(request.query);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+    const result = service.getCorrection(parsed.data.uid, parsed.data.agent, params.id);
+    if (!result.correction) return reply.status(404).send({ error: "Correction not found" });
+    return result;
+  });
+
   app.post("/v1/recall", async (request, reply) => {
     const parsed = layeredRecallSchema.safeParse(request.body);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
@@ -311,4 +364,21 @@ function toScope(input: z.infer<typeof scopeSchema>): Scope {
     channel: input.channel,
     metadata: input.metadata
   };
+}
+
+function mapCorrectionError(error: unknown): { status: 400 | 404 | 409; body: { error: string; retryable?: boolean } } {
+  const message = error instanceof Error ? error.message : "correction rejected";
+  if (message === "Correction target not found") return { status: 404, body: { error: message } };
+  if (message.includes("idempotency conflict")) return { status: 409, body: { error: message } };
+  if (message.includes("stale")) return { status: 409, body: { error: message, retryable: true } };
+  if (
+    message.includes("requires") ||
+    message.includes("rejects") ||
+    message.includes("outside") ||
+    message.includes("unknown") ||
+    message.includes("out-of-scope")
+  ) {
+    return { status: 400, body: { error: message } };
+  }
+  return { status: 409, body: { error: message } };
 }

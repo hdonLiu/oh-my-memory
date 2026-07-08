@@ -93,15 +93,16 @@ function collectL1Sessions(service: MemoryService): Array<{ scope: Scope; sessio
     };
     byKey.set(sessionKey(scope, view.topic.sessionId), { scope, sessionId: view.topic.sessionId });
   }
+  for (const item of service.listPendingL1CorrectionSessions()) {
+    byKey.set(sessionKey(item.scope, item.sessionId), item);
+  }
   return Array.from(byKey.values());
 }
 
 function collectL2Namespaces(service: MemoryService): Array<{ uid: string; agent: string }> {
   const byKey = new Map<string, { uid: string; agent: string }>();
-  for (const view of service.listL1Topics({ includeInactive: false })) {
-    if (view.revision.status !== "canonical") continue;
-    const value = { uid: view.topic.uid, agent: view.topic.agent };
-    byKey.set(`${value.uid}\0${value.agent}`, value);
+  for (const namespace of service.listDueL2Namespaces()) {
+    byKey.set(`${namespace.uid}\0${namespace.agent}`, namespace);
   }
   return Array.from(byKey.values());
 }

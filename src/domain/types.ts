@@ -34,6 +34,87 @@ export interface ConversationTurn extends Scope {
 export type RevisionStatus = "provisional" | "canonical" | "superseded" | "deleted";
 export type EntityStatus = "active" | "superseded" | "merged" | "deleted";
 export type OfflineRunStatus = "running" | "success" | "failed";
+export type EvidenceAuthority = "conversation" | "human_correction";
+export type CorrectionTargetType = "turn" | "l1_component" | "l2_statement";
+export type CorrectionAction = "retract" | "replace";
+export type CorrectionStatus = "pending_l1" | "ready_l2" | "applied";
+export type NamespaceChangeKind =
+  | "l1_revision"
+  | "l1_delete"
+  | "correction_created"
+  | "correction_ready"
+  | "correction_applied";
+export type StatementStatus = "supported" | "contested";
+
+export type StatementEvidenceRef =
+  | { kind: "component"; id: string }
+  | { kind: "correction"; id: string };
+
+export interface ConflictAssessment {
+  summary: string;
+  supportingEvidenceRefs: StatementEvidenceRef[];
+  conflictingEvidenceRefs: StatementEvidenceRef[];
+  alternatives: string[];
+}
+
+export interface CorrectionRecord {
+  id: string;
+  eventId: string;
+  payloadHash: string;
+  uid: string;
+  agent: string;
+  targetType: CorrectionTargetType;
+  targetId: string;
+  targetRevisionId: string | null;
+  action: CorrectionAction;
+  correctedContent: string | null;
+  reason: string;
+  authority: "human_correction";
+  status: CorrectionStatus;
+  affectedSource: string | null;
+  affectedChannel: string | null;
+  affectedSessionId: string | null;
+  createdSequence: number;
+  readySequence: number | null;
+  appliedSequence: number | null;
+  error: string | null;
+  createdAt: string;
+  updatedAt: string;
+  appliedAt: string | null;
+}
+
+export interface CreateCorrectionInput {
+  eventId: string;
+  uid: string;
+  agent: string;
+  source?: string;
+  channel?: string;
+  sessionId?: string;
+  targetType: CorrectionTargetType;
+  targetId: string;
+  targetRevisionId: string | null;
+  action: CorrectionAction;
+  correctedContent: string | null;
+  reason: string;
+}
+
+export interface NamespaceChange {
+  sequence: number;
+  uid: string;
+  agent: string;
+  kind: NamespaceChangeKind;
+  entityType: string;
+  entityId: string;
+  correctionId: string | null;
+  createdAt: string;
+}
+
+export interface GovernanceFreshness {
+  status: "current" | "pending_reconciliation";
+  pendingCorrectionCount: number;
+  latestGovernanceSequence: number;
+  appliedGovernanceSequence: number;
+}
 
 export interface GenerationProvenance {
   provider?: string;
@@ -72,6 +153,8 @@ export interface L1Component extends GenerationProvenance {
   content: string;
   labels: string[];
   evidenceTurnIds: string[];
+  evidenceCorrectionIds: string[];
+  evidenceAuthority: EvidenceAuthority;
   createdAt: string;
 }
 
@@ -87,7 +170,8 @@ export interface L1MaintenancePlanItem {
   components?: Array<{
     content: string;
     labels?: string[];
-    evidenceTurnIds: string[];
+    evidenceTurnIds?: string[];
+    evidenceCorrectionIds?: string[];
     confidence?: number;
   }>;
   reason: string;
@@ -96,6 +180,7 @@ export interface L1MaintenancePlanItem {
 
 export interface L1MaintenancePlan {
   items: L1MaintenancePlanItem[];
+  handledCorrectionIds?: string[];
 }
 
 export interface L1MaintenanceRun {
@@ -126,8 +211,14 @@ export interface L2Aggregate {
 }
 
 export interface L2Statement {
+  id?: string;
   content: string;
   evidenceComponentIds: string[];
+  evidenceCorrectionIds?: string[];
+  semanticOrigin?: "derived";
+  evidenceAuthority?: EvidenceAuthority;
+  status?: StatementStatus;
+  conflictAssessment?: ConflictAssessment | null;
   confidence: number;
   qualifier?: string;
 }
@@ -182,6 +273,32 @@ export interface L2MembershipPlan {
   operations: L2MembershipPlanOperation[];
   desiredMemberships: L2DesiredMembership[];
   retireAggregateIds: string[];
+  handledCorrectionIds?: string[];
+}
+
+export interface StatementDraft {
+  content: string;
+  evidenceComponentIds?: string[];
+  evidenceCorrectionIds?: string[];
+  status?: StatementStatus;
+  conflictAssessment?: ConflictAssessment | null;
+  confidence: number;
+  qualifier?: string;
+}
+
+export type StatementOperation =
+  | { op: "continue"; sourceRef: string; statement: StatementDraft }
+  | { op: "create"; statement: StatementDraft }
+  | { op: "merge"; sourceRefs: string[]; statement: StatementDraft }
+  | { op: "split"; sourceRef: string; statements: StatementDraft[] }
+  | { op: "retire"; sourceRef: string };
+
+export interface StatementLineageEdge {
+  fromRevisionId: string;
+  fromStatementId: string;
+  toRevisionId: string | null;
+  toStatementId: string | null;
+  operation: "continue" | "merge" | "split" | "retire";
 }
 
 export interface L2AggregationRun {

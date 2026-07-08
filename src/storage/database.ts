@@ -245,9 +245,11 @@ function runMigrations(db: Database.Database): void {
   ensureUidColumns(db);
   ensureTurnEventId(db);
   ensureRunIdempotencyColumns(db);
+  ensureReconciliationRunColumns(db);
   ensureL2RevisionIdentityColumns(db);
   ensureTopicProjectMemoryColumn(db);
   ensureReadableMemoryColumn(db);
+  ensureGovernanceSchema(db);
   ensureIndexes(db);
   recordMigration(db, 1);
   recordMigration(db, 2);
@@ -305,6 +307,106 @@ function ensureReadableMemoryColumn(db: Database.Database): void {
   `);
 }
 
+function ensureReconciliationRunColumns(db: Database.Database): void {
+  const l1Columns = db.pragma("table_info(l1_maintenance_runs)") as Array<{ name: string }>;
+  for (const [name, ddl] of [
+    ["input_snapshot_hash", "alter table l1_maintenance_runs add column input_snapshot_hash text"],
+    ["run_mode", "alter table l1_maintenance_runs add column run_mode text not null default 'incremental'"],
+    ["caller_idempotency_key", "alter table l1_maintenance_runs add column caller_idempotency_key text"],
+    ["prompt_version", "alter table l1_maintenance_runs add column prompt_version text"],
+    ["schema_version", "alter table l1_maintenance_runs add column schema_version text"]
+  ] as const) {
+    if (!l1Columns.some((column) => column.name === name)) db.exec(ddl);
+  }
+
+  const l2Columns = db.pragma("table_info(l2_aggregation_runs)") as Array<{ name: string }>;
+  for (const [name, ddl] of [
+    ["source_governance_watermark", "alter table l2_aggregation_runs add column source_governance_watermark integer not null default 0"],
+    ["input_snapshot_hash", "alter table l2_aggregation_runs add column input_snapshot_hash text"],
+    ["run_mode", "alter table l2_aggregation_runs add column run_mode text not null default 'incremental'"],
+    ["caller_idempotency_key", "alter table l2_aggregation_runs add column caller_idempotency_key text"],
+    ["prompt_version", "alter table l2_aggregation_runs add column prompt_version text"],
+    ["schema_version", "alter table l2_aggregation_runs add column schema_version text"],
+    ["context_expansion_rounds", "alter table l2_aggregation_runs add column context_expansion_rounds integer not null default 0"],
+    ["context_request_json", "alter table l2_aggregation_runs add column context_request_json text"]
+  ] as const) {
+    if (!l2Columns.some((column) => column.name === name)) db.exec(ddl);
+  }
+}
+
+function ensureGovernanceSchema(db: Database.Database): void {
+  const componentColumns = db.pragma("table_info(l1_components)") as Array<{ name: string }>;
+  if (!componentColumns.some((column) => column.name === "evidence_authority")) {
+    db.exec("alter table l1_components add column evidence_authority text not null default 'conversation'");
+  }
+  if (!componentColumns.some((column) => column.name === "evidence_correction_ids")) {
+    db.exec("alter table l1_components add column evidence_correction_ids text not null default '[]'");
+  }
+  db.exec(`
+    create table if not exists namespace_changes (
+      sequence integer primary key autoincrement,
+      uid text not null,
+      agent text not null,
+      kind text not null,
+      entity_type text not null,
+      entity_id text not null,
+      correction_id text,
+      created_at text not null
+    );
+
+    create table if not exists correction_records (
+      id text primary key,
+      event_id text not null,
+      payload_hash text not null,
+      uid text not null,
+      agent text not null,
+      target_type text not null,
+      target_id text not null,
+      target_revision_id text,
+      action text not null,
+      corrected_content text,
+      reason text not null,
+      authority text not null,
+      status text not null,
+      affected_source text,
+      affected_channel text,
+      affected_session_id text,
+      created_sequence integer not null,
+      ready_sequence integer,
+      applied_sequence integer,
+      error text,
+      created_at text not null,
+      updated_at text not null,
+      applied_at text,
+      unique(uid, agent, event_id)
+    );
+
+    create table if not exists statement_lineage_edges (
+      id text primary key,
+      uid text not null,
+      agent text not null,
+      from_revision_id text not null,
+      from_statement_id text not null,
+      to_revision_id text,
+      to_statement_id text,
+      operation text not null,
+      created_at text not null
+    );
+
+    create table if not exists l2_checkpoints (
+      uid text not null,
+      agent text not null,
+      l1_stable_watermark integer not null,
+      governance_watermark integer not null,
+      run_id text not null,
+      prompt_version text not null,
+      schema_version text not null,
+      updated_at text not null,
+      primary key(uid, agent)
+    );
+  `);
+}
+
 function ensureIndexes(db: Database.Database): void {
   db.exec(`
     create index if not exists idx_memories_scope_status_level_type
@@ -333,6 +435,24 @@ function ensureIndexes(db: Database.Database): void {
       on l2_component_memberships (component_id);
     create index if not exists idx_l2_runs_namespace
       on l2_aggregation_runs (uid, agent, started_at);
+    create index if not exists idx_l1_runs_success_snapshot
+      on l1_maintenance_runs (uid, source, agent, channel, session_id, status, input_snapshot_hash);
+    create index if not exists idx_l2_runs_success_snapshot
+      on l2_aggregation_runs (uid, agent, status, input_snapshot_hash);
+    create index if not exists idx_corrections_status_created
+      on correction_records (uid, agent, status, created_sequence);
+    create index if not exists idx_corrections_status_ready
+      on correction_records (uid, agent, status, ready_sequence);
+    create index if not exists idx_corrections_l1_scope
+      on correction_records (uid, affected_source, agent, affected_channel, affected_session_id, status);
+    create index if not exists idx_corrections_target_namespace
+      on correction_records (uid, agent, target_type, target_id);
+    create index if not exists idx_namespace_changes_namespace_sequence
+      on namespace_changes (uid, agent, sequence);
+    create index if not exists idx_statement_lineage_from
+      on statement_lineage_edges (uid, agent, from_revision_id, from_statement_id);
+    create index if not exists idx_statement_lineage_to
+      on statement_lineage_edges (uid, agent, to_revision_id, to_statement_id);
   `);
 }
 

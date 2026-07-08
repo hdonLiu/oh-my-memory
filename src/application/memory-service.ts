@@ -23,8 +23,12 @@ import { LlmTopicMemoryGenerator, topicMemoryUnitToDraft } from "../domain/topic
 import { SlidingTopicBuilder, type TopicBuilder } from "../domain/topics.js";
 import type {
   ConversationTurn,
+  CorrectionRecord,
+  CorrectionStatus,
   CreateMemoryInput,
+  CreateCorrectionInput,
   CreateTurnInput,
+  GovernanceFreshness,
   Memory,
   MemoryStatus,
   ProjectBuildRun,
@@ -80,8 +84,21 @@ export interface MemoryService {
   listL2Aggregates(uid: string, agent: string, includeInactive?: boolean): ReturnType<MemoryStore["layered"]["listL2AggregateViews"]>;
   runL2Aggregation(uid: string, agent: string, watermark?: number): ReturnType<LayeredMemoryService["runL2Aggregation"]>;
   listL2AggregationRuns(limit?: number): ReturnType<MemoryStore["layered"]["listL2AggregationRuns"]>;
+  createCorrection(input: CreateCorrectionInput): { correction: CorrectionRecord };
+  getCorrection(uid: string, agent: string, id: string): { correction: CorrectionRecord | null };
+  listCorrections(filter: {
+    uid: string;
+    agent: string;
+    status?: CorrectionStatus;
+    limit?: number;
+  }): { corrections: CorrectionRecord[] };
+  listPendingL1CorrectionSessions(): Array<{ scope: Scope; sessionId: string }>;
+  listReadyL2CorrectionNamespaces(): Array<{ uid: string; agent: string }>;
+  listDueL2Namespaces(): Array<{ uid: string; agent: string }>;
   recallV2(input: { uid: string; agent: string; query: string; limit?: number; sessionId?: string; includeProvisional?: boolean }): Promise<{
+    usagePolicy: "reference_only";
     shouldUseMemory: boolean;
+    freshness: GovernanceFreshness;
     reason: string;
     results: LayeredRecallResult[];
   }>;
@@ -249,6 +266,30 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
 
     listL2AggregationRuns(limit) {
       return store.layered.listL2AggregationRuns(limit);
+    },
+
+    createCorrection(input) {
+      return { correction: store.layered.createCorrection(input) };
+    },
+
+    getCorrection(uid, agent, id) {
+      return { correction: store.layered.getCorrection(uid, agent, id) };
+    },
+
+    listCorrections(filter) {
+      return { corrections: store.layered.listCorrections(filter) };
+    },
+
+    listPendingL1CorrectionSessions() {
+      return store.layered.listPendingL1CorrectionSessions();
+    },
+
+    listReadyL2CorrectionNamespaces() {
+      return store.layered.listReadyL2CorrectionNamespaces();
+    },
+
+    listDueL2Namespaces() {
+      return store.layered.listDueL2Namespaces();
     },
 
     recallV2(input) {

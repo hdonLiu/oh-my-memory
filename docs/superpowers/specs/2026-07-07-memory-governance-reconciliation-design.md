@@ -1,13 +1,15 @@
 # Memory Governance & Reconciliation v1
 
-Status: Proposed for review
+Status: Accepted; v1 implemented
 
 Date: 2026-07-07
 
 Depends on:
 
 - [oh-my-memory Architecture v2](../../architecture/oh-my-memory-architecture-v2.md)
+- [oh-my-memory Architecture v2.1](../../architecture/oh-my-memory-architecture-v2.1.md)
 - [ADR-0001: Three-Stage Memory Pipeline](../../architecture/0001-three-stage-memory-pipeline.md)
+- [ADR-0002: Governance Plane for Corrections and Reconciliation](../../architecture/0002-governance-plane.md)
 
 ## 1. Document Role
 
@@ -124,8 +126,8 @@ For storage and validation, L1 Components expose `evidenceTurnIds` and `evidence
 Correction evidence is namespace- and scope-bound:
 
 - every referenced Correction must exist and match the enclosing entity's `uid + agent`;
-- an L1 Component may cite a Correction only when its `affectedSessionId` matches the Component's owning Topic session;
-- an L2 Statement may add a Correction reference only from the fixed L2 job snapshot for the same namespace, or retain a previously validated reference from its direct predecessor;
+- an L1 Component Correction reference is valid only when its `affectedSource + affectedChannel + affectedSessionId` matches the Component's owning Topic scope;
+- an L2 Statement Correction reference is valid only when it comes from the fixed L2 job snapshot for the same namespace, or when it is retained from a previously validated direct predecessor;
 - authority derivation runs only after all existence, namespace, session, lifecycle, and snapshot-scope checks succeed.
 
 ### 6.2 Evidence Authority
@@ -258,8 +260,12 @@ export interface CorrectionRecord {
   reason: string;
   authority: "human_correction";
   status: CorrectionStatus;
+  affectedSource: string | null;
+  affectedChannel: string | null;
   affectedSessionId: string | null;
-  changeSequence: number;
+  createdSequence: number;
+  readySequence: number | null;
+  appliedSequence: number | null;
   error: string | null;
   createdAt: string;
   updatedAt: string;
@@ -275,10 +281,24 @@ Initial status is determined as follows:
 | Turn | replace | `pending_l1` | Owning L1 session must incorporate correction evidence |
 | L1 Component | retract | `pending_l1` | Owning Topic must be revised |
 | L1 Component | replace | `pending_l1` | Owning Topic must incorporate correction evidence |
-| L2 Statement | retract | `ready_l2` | L2 can remove the derived claim directly |
+| L2 Statement | retract | `ready_l2` | L2 removes the derived claim directly |
 | L2 Statement | replace | `ready_l2` | L2 consumes the Correction Record directly as authoritative evidence |
 
 Corrections targeting a Turn or L1 Component follow `pending_l1 → ready_l2 → applied`. Corrections targeting an L2 Statement follow `ready_l2 → applied`; they never enter `pending_l1`. These transitions are performed only by the independent offline jobs that own the corresponding layer.
+
+Scope fields are target-dependent:
+
+- Turn and L1 Component Corrections must pin `affectedSource`, `affectedChannel`, and `affectedSessionId` because the current L1 boundary is `uid + source + agent + channel + sessionId`;
+- L2 Statement Corrections set those fields to `null` because L2 Aggregates are namespaced by `uid + agent`;
+- service validation rejects partial L1 scope pins, cross-scope targets, and any attempt to infer missing source/channel from session ID alone.
+
+The sequence fields are lifecycle watermarks, not aliases:
+
+- `createdSequence` is the `namespace_changes.sequence` for `correction_created`;
+- `readySequence` is set only when the Correction becomes `ready_l2`, using the `correction_ready` sequence; L2 Statement Corrections are inserted with `status=ready_l2` and emit `correction_created` and `correction_ready` NamespaceChanges in the same transaction;
+- `appliedSequence` is set only when the Correction becomes `applied`, using the `correction_applied` sequence.
+
+Lifecycle sequences are not interchangeable watermarks. A later `appliedSequence` for one Correction does not prove that earlier created or ready Corrections have also converged. Schedulers therefore discover work from durable Correction status sets, while sequences provide ordering, audit, and snapshot identity within that status.
 
 ### 6.5 Namespace Change
 
@@ -319,7 +339,7 @@ export interface L2Checkpoint {
 }
 ```
 
-The checkpoint advances only in the same transaction that commits all L2 Revisions and marks all included corrections `applied`.
+The checkpoint advances only in the same transaction that commits all L2 Revisions and marks all included corrections `applied`. `governanceWatermark` is an applied-only audit watermark: the highest included `appliedSequence`. It is never used to prove absence of lower-sequence pending or ready Corrections.
 
 ## 7. Persistence Schema
 
@@ -376,8 +396,12 @@ create table correction_records (
   reason text not null,
   authority text not null,
   status text not null,
+  affected_source text,
+  affected_channel text,
   affected_session_id text,
-  change_sequence integer not null,
+  created_sequence integer not null,
+  ready_sequence integer,
+  applied_sequence integer,
   error text,
   created_at text not null,
   updated_at text not null,
@@ -423,11 +447,13 @@ create table l2_checkpoints (
 
 Required indexes:
 
-- correction status by `uid + agent + status + change_sequence`;
+- correction status by `uid + agent + status + created_sequence`;
+- ready correction discovery by `uid + agent + status + ready_sequence`;
 - correction affected session by `uid + agent + affected_session_id + status`;
+- correction affected L1 scope by `uid + affected_source + agent + affected_channel + affected_session_id + status` for rows where `affected_source` and `affected_channel` are not null;
 - namespace changes by `uid + agent + sequence`;
 - L1/L2 successful input snapshot lookup;
-- correction target by `target_type + target_id`.
+- correction target by `uid + agent + target_type + target_id`.
 - Statement lineage source and destination occurrences.
 
 ## 8. Correction API
@@ -459,14 +485,16 @@ Validation rules:
 - `replace` requires non-empty `correctedContent`;
 - `retract` rejects `correctedContent`;
 - target must exist and belong to the requested `uid + agent` namespace;
+- Turn and L1 Component requests must include `source`, `channel`, and `sessionId`; those request fields must match the target's stored L1 scope exactly, and the persisted Correction pins those fields;
+- L2 Statement targets reject `source`, `channel`, and `sessionId` request fields because their correction scope is the Aggregate namespace plus pinned Statement occurrence;
 - an L2 Statement correction requires `targetRevisionId`, and the `(targetRevisionId, targetId)` occurrence must be current when the Correction is created;
 - a stale or non-current L2 occurrence returns HTTP 409 with `retryable=true` and the current same-namespace occurrence reference, with no Correction write;
-- namespace mismatch returns not-found semantics rather than disclosing cross-namespace existence;
-- the target must have enough stored ownership information to locate its L1 session or L2 Aggregate;
+- namespace mismatch returns HTTP 404 with the same response body and headers as an unknown target;
+- Turn and L1 Component targets must have stored `uid`, `agent`, `source`, `channel`, and `sessionId`; L2 Statement targets must have stored `uid`, `agent`, `aggregateRevisionId`, `aggregateId`, and current-occurrence state;
 - duplicate `eventId` with the same normalized payload returns the existing Correction;
 - duplicate `eventId` with a different normalized payload returns conflict.
 
-The write transaction performs no LLM call. It validates and pins the target occurrence, then inserts the Correction and namespace change. The Correction Record itself is the replacement evidence; the request creates no synthetic Turn, session, Topic, or Component.
+The write transaction performs no LLM call. It validates and pins the target occurrence and, for L1-bound targets, the complete L1 scope, then inserts the Correction and required NamespaceChange rows. L2 Statement Corrections also emit `correction_ready` in the same transaction because their initial lifecycle state is already `ready_l2`. The Correction Record itself is the replacement evidence; the request creates no synthetic Turn, session, Topic, or Component.
 
 Callers should treat a stale-target 409 as ordinary optimistic concurrency: refresh Recall or the target Aggregate, obtain the new current Revision reference, let the user-visible correction intent remain unchanged, and retry with the same `eventId` only after rebuilding the normalized request for that current target. Because reusing an event ID with a different payload conflicts, a stale request that was never persisted may reuse its event ID; an already persisted Correction must never be retargeted.
 
@@ -474,16 +502,16 @@ Callers should treat a stale-target 409 as ordinary optimistic concurrency: refr
 
 ```text
 GET /v1/corrections?uid=u1&agent=codex&status=pending_l1&limit=20
-GET /v1/corrections/:id
+GET /v1/corrections/:id?uid=u1&agent=codex
 ```
 
-List access requires both `uid` and `agent`. Inspection enforces namespace ownership through the service layer.
+List and inspect access require both `uid` and `agent` request fields. Inspection first filters by `id + uid + agent`; a missing row returns HTTP 404. The service never loads a Correction by `id` alone and then performs a separate namespace check, because that could disclose cross-namespace existence through timing, error shape, or logging.
 
 ### 8.3 Replacement Evidence
 
 `replace` stores corrected content only in the immutable Correction Record. It does not disguise that assertion as conversational or topical evidence.
 
-For Turn or L1 Component targets, the owning session's offline L1 Planner receives the Correction Record. Any resulting Component may cite the Correction ID directly alongside any retained Turn evidence.
+For Turn or L1 Component targets, the owning session's offline L1 Planner receives the Correction Record. A resulting Component's Correction reference is valid only when it cites a Correction ID from that fixed L1 input snapshot and the Correction's pinned L1 scope matches the Component's owning Topic scope. Valid Components may combine Correction evidence with retained Turn evidence.
 
 For an L2 Statement target, the offline L2 Planner and synthesizer receive the Correction Record directly. A replacement Statement cites the Correction ID; it does not need to pass through L1 first.
 
@@ -511,7 +539,7 @@ Undo and redo are excluded from v1. A future design must append an explicit `can
 The L1 scheduler processes a session when either condition is true:
 
 - it has at least one provisional Topic;
-- it has at least one `pending_l1` Correction.
+- it has at least one `pending_l1` Correction whose pinned `affectedSource + affectedChannel + affectedSessionId` matches that session scope.
 
 Work discovery is database-backed and survives process restart.
 
@@ -529,7 +557,7 @@ corrections: CorrectionRecord[];
 handledCorrectionIds: string[];
 ```
 
-The system requires every due Correction in the fixed input snapshot to appear exactly once in `handledCorrectionIds`. Missing, duplicate, unknown, or cross-session IDs fail the run.
+The fixed L1 input snapshot contains every `pending_l1` Correction whose pinned `affectedSource + affectedChannel + affectedSessionId` matches the session scope at snapshot time. The system requires each included Correction ID to appear exactly once in `handledCorrectionIds`. Missing, duplicate, unknown, or cross-session IDs fail the run.
 
 Semantic requirements communicated to the LLM:
 
@@ -560,7 +588,7 @@ Failure leaves Corrections `pending_l1`, does not expose partial canonical state
 The L2 scheduler processes a namespace when any condition is true:
 
 - current L1 stable watermark exceeds the stored L2 checkpoint;
-- the highest `ready_l2` Correction sequence exceeds the checkpoint governance watermark;
+- it has at least one Correction with `status='ready_l2'`;
 - a manual run requests `full` reconciliation.
 
 Namespace discovery must include namespaces represented only by pending governance work. Deleting or superseding the final active Topic must not make the namespace undiscoverable.
@@ -592,7 +620,7 @@ export type L2MembershipPlanningResult =
     };
 ```
 
-Every due `ready_l2` Correction selected into the input snapshot must be supplied to the Planner. A `complete` result must handle each of them exactly once.
+The fixed L2 input snapshot contains either all `ready_l2` Corrections in the namespace at snapshot time, or one deterministic bounded partition chosen before any Planner call when required by batch or token ceilings. Every `ready_l2` Correction included in that fixed snapshot must be supplied to the Planner. A `complete` result must handle each included Correction exactly once.
 
 `handledCorrectionIds` is validated only on a `complete` result. `needs_more_context` commits no semantic change, advances no checkpoint, and leaves Corrections `ready_l2`.
 
@@ -607,14 +635,14 @@ The L2 synthesizer receives the relevant Corrections for each desired membership
 
 The system binds source references to immutable `(revisionId, statementId)` occurrences before the LLM call. It validates complete, single consumption of the required source set and then assigns result IDs. The LLM cannot copy, invent, or reassign an ID.
 
-Concurrent L2 runs may bind the same ordinary source occurrence even when no Correction reserves it. The first valid commit advances the namespace sequence and current Revision; every competing stale commit fails optimistic validation, discards its generated Plan, refreshes the snapshot and source bindings, and retries under scheduler backoff. This prevents duplicate consumption or corruption but may create harmless retry churn in multi-worker deployments. V1 optimizes for the normal single-scheduler deployment and does not add pessimistic Aggregate locks.
+Concurrent L2 runs may bind the same ordinary source occurrence even when no Correction reserves it. The first valid commit writes its NamespaceChange rows and current Revision; every competing stale commit fails optimistic validation, discards its generated Plan, refreshes the snapshot and source bindings, and retries under scheduler backoff. This prevents duplicate consumption or corruption but may create harmless retry churn in multi-worker deployments. V1 optimizes for the normal single-scheduler deployment and does not add pessimistic Aggregate locks.
 
 A due L2 Statement Correction reserves its pinned source occurrence within the synthesis snapshot:
 
 - `replace` requires exactly one `continue` from the reserved source, preserves its logical Statement ID, and requires the resulting Statement to cite that Correction ID;
 - `retract` requires `retire` for the reserved source;
 - no other operation in the same result may consume that source;
-- an L2 commit built from a snapshot older than the Correction's namespace sequence fails optimistic validation and must be retried with the Correction included.
+- an L2 commit whose fixed snapshot omitted a ready Correction that is still `ready_l2` at commit time fails optimistic validation and must be retried with that Correction included, unless the run explicitly persisted `needs_context` without semantic changes.
 
 Correction and conflict status interact as follows:
 
@@ -650,7 +678,7 @@ Correction identity is:
 uid + agent + eventId
 ```
 
-The normalized request payload is hashed to detect conflicting reuse. The immutable payload hash covers namespace, target type and pinned target occurrence, action, corrected content, reason, and authority.
+The normalized request payload is hashed to detect conflicting reuse. The immutable payload hash covers namespace, target type and pinned target occurrence, pinned L1 scope fields when present, action, corrected content, reason, and authority.
 
 Retries must reuse the same `eventId`. Distinct event IDs always represent distinct governance events even when their normalized payloads are identical. The system performs no semantic deduplication across Correction Records: collapsing separate events would lose chronology and would require a nondeterministic semantic decision before the idempotency boundary.
 
@@ -665,7 +693,7 @@ scope
 sessionId
 current Topic and Revision IDs
 input Turn IDs and content hashes
-pending Correction IDs, immutable payload hashes, and change sequences
+pending Correction IDs, immutable payload hashes, created sequences, and pinned L1 scope fields
 prompt version
 schema version
 run mode
@@ -682,8 +710,7 @@ The L2 input snapshot hash covers:
 uid
 agent
 L1 stable watermark
-ready governance watermark
-ready Correction IDs and immutable payload hashes
+ready Correction set projection: IDs, immutable payload hashes, ready sequences, and pinned target occurrences
 mandatory and optional candidate IDs and content hashes
 context-expansion round and normalized request hash
 prompt version
@@ -700,7 +727,7 @@ Snapshot idempotency guarantees only that a previously successful identical inpu
 
 The canonical snapshot projection, serializer, hash function, and successful-run lookup are state-machine prerequisites. L1/L2 orchestration must first load the complete semantic input, build its snapshot, and check prior success before entering any Planner-calling transition. No state machine may independently reconstruct a partial task identity after it has started.
 
-The common snapshot foundation is implemented before either correction state machine. L1 then binds its full Topic/Turn/Correction projection. L2 binds its base watermark/Correction projection first and adds the deterministic mandatory/optional candidate projection when bounded retrieval is implemented, before L2 state-machine orchestration is enabled.
+The common snapshot foundation is implemented before either correction state machine. L1 then binds its full Topic/Turn/Correction projection, including complete L1 scope pins. L2 binds its base L1 watermark and ready-Correction set projection first. The ready-Correction projection is the sorted list of included Correction IDs plus their immutable payload hashes, ready sequences, and pinned target occurrences. It is used for snapshot identity only, never for proving that omitted lower-sequence ready Corrections are complete. L2 then adds the deterministic mandatory/optional candidate projection when bounded retrieval is implemented, before L2 state-machine orchestration is enabled.
 
 ### 11.4 Run Modes
 
@@ -788,7 +815,7 @@ sourceL1Watermark?: number;
 sourceGovernanceWatermark?: number;
 ```
 
-Freshness is `pending_reconciliation` whenever the namespace contains a non-applied Correction whose sequence exceeds the L2 checkpoint governance watermark. This status does not suppress old results because eventual consistency is an accepted product behavior.
+Freshness is `pending_reconciliation` whenever the namespace contains any Correction with `status!='applied'`, regardless of that Correction's lifecycle sequence relative to the L2 checkpoint. `pendingCorrectionCount` counts those non-applied Corrections. `latestGovernanceSequence` reports the maximum lifecycle sequence currently visible in the namespace: `createdSequence` for `pending_l1`, `readySequence` for `ready_l2`, and `appliedSequence` for `applied`. `appliedGovernanceSequence` reports the checkpoint's applied-only governance watermark. This status does not suppress old results because eventual consistency is an accepted product behavior.
 
 ### 12.2 Planner Policy
 
@@ -892,7 +919,7 @@ GET  /v1/corrections/:id
 - namespace mismatch: HTTP 404;
 - stale or non-current L2 Statement occurrence: HTTP 409;
 - duplicate event ID with different payload: HTTP 409;
-- transaction failure: no partial Correction or change sequence.
+- transaction failure: no partial Correction or NamespaceChange rows.
 
 ### 15.2 Offline Jobs
 
@@ -902,12 +929,13 @@ The run fails without advancing state when:
 - a due Correction is missing from `handledCorrectionIds`;
 - the Plan references an unknown or out-of-scope Correction, Turn, Topic, Component, Aggregate, or Statement;
 - an L1 Component or L2 Statement cites a Correction whose `uid + agent` differs from its enclosing Topic or Aggregate namespace;
-- an L1 Component cites a Correction whose `affectedSessionId` differs from its owning Topic session;
+- an L1 Component cites a Correction whose `affectedSource + affectedChannel + affectedSessionId` differs from its owning Topic scope;
 - an L2 Statement cites a Component outside Membership or a Correction outside the fixed job snapshot;
 - a `supported` Statement contains conflict data, or a `contested` Statement lacks a valid, disjoint, in-scope conflict assessment;
 - a Statement operation invents a source reference, consumes a source twice, leaves a required source unhandled, or violates the system ID-allocation rules;
 - a due Statement correction is not mapped to its required `continue` or `retire` operation;
-- the namespace sequence changed after the job snapshot was fixed;
+- an L1 commit omitted any `pending_l1` Correction in the fixed L1 session snapshot;
+- an L2 semantic commit omitted any `ready_l2` Correction in the fixed L2 namespace snapshot, except Corrections intentionally excluded by a deterministic pre-snapshot partition that remains `ready_l2` for a later run;
 - claimed correction authority cannot be derived from evidence;
 - an Aggregate remains above the hard member limit;
 - the database commit fails.
@@ -987,6 +1015,8 @@ All implementation follows test-first development.
 - stale-target conflict returns a retryable current occurrence reference, and a refreshed request can succeed without retargeting a persisted Correction;
 - retract/replace validation is enforced;
 - replacement creates no synthetic Turn, session, Topic, or Component;
+- Turn and L1 Component Corrections pin the complete `source + channel + sessionId` L1 scope and reject ambiguous or partial scope;
+- L2 Statement Corrections reject L1 scope fields and emit both `correction_created` and `correction_ready` namespace changes in the create transaction;
 - Correction authority is fixed by the service, and unknown or out-of-scope Correction evidence IDs are rejected;
 - cross-namespace and cross-session Correction evidence references are rejected before authority derivation;
 - malformed or non-array `evidence_correction_ids` is rejected by SQLite shape validation;
@@ -1047,6 +1077,8 @@ All implementation follows test-first development.
 - multiple Corrections within the batch window share one fixed job snapshot;
 - continuous arrivals cannot postpone reconciliation beyond the configured maximum wait;
 - governance-only changes schedule L2;
+- L2 discovery uses durable `ready_l2` status, so a lower-sequence ready Correction is not skipped after an unrelated higher applied checkpoint;
+- Recall freshness remains `pending_reconciliation` when any non-applied Correction exists, even if its `createdSequence` or `readySequence` is lower than the applied checkpoint watermark;
 - a namespace with no remaining active Topic is still discoverable through governance work;
 - restart rediscovery finds pending L1 and ready L2 Corrections;
 - unchanged namespaces with no due work produce no LLM calls.
@@ -1116,16 +1148,16 @@ This version does not define release-blocking thresholds. Threshold selection re
 Implementation should proceed in this order:
 
 1. Governance Plane ADR and canonical Architecture v2.1;
-2. schema, deterministic migration, backup, and recovery path;
-3. Correction repository and API;
-4. first-class correction evidence and authority propagation;
-5. canonical snapshot projection, hashing, successful-run lookup, and pre-LLM idempotency foundation;
-6. complete L1 snapshot binding, then the L1 correction state machine;
-7. Statement identity and conflict status;
-8. initial bounded retrieval, complete L2 candidate-snapshot binding, at most one expansion, and direct `needs_context` exhaustion;
-9. core L2 correction state machine and checkpoint against that bounded path;
-10. configurable multi-round expansion, optional full-reconciliation fallback, and persisted expansion recovery;
-11. scheduler incremental discovery, batching, retry backoff, and cost ceilings;
+2. schema additions, deterministic legacy Statement ID migration, current Statement occurrence lookup, backup, and recovery path;
+3. durable governance sequence model, namespace changes, L2 checkpoints, and scheduler discovery queries for provisional, pending, ready, and governance-only work;
+4. canonical snapshot projection, hashing, successful-run lookup, and pre-LLM idempotency foundation before any correction state machine invokes a Planner;
+5. Correction repository and API, including full L1 scope pinning and L2 current-occurrence validation;
+6. first-class correction evidence and authority propagation;
+7. complete L1 snapshot binding, then the L1 correction state machine;
+8. Statement lineage operations and conflict status on top of migrated Statement IDs;
+9. initial bounded retrieval, complete L2 candidate-snapshot binding, at most one expansion, and direct `needs_context` exhaustion;
+10. core L2 correction state machine and checkpoint against that bounded path;
+11. configurable multi-round expansion, optional full-reconciliation fallback, persisted expansion recovery, batching, retry backoff, and cost ceilings;
 12. Recall governance contract;
 13. migration, API, workflow, restart, recovery, and failure tests;
 14. README and production backlog updates;
