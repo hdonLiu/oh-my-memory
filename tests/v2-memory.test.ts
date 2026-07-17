@@ -422,12 +422,21 @@ describe("v2 layered memory", () => {
   it("discovers L1 and L2 scheduler work from durable Correction statuses", async () => {
     const l1Runs: string[] = [];
     const l2Runs: string[] = [];
+    const l3Runs: string[] = [];
     const schedulers = startLayeredSchedulers(
       {
-        listL1Topics: () => [],
+        listL1Topics: () => [
+          {
+            topic: { ...scope, id: "topic", sessionId: "session-1", status: "active", metadata: {} },
+            revision: { status: "canonical" },
+            components: [],
+            sourceSegmentStatus: "complete"
+          }
+        ],
         listPendingL1CorrectionSessions: () => [{ scope, sessionId: "session-1" }],
         listReadyL2CorrectionNamespaces: () => [{ uid: scope.uid, agent: scope.agent }],
         listDueL2Namespaces: () => [{ uid: scope.uid, agent: scope.agent }],
+        listDueL3Namespaces: () => [{ uid: scope.uid, agent: scope.agent }],
         runL1Maintenance: async (_scope: typeof scope, sessionId: string) => {
           l1Runs.push(sessionId);
           return { run: null, topics: [] };
@@ -435,15 +444,28 @@ describe("v2 layered memory", () => {
         runL2Aggregation: async (uid: string, agent: string) => {
           l2Runs.push(`${uid}/${agent}`);
           return { run: null, aggregates: [] };
+        },
+        runL3ProfileBuild: async (uid: string, agent: string) => {
+          l3Runs.push(`${uid}/${agent}`);
+          return { createdOrUpdated: [], rejected: [] };
         }
       } as never,
-      { l1Enabled: false, l1IntervalMs: 60_000, l2Enabled: false, l2IntervalMs: 60_000 }
+      {
+        l1Enabled: false,
+        l1IntervalMs: 60_000,
+        l2Enabled: false,
+        l2IntervalMs: 60_000,
+        l3Enabled: false,
+        l3IntervalMs: 60_000
+      }
     );
 
     await expect(schedulers.runL1Once()).resolves.toMatchObject({ sessionsRun: 1, errors: [] });
     await expect(schedulers.runL2Once()).resolves.toMatchObject({ namespacesRun: 1, errors: [] });
+    await expect(schedulers.runL3Once()).resolves.toMatchObject({ namespacesRun: 1, errors: [] });
     expect(l1Runs).toEqual(["session-1"]);
     expect(l2Runs).toEqual([`${scope.uid}/${scope.agent}`]);
+    expect(l3Runs).toEqual([`${scope.uid}/${scope.agent}`]);
     schedulers.stop();
   });
 
@@ -835,6 +857,140 @@ describe("v2 layered memory", () => {
     );
   });
 
+  it("recalls a partial Topic immediately as provisional L1 without legacy memory writes", async () => {
+    const store = new MemoryRepository(createDatabase(":memory:"));
+    const layeredService = new LayeredMemoryService(store, {
+      l1Planner: { async plan() { return { items: [] }; } },
+      l2Planner: { async plan() { return { operations: [], desiredMemberships: [], retireAggregateIds: [] }; } },
+      l2Synthesizer: { async synthesize() { throw new Error("not used"); } },
+      recallPlanner: {
+        async plan(input) {
+          return { shouldUseMemory: true, selectedIds: input.candidates.map((candidate) => candidate.id), reason: "test" };
+        }
+      }
+    });
+    const service = createTestMemoryService(store, { layeredService, legacyCompatibility: false });
+
+    await service.ingestTurn({
+      eventId: "online-1",
+      sessionId: "online-session",
+      role: "user",
+      content: "我更喜欢 TypeScript 处理长期项目",
+      ...scope
+    });
+    await service.ingestTurn({
+      eventId: "online-2",
+      sessionId: "online-session",
+      role: "assistant",
+      content: "已记录这个偏好",
+      ...scope
+    });
+
+    const topics = service.listL1Topics({ uid: scope.uid, agent: scope.agent, sessionId: "online-session" });
+    expect(store.listMemories({ uid: scope.uid })).toEqual([]);
+    expect(topics).toHaveLength(1);
+    expect(topics[0]).toMatchObject({
+      revision: { status: "provisional" },
+      sourceSegmentStatus: "partial"
+    });
+    expect(topics[0].revision.sourceTurnIds).toHaveLength(2);
+
+    const recall = await service.recallV2({ uid: scope.uid, agent: scope.agent, query: "TypeScript" });
+    expect(recall.results).toEqual(
+      expect.arrayContaining([expect.objectContaining({ level: "L1_TOPIC", stability: "provisional" })])
+    );
+  });
+
+  it("creates L3 Profiles only from canonical evidence spanning multiple sessions", async () => {
+    const store = new MemoryRepository(createDatabase(":memory:"));
+    const first = seedCanonicalComponent(store, "profile-session-1", "用户长期偏好 TypeScript");
+    const second = seedCanonicalComponent(store, "profile-session-2", "用户再次选择 TypeScript");
+    store.layered.upsertL2Checkpoint(
+      scope.uid,
+      scope.agent,
+      store.layered.getL1StableWatermark(scope.uid, scope.agent),
+      0,
+      "profile-test-l2"
+    );
+    const service = new LayeredMemoryService(store, {
+      l1Planner: { async plan() { return { items: [] }; } },
+      l2Planner: { async plan() { return { operations: [], desiredMemberships: [], retireAggregateIds: [] }; } },
+      l2Synthesizer: { async synthesize() { throw new Error("not used"); } },
+      profileExtractor: {
+        async extract() {
+          return [
+            {
+              profileKey: "preference:typescript",
+              category: "preference",
+              value: "TypeScript",
+              summary: "用户跨多个会话持续偏好 TypeScript",
+              evidenceComponentIds: [first.id, second.id],
+              evidenceAggregateIds: [],
+              confidence: 0.95,
+              reason: "repeated canonical evidence"
+            },
+            {
+              profileKey: "unstable:single-session",
+              category: "other",
+              value: "temporary",
+              summary: "仅单次出现",
+              evidenceComponentIds: [first.id],
+              evidenceAggregateIds: [],
+              confidence: 0.8,
+              reason: "single evidence"
+            }
+          ];
+        }
+      },
+      recallPlanner: {
+        async plan(input) {
+          return { shouldUseMemory: true, selectedIds: input.candidates.map((candidate) => candidate.id), reason: "test" };
+        }
+      }
+    });
+
+    expect(store.layered.listDueL3Namespaces()).toContainEqual({ uid: scope.uid, agent: scope.agent });
+    const build = await service.runL3ProfileBuild(scope.uid, scope.agent);
+    expect(build.createdOrUpdated).toHaveLength(1);
+    expect(build.createdOrUpdated[0]).toMatchObject({
+      level: "L3",
+      type: "profile",
+      object: "TypeScript",
+      metadata: {
+        canonicalProfile: true,
+        evidenceSessionIds: expect.arrayContaining(["profile-session-1", "profile-session-2"])
+      }
+    });
+    expect(build.rejected).toEqual([
+      expect.objectContaining({ profileKey: "unstable:single-session", reason: expect.stringContaining("two sessions") })
+    ]);
+    expect(store.layered.listDueL3Namespaces()).not.toContainEqual({ uid: scope.uid, agent: scope.agent });
+
+    const recall = await service.recall({ uid: scope.uid, agent: scope.agent, query: "TypeScript" });
+    expect(recall.results).toEqual(
+      expect.arrayContaining([expect.objectContaining({ level: "L3_PROFILE", stability: "stable" })])
+    );
+
+    const app = buildServer(createTestMemoryService(store, { layeredService: service, legacyCompatibility: false }));
+    const listed = await app.inject({
+      method: "GET",
+      url: `/v1/l3/profiles?uid=${scope.uid}&agent=${scope.agent}`
+    });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json().profiles).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ object: "TypeScript", metadata: expect.objectContaining({ canonicalProfile: true }) })
+      ])
+    );
+    const rerun = await app.inject({
+      method: "POST",
+      url: "/v1/jobs/l3-profile/run",
+      payload: { uid: scope.uid, agent: scope.agent }
+    });
+    expect(rerun.statusCode).toBe(200);
+    expect(rerun.json().createdOrUpdated).toHaveLength(1);
+  });
+
   it("supports an idempotent empty L2 checkpoint", async () => {
     const store = new MemoryRepository(createDatabase(":memory:"));
     const service = new LayeredMemoryService(store, {
@@ -854,19 +1010,19 @@ describe("v2 layered memory", () => {
   });
 });
 
-function seedCanonicalComponent(store: MemoryRepository) {
+function seedCanonicalComponent(store: MemoryRepository, sessionId = "session-1", content = "seed") {
   seedCounter += 1;
   const turn = store.createTurn({
     eventId: `seed-turn-${seedCounter}`,
-    sessionId: "session-1",
+    sessionId,
     role: "user",
-    content: "seed",
+    content,
     ...scope
   });
   const segment = store.createTopicSegment({
-    sessionId: "session-1",
-    title: "Seed",
-    summary: "Seed",
+    sessionId,
+    title: content,
+    summary: content,
     status: "complete",
     confidence: 1,
     turnIds: [turn.id],
@@ -883,7 +1039,7 @@ function seedCanonicalComponent(store: MemoryRepository) {
   });
   store.layered.runL1Maintenance(
     scope,
-    "session-1",
+    sessionId,
     new Date().toISOString(),
     {
       items: [
@@ -891,9 +1047,9 @@ function seedCanonicalComponent(store: MemoryRepository) {
           operation: "keep",
           sourceTopicIds: [provisional.topic.id],
           sourceTurnIds: [turn.id],
-          title: "Seed",
-          summary: "Seed",
-          components: [{ content: "Seed component", evidenceTurnIds: [turn.id], confidence: 1 }],
+          title: content,
+          summary: content,
+          components: [{ content, evidenceTurnIds: [turn.id], confidence: 1 }],
           reason: "seed",
           confidence: 1
         }
@@ -901,7 +1057,7 @@ function seedCanonicalComponent(store: MemoryRepository) {
     },
     { promptVersion: "test", schemaVersion: "v2" }
   );
-  return store.layered.listStableComponents(scope.uid, scope.agent)[0];
+  return store.layered.listStableComponents(scope.uid, scope.agent).at(-1)!;
 }
 
 function createTestMemoryService(store: MemoryStore, options: MemoryServiceOptions = {}) {
@@ -913,6 +1069,7 @@ function createTestMemoryService(store: MemoryStore, options: MemoryServiceOptio
     recallPlanner: {
       plan: () => ({ shouldUseMemory: false, selectedMemoryIds: [], reason: "test default" })
     },
+    legacyCompatibility: true,
     ...options
   });
 }

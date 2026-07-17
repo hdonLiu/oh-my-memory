@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import type { LlmCompletionClient } from "../domain/extractors.js";
 import { jaccard } from "../domain/text.js";
 import type {
+  CanonicalProfileDraft,
   GenerationProvenance,
   GovernanceFreshness,
   CorrectionRecord,
@@ -11,6 +12,7 @@ import type {
   L2AggregateContent,
   L2MembershipPlan,
   L2Statement,
+  Memory,
   StatementOperation,
   Scope,
   TopicSegment
@@ -57,13 +59,25 @@ export interface L2RevisionSynthesizer {
   }): Promise<{ content: L2AggregateContent; statementOperations?: StatementOperation[]; reason: string; confidence: number }>;
 }
 
+export interface CanonicalProfileExtractor {
+  extract(input: {
+    uid: string;
+    agent: string;
+    components: ReturnType<MemoryStore["layered"]["listStableComponents"]>;
+    componentSessions: Record<string, string>;
+    aggregates: L2AggregateView[];
+    existingProfiles: Memory[];
+  }): Promise<CanonicalProfileDraft[]>;
+}
+
 export interface LayeredRecallResult {
-  level: "L2" | "L1_COMPONENT" | "L1_TOPIC";
+  level: "L3_PROFILE" | "L2" | "L1_COMPONENT" | "L1_TOPIC";
   id: string;
   text: string;
   score: number;
   stability: "stable" | "provisional";
   evidence: {
+    aggregateIds: string[];
     componentIds: string[];
     topicRevisionIds: string[];
     turnIds: string[];
@@ -93,6 +107,7 @@ export interface LayeredMemoryServiceOptions {
   l2Planner: L2MembershipPlanner;
   l2Synthesizer: L2RevisionSynthesizer;
   recallPlanner: LayeredRecallPlanner;
+  profileExtractor?: CanonicalProfileExtractor;
   provenance?: Partial<GenerationProvenance>;
 }
 
@@ -111,7 +126,10 @@ export class LayeredMemoryService {
     run: ReturnType<MemoryStore["layered"]["runL1Maintenance"]>;
     topics: L1TopicView[];
   }> {
-    const topics = this.store.layered.listL1TopicViews({ ...scope, sessionId, includeInactive: true });
+    const allTopics = this.store.layered.listL1TopicViews({ ...scope, sessionId, includeInactive: true });
+    const topics = allTopics.filter(
+      (view) => view.revision.status !== "provisional" || view.sourceSegmentStatus === "complete"
+    );
     const turns = this.store.recentTurns({ ...scope, sessionId }, 10_000);
     const corrections = this.store.layered.listPendingL1CorrectionsForSession(scope, sessionId);
     const inputCutoff = turns.at(-1)?.createdAt ?? new Date().toISOString();
@@ -205,6 +223,128 @@ export class LayeredMemoryService {
     return { run, aggregates: this.store.layered.listL2AggregateViews(uid, agent, true) };
   }
 
+  async runL3ProfileBuild(uid: string, agent: string): Promise<{
+    createdOrUpdated: Memory[];
+    rejected: Array<{ profileKey: string; reason: string }>;
+  }> {
+    const extractor = this.options.profileExtractor;
+    if (!extractor) throw new Error("L3 profile extraction is not configured");
+
+    const components = this.store.layered.listStableComponents(uid, agent);
+    const componentsById = new Map(components.map((component) => [component.id, component]));
+    const aggregates = this.store.layered.listL2AggregateViews(uid, agent);
+    const aggregatesById = new Map(aggregates.map((view) => [view.aggregate.id, view]));
+    const topicRevisionSessions = new Map(
+      this.store.layered
+        .listL1TopicViews({ uid, agent, includeInactive: true })
+        .map((view) => [view.revision.id, view.topic.sessionId])
+    );
+    const componentSessions = Object.fromEntries(
+      components
+        .map((component) => [component.id, topicRevisionSessions.get(component.topicRevisionId)] as const)
+        .filter((entry): entry is readonly [string, string] => Boolean(entry[1]))
+    );
+    const existingProfiles = this.store
+      .listMemories({ uid, agent })
+      .filter(
+        (memory) =>
+          memory.level === "L3" &&
+          memory.type === "profile" &&
+          memory.status === "active" &&
+          memory.metadata.canonicalProfile === true
+      );
+    const drafts = await extractor.extract({ uid, agent, components, componentSessions, aggregates, existingProfiles });
+    const createdOrUpdated: Memory[] = [];
+    const rejected: Array<{ profileKey: string; reason: string }> = [];
+    const profilesByKey = new Map(existingProfiles.map((profile) => [profile.metadata.profileKey, profile]));
+    const freshness = this.store.layered.getGovernanceFreshness(uid, agent);
+    const sourceL1Watermark = this.store.layered.getL1StableWatermark(uid, agent);
+
+    for (const draft of drafts) {
+      const unknownComponents = draft.evidenceComponentIds.filter((id) => !componentsById.has(id));
+      const unknownAggregates = draft.evidenceAggregateIds.filter((id) => !aggregatesById.has(id));
+      if (unknownComponents.length || unknownAggregates.length) {
+        rejected.push({ profileKey: draft.profileKey, reason: "profile references non-canonical evidence" });
+        continue;
+      }
+      const aggregateComponentIds = draft.evidenceAggregateIds.flatMap(
+        (id) => aggregatesById.get(id)?.componentIds ?? []
+      );
+      if (aggregateComponentIds.some((id) => !componentsById.has(id))) {
+        rejected.push({ profileKey: draft.profileKey, reason: "profile Aggregate contains non-canonical evidence" });
+        continue;
+      }
+      const evidenceComponentIds = unique([...draft.evidenceComponentIds, ...aggregateComponentIds]);
+      const evidenceComponents = evidenceComponentIds
+        .map((id) => componentsById.get(id))
+        .filter((component): component is NonNullable<typeof component> => Boolean(component));
+      const evidenceSessionIds = unique(
+        evidenceComponents
+          .map((component) => topicRevisionSessions.get(component.topicRevisionId))
+          .filter((sessionId): sessionId is string => Boolean(sessionId))
+      );
+      if (evidenceSessionIds.length < 2) {
+        rejected.push({ profileKey: draft.profileKey, reason: "profile requires canonical evidence from at least two sessions" });
+        continue;
+      }
+
+      const sourceTurnIds = unique(evidenceComponents.flatMap((component) => component.evidenceTurnIds));
+      const evidenceAggregates = draft.evidenceAggregateIds
+        .map((id) => aggregatesById.get(id))
+        .filter((view): view is NonNullable<typeof view> => Boolean(view));
+      const evidenceCorrectionIds = unique([
+        ...evidenceComponents.flatMap((component) => component.evidenceCorrectionIds),
+        ...evidenceAggregates.flatMap((view) => [
+          ...view.revision.facts,
+          ...view.revision.decisions,
+          ...view.revision.constraints,
+          ...view.revision.openQuestions
+        ]).flatMap((statement) => statement.evidenceCorrectionIds ?? [])
+      ]);
+      const metadata = {
+        canonicalProfile: true,
+        profileKey: draft.profileKey,
+        category: draft.category,
+        evidenceComponentIds,
+        evidenceAggregateIds: unique(draft.evidenceAggregateIds),
+        evidenceSessionIds,
+        evidenceCorrectionIds,
+        sourceTopicRevisionIds: unique(evidenceComponents.map((component) => component.topicRevisionId)),
+        sourceL1Watermark,
+        sourceGovernanceWatermark: freshness.appliedGovernanceSequence,
+        reason: draft.reason
+      };
+      const existing = profilesByKey.get(draft.profileKey);
+      const input = {
+        level: "L3" as const,
+        type: "profile" as const,
+        subject: "user",
+        predicate: draft.category,
+        object: draft.value,
+        summary: draft.summary,
+        confidence: draft.confidence,
+        status: "active" as const,
+        supersedesId: null,
+        sourceTurnIds,
+        uid,
+        source: "canonical",
+        agent,
+        channel: "profile",
+        metadata
+      };
+      const profile = existing ? this.store.updateMemory(existing.id, input) : this.store.createMemory(input);
+      createdOrUpdated.push(profile);
+      profilesByKey.set(draft.profileKey, profile);
+    }
+    this.store.layered.upsertL3ProfileCheckpoint(
+      uid,
+      agent,
+      sourceL1Watermark,
+      freshness.appliedGovernanceSequence
+    );
+    return { createdOrUpdated, rejected };
+  }
+
   async recall(input: { uid: string; agent: string; query: string; limit?: number; sessionId?: string; includeProvisional?: boolean }): Promise<{
     usagePolicy: "reference_only";
     shouldUseMemory: boolean;
@@ -218,19 +358,64 @@ export class LayeredMemoryService {
     const freshness = this.store.layered.getGovernanceFreshness(input.uid, input.agent);
     const results: LayeredRecallResult[] = [];
 
+    for (const profile of this.store.listMemories({ uid: input.uid, agent: input.agent }).filter(
+      (memory) =>
+        memory.level === "L3" &&
+        memory.type === "profile" &&
+        memory.status === "active" &&
+        memory.metadata.canonicalProfile === true
+    )) {
+      const relevance = scoreText(input.query, profile.readableText);
+      if (relevance <= 0) continue;
+      const score = relevance + 0.6;
+      const componentIds = toStringArray(profile.metadata.evidenceComponentIds);
+      const evidenceComponents = componentIds
+        .map((id) => componentsById.get(id))
+        .filter((component): component is NonNullable<typeof component> => Boolean(component));
+      const evidenceCorrectionIds = unique([
+        ...toStringArray(profile.metadata.evidenceCorrectionIds),
+        ...evidenceComponents.flatMap((component) => component.evidenceCorrectionIds)
+      ]);
+      results.push({
+        level: "L3_PROFILE",
+        id: profile.id,
+        text: profile.readableText,
+        score,
+        stability: "stable",
+        evidence: {
+          aggregateIds: toStringArray(profile.metadata.evidenceAggregateIds),
+          componentIds,
+          topicRevisionIds: toStringArray(profile.metadata.sourceTopicRevisionIds),
+          turnIds: profile.sourceTurnIds
+        },
+        evidenceAuthority: evidenceCorrectionIds.length > 0 ? "human_correction" : "conversation",
+        evidenceCorrectionIds,
+        statementIds: [],
+        statementStatuses: [],
+        statementConflicts: [],
+        sourceL1Watermark: toOptionalNumber(profile.metadata.sourceL1Watermark),
+        sourceGovernanceWatermark: toOptionalNumber(profile.metadata.sourceGovernanceWatermark)
+      });
+    }
+
     for (const view of this.store.layered.listL2AggregateViews(input.uid, input.agent)) {
-      const text = [view.revision.canonicalTitle, view.revision.summary].join("\n");
-      const score = scoreText(input.query, text) + 0.4;
-      if (score <= 0) continue;
-      const components = view.componentIds.map((id) => componentsById.get(id)).filter((value): value is NonNullable<typeof value> => Boolean(value));
-      const topicRevisionIds = unique(components.map((component) => component.topicRevisionId));
-      const turnIds = unique(components.flatMap((component) => component.evidenceTurnIds));
       const statements = [
         ...view.revision.facts,
         ...view.revision.decisions,
         ...view.revision.constraints,
         ...view.revision.openQuestions
       ];
+      const text = [
+        view.revision.canonicalTitle,
+        view.revision.summary,
+        ...statements.map((statement) => statement.content)
+      ].join("\n");
+      const relevance = scoreText(input.query, text);
+      if (relevance <= 0) continue;
+      const score = relevance + 0.4;
+      const components = view.componentIds.map((id) => componentsById.get(id)).filter((value): value is NonNullable<typeof value> => Boolean(value));
+      const topicRevisionIds = unique(components.map((component) => component.topicRevisionId));
+      const turnIds = unique(components.flatMap((component) => component.evidenceTurnIds));
       const evidenceCorrectionIds = unique(statements.flatMap((statement) => statement.evidenceCorrectionIds ?? []));
       const statementIds = statements.map((statement) => statement.id).filter((id): id is string => Boolean(id));
       const statementStatuses = unique(statements.map((statement) => statement.status ?? "supported")) as Array<"supported" | "contested">;
@@ -243,7 +428,7 @@ export class LayeredMemoryService {
         text,
         score,
         stability: "stable",
-        evidence: { componentIds: view.componentIds, topicRevisionIds, turnIds },
+        evidence: { aggregateIds: [view.aggregate.id], componentIds: view.componentIds, topicRevisionIds, turnIds },
         evidenceAuthority: evidenceCorrectionIds.length > 0 || statements.some((statement) => statement.evidenceAuthority === "human_correction")
           ? "human_correction"
           : "conversation",
@@ -257,8 +442,9 @@ export class LayeredMemoryService {
     }
 
     for (const component of stableComponents) {
-      const score = scoreText(input.query, component.content) + 0.2;
-      if (score <= 0) continue;
+      const relevance = scoreText(input.query, component.content);
+      if (relevance <= 0) continue;
+      const score = relevance + 0.2;
       results.push({
         level: "L1_COMPONENT",
         id: component.id,
@@ -266,6 +452,7 @@ export class LayeredMemoryService {
         score,
         stability: "stable",
         evidence: {
+          aggregateIds: [],
           componentIds: [component.id],
           topicRevisionIds: [component.topicRevisionId],
           turnIds: component.evidenceTurnIds
@@ -279,8 +466,12 @@ export class LayeredMemoryService {
       });
     }
 
-    if (input.includeProvisional && input.sessionId) {
-      const topics = this.store.layered.listL1TopicViews({ uid: input.uid, agent: input.agent, sessionId: input.sessionId });
+    if (input.includeProvisional ?? true) {
+      const topics = this.store.layered.listL1TopicViews({
+        uid: input.uid,
+        agent: input.agent,
+        sessionId: input.sessionId
+      });
       for (const view of topics.filter((value) => value.revision.status === "provisional")) {
         const score = scoreText(input.query, `${view.revision.title}\n${view.revision.summary}`);
         if (score <= 0) continue;
@@ -290,7 +481,12 @@ export class LayeredMemoryService {
           text: `${view.revision.title}\n${view.revision.summary}`,
           score,
           stability: "provisional",
-          evidence: { componentIds: [], topicRevisionIds: [view.revision.id], turnIds: view.revision.sourceTurnIds },
+          evidence: {
+            aggregateIds: [],
+            componentIds: [],
+            topicRevisionIds: [view.revision.id],
+            turnIds: view.revision.sourceTurnIds
+          },
           evidenceAuthority: "conversation",
           evidenceCorrectionIds: [],
           statementIds: [],
@@ -424,6 +620,17 @@ const l2ContentSchema = z.object({
   openQuestions: z.array(statementSchema)
 });
 
+const canonicalProfileSchema = z.object({
+  profileKey: z.string().min(1),
+  category: z.enum(["preference", "identity", "habit", "constraint", "relationship", "other"]),
+  value: z.string().min(1),
+  summary: z.string().min(1),
+  evidenceComponentIds: z.array(z.string()).default([]),
+  evidenceAggregateIds: z.array(z.string()).default([]),
+  confidence: z.number().min(0).max(1),
+  reason: z.string().min(1)
+}) as z.ZodType<CanonicalProfileDraft>;
+
 export class LlmL1MaintenancePlanner implements L1MaintenancePlanner {
   constructor(private readonly client: LlmCompletionClient) {}
   async plan(input: Parameters<L1MaintenancePlanner["plan"]>[0]): Promise<L1MaintenancePlan> {
@@ -523,6 +730,45 @@ export class LlmL2RevisionSynthesizer implements L2RevisionSynthesizer {
   }
 }
 
+export class LlmCanonicalProfileExtractor implements CanonicalProfileExtractor {
+  constructor(private readonly client: LlmCompletionClient) {}
+
+  async extract(input: Parameters<CanonicalProfileExtractor["extract"]>[0]): Promise<CanonicalProfileDraft[]> {
+    const schema = z.object({ profiles: z.array(canonicalProfileSchema) });
+    const parsed = parseJson(
+      await this.client.complete(
+        JSON.stringify({
+          task: "Extract only cross-session stable L3 user profiles from canonical L1/L2 evidence. Return JSON only.",
+          rules: [
+            "Use only supplied canonical Component and active Aggregate ids.",
+            "A profile must be supported across at least two distinct sessions; the server validates this strictly.",
+            "Do not promote temporary tasks, one-off project state, or unresolved questions.",
+            "Use a stable profileKey so repeated builds update the same profile.",
+            "Prefer durable preferences, identity, habits, constraints, and relationships."
+          ],
+          uid: input.uid,
+          agent: input.agent,
+          components: input.components,
+          componentSessions: input.componentSessions,
+          aggregates: input.aggregates,
+          existingProfiles: input.existingProfiles.map((profile) => ({
+            id: profile.id,
+            profileKey: profile.metadata.profileKey,
+            category: profile.metadata.category,
+            value: profile.object,
+            summary: profile.summary
+          })),
+          responseSchema:
+            "{profiles:[{profileKey,category,value,summary,evidenceComponentIds,evidenceAggregateIds,confidence,reason}]}"
+        })
+      ),
+      schema,
+      "L3 profile extraction"
+    );
+    return parsed.profiles;
+  }
+}
+
 export class LlmLayeredRecallPlanner implements LayeredRecallPlanner {
   constructor(private readonly client: LlmCompletionClient) {}
   async plan(input: { query: string; candidates: LayeredRecallResult[] }): Promise<{
@@ -584,6 +830,14 @@ function diversify(results: LayeredRecallResult[]): LayeredRecallResult[] {
 
 function unique(values: string[]): string[] {
   return Array.from(new Set(values));
+}
+
+function toStringArray(value: unknown): string[] {
+  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+}
+
+function toOptionalNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? value : undefined;
 }
 
 function snapshotDigest(value: unknown): string {

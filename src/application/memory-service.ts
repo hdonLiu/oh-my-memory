@@ -41,6 +41,7 @@ import type { MemoryStore } from "../storage/store.js";
 import { loadTopicWindowConfig } from "./topic-config.js";
 import {
   LayeredMemoryService,
+  LlmCanonicalProfileExtractor,
   LlmL1MaintenancePlanner,
   LlmL2MembershipPlanner,
   LlmL2RevisionSynthesizer,
@@ -84,6 +85,8 @@ export interface MemoryService {
   listL2Aggregates(uid: string, agent: string, includeInactive?: boolean): ReturnType<MemoryStore["layered"]["listL2AggregateViews"]>;
   runL2Aggregation(uid: string, agent: string, watermark?: number): ReturnType<LayeredMemoryService["runL2Aggregation"]>;
   listL2AggregationRuns(limit?: number): ReturnType<MemoryStore["layered"]["listL2AggregationRuns"]>;
+  listL3Profiles(uid: string, agent: string): { profiles: Memory[] };
+  runL3ProfileBuild(uid: string, agent: string): ReturnType<LayeredMemoryService["runL3ProfileBuild"]>;
   createCorrection(input: CreateCorrectionInput): { correction: CorrectionRecord };
   getCorrection(uid: string, agent: string, id: string): { correction: CorrectionRecord | null };
   listCorrections(filter: {
@@ -95,6 +98,7 @@ export interface MemoryService {
   listPendingL1CorrectionSessions(): Array<{ scope: Scope; sessionId: string }>;
   listReadyL2CorrectionNamespaces(): Array<{ uid: string; agent: string }>;
   listDueL2Namespaces(): Array<{ uid: string; agent: string }>;
+  listDueL3Namespaces(): Array<{ uid: string; agent: string }>;
   recallV2(input: { uid: string; agent: string; query: string; limit?: number; sessionId?: string; includeProvisional?: boolean }): Promise<{
     usagePolicy: "reference_only";
     shouldUseMemory: boolean;
@@ -113,6 +117,7 @@ export interface MemoryServiceOptions {
   embeddingIndex?: EmbeddingIndex;
   recallPlanner?: MemoryRecallPlanner;
   layeredService?: LayeredMemoryService;
+  legacyCompatibility?: boolean;
 }
 
 export function createRuntimeMemoryService(
@@ -139,17 +144,21 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
   const embeddingIndex = options.embeddingIndex;
   const recallPlanner = options.recallPlanner ?? createDefaultRecallPlanner();
   const layeredService = options.layeredService ?? (isLlmConfigured() ? createDefaultLayeredService(store) : undefined);
+  const legacyCompatibility = options.legacyCompatibility ?? false;
 
   return {
     async ingestTurn(input) {
       const turn = store.createTurn(input);
       const scope = toScope(input);
       const topic = await topicBuilder.build(store, scope, turn.sessionId);
+      if (topic) appendProvisionalTopic(store, layeredService, topic);
       if (!topic || topic.status !== "complete") {
         return { turn, topic, memories: [] };
       }
+      if (!legacyCompatibility) {
+        return { turn, topic, memories: [] };
+      }
       const topicMemory = store.createMemory(topicToDraftFromSegment(topic));
-      appendProvisionalTopic(store, layeredService, topic);
       const memories = [topicMemory];
       if (embeddingProvider && embeddingIndex) {
         await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
@@ -159,11 +168,14 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
 
     async flushSessionTopic(scope, sessionId) {
       const topic = await topicBuilder.flush(store, scope, sessionId);
+      if (topic) appendProvisionalTopic(store, layeredService, topic);
       if (!topic || topic.status !== "complete") {
         return { topic, memories: [] };
       }
+      if (!legacyCompatibility) {
+        return { topic, memories: [] };
+      }
       const topicMemory = store.createMemory(topicToDraftFromSegment(topic));
-      appendProvisionalTopic(store, layeredService, topic);
       const memories = [topicMemory];
       if (embeddingProvider && embeddingIndex) {
         await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
@@ -223,6 +235,9 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
     },
 
     runDreaming(scope) {
+      if (!legacyCompatibility) {
+        return requireLayeredService(layeredService).runL3ProfileBuild(scope.uid, scope.agent);
+      }
       return compressor.compress(store, scope);
     },
 
@@ -268,6 +283,24 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
       return store.layered.listL2AggregationRuns(limit);
     },
 
+    listL3Profiles(uid, agent) {
+      return {
+        profiles: store
+          .listMemories({ uid, agent })
+          .filter(
+            (memory) =>
+              memory.level === "L3" &&
+              memory.type === "profile" &&
+              memory.status === "active" &&
+              memory.metadata.canonicalProfile === true
+          )
+      };
+    },
+
+    runL3ProfileBuild(uid, agent) {
+      return requireLayeredService(layeredService).runL3ProfileBuild(uid, agent);
+    },
+
     createCorrection(input) {
       return { correction: store.layered.createCorrection(input) };
     },
@@ -290,6 +323,10 @@ export function createMemoryService(store: MemoryStore, options: MemoryServiceOp
 
     listDueL2Namespaces() {
       return store.layered.listDueL2Namespaces();
+    },
+
+    listDueL3Namespaces() {
+      return store.layered.listDueL3Namespaces();
     },
 
     recallV2(input) {
@@ -436,6 +473,7 @@ function createDefaultLayeredService(store: MemoryStore): LayeredMemoryService {
     l2Planner: new LlmL2MembershipPlanner(client),
     l2Synthesizer: new LlmL2RevisionSynthesizer(client),
     recallPlanner: new LlmLayeredRecallPlanner(client),
+    profileExtractor: new LlmCanonicalProfileExtractor(client),
     provenance: {
       provider: "openai-compatible",
       model: process.env.LLM_MODEL,

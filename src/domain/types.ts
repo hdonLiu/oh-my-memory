@@ -313,6 +313,19 @@ export interface L2AggregationRun {
   endedAt: string | null;
 }
 
+export type ProfileCategory = "preference" | "identity" | "habit" | "constraint" | "relationship" | "other";
+
+export interface CanonicalProfileDraft {
+  profileKey: string;
+  category: ProfileCategory;
+  value: string;
+  summary: string;
+  evidenceComponentIds: string[];
+  evidenceAggregateIds: string[];
+  confidence: number;
+  reason: string;
+}
+
 export interface Memory extends Scope {
   id: string;
   level: MemoryLevel;

@@ -404,6 +404,15 @@ function ensureGovernanceSchema(db: Database.Database): void {
       updated_at text not null,
       primary key(uid, agent)
     );
+
+    create table if not exists l3_profile_checkpoints (
+      uid text not null,
+      agent text not null,
+      l1_stable_watermark integer not null,
+      governance_watermark integer not null,
+      updated_at text not null,
+      primary key(uid, agent)
+    );
   `);
 }
 

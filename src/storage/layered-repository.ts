@@ -24,13 +24,15 @@ import type {
   StatementLineageEdge,
   StatementOperation,
   Scope,
-  TopicSegment
+  TopicSegment,
+  TopicStatus
 } from "../domain/types.js";
 
 export interface L1TopicView {
   topic: L1Topic;
   revision: L1TopicRevision;
   components: L1Component[];
+  sourceSegmentStatus: TopicStatus | null;
 }
 
 export interface L2AggregateView {
@@ -64,6 +66,34 @@ export class LayeredMemoryRepository {
     if (existing) {
       const view = this.getL1TopicView(existing.topic_id);
       if (!view) throw new Error(`L1 topic missing for source segment: ${segment.id}`);
+      if (view.revision.status === "provisional") {
+        const updatedAt = now();
+        this.db.transaction(() => {
+          this.db
+            .prepare(
+              `update l1_topic_revisions set
+                title = ?, summary = ?, source_turn_ids = ?, provider = ?, model = ?, prompt_version = ?,
+                schema_version = ?, reason = ?, confidence = ?
+               where id = ? and status = 'provisional'`
+            )
+            .run(
+              segment.title,
+              segment.summary,
+              JSON.stringify(segment.turnIds),
+              provenance.provider ?? null,
+              provenance.model ?? null,
+              provenance.promptVersion,
+              provenance.schemaVersion,
+              provenance.reason,
+              provenance.confidence,
+              view.revision.id
+            );
+          this.db
+            .prepare("update l1_topics set metadata = ?, updated_at = ? where id = ?")
+            .run(JSON.stringify(segment.metadata), updatedAt, view.topic.id);
+        })();
+        return this.getL1TopicView(view.topic.id)!;
+      }
       return view;
     }
 
@@ -129,7 +159,17 @@ export class LayeredMemoryRepository {
     const topic = mapL1Topic(row);
     const revision = this.getL1Revision(topic.currentRevisionId);
     if (!revision) return null;
-    return { topic, revision, components: this.listL1Components(revision.id) };
+    const sourceSegment = revision.sourceSegmentId
+      ? (this.db.prepare("select status from topic_segments where id = ?").get(revision.sourceSegmentId) as
+          | { status: TopicStatus }
+          | undefined)
+      : undefined;
+    return {
+      topic,
+      revision,
+      components: this.listL1Components(revision.id),
+      sourceSegmentStatus: sourceSegment?.status ?? null
+    };
   }
 
   getL1Revision(revisionId: string): L1TopicRevision | null {
@@ -357,6 +397,43 @@ export class LayeredMemoryRepository {
     for (const row of stableRows) byKey.set(`${row.uid}\0${row.agent}`, row);
     for (const row of this.listReadyL2CorrectionNamespaces()) byKey.set(`${row.uid}\0${row.agent}`, row);
     return Array.from(byKey.values());
+  }
+
+  listDueL3Namespaces(): Array<{ uid: string; agent: string }> {
+    return this.db
+      .prepare(
+        `select s.uid, s.agent
+         from l1_stable_sequence s
+         left join l2_checkpoints l2 on l2.uid = s.uid and l2.agent = s.agent
+         left join l3_profile_checkpoints l3 on l3.uid = s.uid and l3.agent = s.agent
+         group by s.uid, s.agent
+         having coalesce(l2.l1_stable_watermark, 0) >= max(s.sequence)
+            and (
+              max(s.sequence) > coalesce(l3.l1_stable_watermark, 0)
+              or coalesce(l2.governance_watermark, 0) > coalesce(l3.governance_watermark, 0)
+            )
+         order by max(s.sequence) asc`
+      )
+      .all() as Array<{ uid: string; agent: string }>;
+  }
+
+  upsertL3ProfileCheckpoint(
+    uid: string,
+    agent: string,
+    l1StableWatermark: number,
+    governanceWatermark: number
+  ): void {
+    this.db
+      .prepare(
+        `insert into l3_profile_checkpoints
+         (uid, agent, l1_stable_watermark, governance_watermark, updated_at)
+         values (?, ?, ?, ?, ?)
+         on conflict(uid, agent) do update set
+           l1_stable_watermark = excluded.l1_stable_watermark,
+           governance_watermark = excluded.governance_watermark,
+           updated_at = excluded.updated_at`
+      )
+      .run(uid, agent, l1StableWatermark, governanceWatermark, now());
   }
 
   listPendingL1CorrectionsForSession(scope: Scope, sessionId: string): CorrectionRecord[] {

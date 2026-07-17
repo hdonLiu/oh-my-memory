@@ -21,7 +21,14 @@ export async function runCli(argv: string[]): Promise<CliResult> {
       const service = createMemoryService(new SqliteMemoryStore(createDatabase(dbPath)));
       const result = await service.ingestTurn(input);
       const flushed = await service.flushSessionTopic(toScope(input), input.sessionId);
-      return ok({ turn: result.turn, memories: flushed.memories });
+      const provisionalL1 = service.listL1Topics({
+        uid: input.uid,
+        source: input.source,
+        agent: input.agent,
+        channel: input.channel,
+        sessionId: input.sessionId
+      });
+      return ok({ turn: result.turn, topic: flushed.topic, provisionalL1, memories: flushed.memories });
     }
 
     if (command === "import") {

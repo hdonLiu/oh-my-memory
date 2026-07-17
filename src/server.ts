@@ -68,6 +68,11 @@ const l2RunSchema = z.object({
   watermark: z.number().int().nonnegative().optional()
 });
 
+const canonicalNamespaceSchema = z.object({
+  uid: z.string().min(1),
+  agent: z.string().min(1)
+});
+
 const correctionCreateSchema = z.object({
   eventId: z.string().min(1),
   uid: z.string().min(1),
@@ -290,6 +295,18 @@ export function buildServer(storage: Database.Database | MemoryStore | MemorySer
     const parsed = projectRunQuerySchema.safeParse(request.query);
     if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
     return { runs: service.listL2AggregationRuns(parsed.data.limit) };
+  });
+
+  app.get("/v1/l3/profiles", async (request, reply) => {
+    const parsed = canonicalNamespaceSchema.safeParse(request.query);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+    return service.listL3Profiles(parsed.data.uid, parsed.data.agent);
+  });
+
+  app.post("/v1/jobs/l3-profile/run", async (request, reply) => {
+    const parsed = canonicalNamespaceSchema.safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send({ error: parsed.error.flatten() });
+    return service.runL3ProfileBuild(parsed.data.uid, parsed.data.agent);
   });
 
   app.post("/v1/corrections", async (request, reply) => {

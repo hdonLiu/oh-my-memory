@@ -69,6 +69,7 @@ function createTestMemoryService(store: MemoryStore, options: MemoryServiceOptio
     recallPlanner: {
       plan: () => ({ shouldUseMemory: false, selectedMemoryIds: [], reason: "test default" })
     },
+    legacyCompatibility: true,
     ...options
   });
 }
@@ -664,7 +665,7 @@ describe("embedding abstraction", () => {
 });
 
 describe("runtime service wiring", () => {
-  it("attaches SQLite vector search when embedding environment is configured", async () => {
+  it("keeps the canonical online path in provisional L1 without legacy vectors", async () => {
     const previousEnv = {
       baseUrl: process.env.EMBEDDING_BASE_URL,
       apiKey: process.env.EMBEDDING_API_KEY,
@@ -706,8 +707,16 @@ describe("runtime service wiring", () => {
       const flushed = await service.flushSessionTopic(scope, "s1");
       const rows = db.prepare("select id from memory_vectors").all();
 
-      expect(flushed.memories).toHaveLength(1);
-      expect(rows).toEqual([{ id: flushed.memories[0].id }]);
+      expect(flushed.memories).toEqual([]);
+      expect(rows).toEqual([]);
+      expect(service.listL1Topics({ uid: scope.uid, agent: scope.agent, sessionId: "s1" })).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            revision: expect.objectContaining({ status: "provisional", summary: "项目 A 使用 PostgreSQL" }),
+            sourceSegmentStatus: "complete"
+          })
+        ])
+      );
     } finally {
       globalThis.fetch = previousFetch;
       if (previousEnv.baseUrl === undefined) delete process.env.EMBEDDING_BASE_URL;
@@ -1578,7 +1587,12 @@ describe("cli ingestion", () => {
       expect(imported.stdout).toContain('"failed":1');
 
       const store = new SqliteMemoryStore(createDatabase(dbPath));
-      expect(store.listMemories({ uid: "u1" }).some((memory) => memory.object.includes("PostgreSQL"))).toBe(true);
+      expect(store.listMemories({ uid: "u1" })).toEqual([]);
+      expect(
+        store.layered
+          .listL1TopicViews({ uid: "u1", agent: "demo" })
+          .some((view) => view.revision.summary.includes("PostgreSQL"))
+      ).toBe(true);
     } finally {
       globalThis.fetch = previousFetch;
       if (previousEnv.baseUrl === undefined) delete process.env.LLM_BASE_URL;
