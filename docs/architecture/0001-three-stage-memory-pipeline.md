@@ -1,8 +1,12 @@
 # ADR-0001: Three-Stage Memory Pipeline
 
-Status: Accepted
+Status: Superseded historical ADR
 
 Date: 2026-06-29
+
+Superseded by: [`MEMORY_ARCHITECTURE.md`](../../MEMORY_ARCHITECTURE.md)
+
+The retained decision to separate lightweight real-time work from offline semantic maintenance still applies. The old representation of online L1 Topics and offline Canonical L1 as separate stage entities does not: both now operate on one revisioned Topic model.
 
 Incorporated by: [oh-my-memory Architecture v2](./oh-my-memory-architecture-v2.md)
 

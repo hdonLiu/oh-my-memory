@@ -1,23 +1,25 @@
-import { buildServer } from "./server.js";
+import { startRebuildScheduler } from "./application/scheduler.js";
 import { createRuntimeMemoryService } from "./application/memory-service.js";
-import { startLayeredSchedulers } from "./application/layered-scheduler.js";
+import { buildServer } from "./server.js";
 import { createDatabase } from "./storage/database.js";
 import { MemoryRepository } from "./storage/repositories.js";
 
 const port = Number(process.env.PORT ?? 3000);
 const db = createDatabase();
-const store = new MemoryRepository(db);
-const service = createRuntimeMemoryService(store, {}, db);
+const repository = new MemoryRepository(db);
+const service = createRuntimeMemoryService(repository);
 const app = buildServer(service);
+const scheduler = startRebuildScheduler(service, repository);
 
-const scheduler = startLayeredSchedulers(service);
-
-await app.listen({ port, host: "0.0.0.0" });
-console.log(`oh-my-memory listening on http://localhost:${port}`);
+await app.listen({ port, host: process.env.HOST ?? "127.0.0.1" });
+console.log(`oh-my-memory listening on http://${process.env.HOST ?? "127.0.0.1"}:${port}`);
 
 for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.once(signal, () => {
     scheduler.stop();
-    void app.close().finally(() => process.exit(0));
+    void app.close().finally(() => {
+      db.close();
+      process.exit(0);
+    });
   });
 }

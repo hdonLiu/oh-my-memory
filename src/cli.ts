@@ -1,182 +1,113 @@
 #!/usr/bin/env node
 import { readFileSync } from "node:fs";
-import { createMemoryService } from "./application/memory-service.js";
-import type { CreateTurnInput, Role } from "./domain/types.js";
+import { z } from "zod";
+import { createRuntimeMemoryService } from "./application/memory-service.js";
 import { createDatabase } from "./storage/database.js";
-import { SqliteMemoryStore } from "./storage/sqlite-store.js";
+import { MemoryRepository } from "./storage/repositories.js";
 
-export interface CliResult {
-  exitCode: number;
-  stdout: string;
-  stderr: string;
-}
+const turnSchema = z.object({
+  uid: z.string().min(1),
+  agentId: z.string().min(1),
+  externalSessionId: z.string().min(1),
+  eventId: z.string().min(1),
+  source: z.string().min(1),
+  channel: z.string().min(1).nullable().optional(),
+  role: z.enum(["user", "assistant", "system"]),
+  content: z.string().min(1),
+  metadata: z.record(z.unknown()).default({})
+});
+
+export interface CliResult { exitCode: number; stdout: string; stderr: string }
 
 export async function runCli(argv: string[]): Promise<CliResult> {
+  let db: ReturnType<typeof createDatabase> | undefined;
   try {
     const [command, ...args] = argv;
+    const options = parseOptions(args);
+    db = createDatabase(value(options, "db") ?? process.env.MEMORY_DB_PATH ?? "memory.sqlite");
+    const service = createRuntimeMemoryService(new MemoryRepository(db));
+
     if (command === "ingest") {
-      const parsed = parseOptions(args);
-      const dbPath = getOption(parsed, "db") ?? process.env.MEMORY_DB_PATH ?? "memory.sqlite";
-      const input = turnFromOptions(parsed);
-      const service = createMemoryService(new SqliteMemoryStore(createDatabase(dbPath)));
-      const result = await service.ingestTurn(input);
-      const flushed = await service.flushSessionTopic(toScope(input), input.sessionId);
-      return ok({ turn: result.turn, memories: flushed.memories });
+      return ok(await service.ingestTurn(turnFromOptions(options)));
     }
-
     if (command === "import") {
-      const parsed = parseOptions(args);
-      const dbPath = getOption(parsed, "db") ?? process.env.MEMORY_DB_PATH ?? "memory.sqlite";
-      const file = parsed.positionals[0];
-      if (!file) {
-        return fail("import requires a JSON file path");
-      }
-      const records = JSON.parse(readFileSync(file, "utf8")) as unknown;
-      if (!Array.isArray(records)) {
-        return fail("import file must contain a JSON array");
-      }
-      const service = createMemoryService(new SqliteMemoryStore(createDatabase(dbPath)));
-      let success = 0;
-      const failures: Array<{ index: number; error: string }> = [];
-      const sessionsToFlush = new Map<string, CreateTurnInput>();
-      for (const [index, record] of records.entries()) {
-        try {
-          const input = validateTurn(record);
-          await service.ingestTurn(input);
-          sessionsToFlush.set(sessionFlushKey(input), input);
-          success += 1;
-        } catch (error) {
-          failures.push({ index, error: error instanceof Error ? error.message : "unknown error" });
-        }
-      }
-      for (const input of sessionsToFlush.values()) {
-        await service.flushSessionTopic(toScope(input), input.sessionId);
-      }
-      return {
-        exitCode: failures.length > 0 ? 1 : 0,
-        stdout: `${JSON.stringify({ success, failed: failures.length, failures })}\n`,
-        stderr: ""
-      };
+      const file = options.positionals[0];
+      if (!file) return fail("import requires a JSON file path");
+      const records = z.array(turnSchema).parse(JSON.parse(readFileSync(file, "utf8")));
+      const results = [];
+      for (const record of records) results.push(await service.ingestTurn(record));
+      return ok({ imported: results.length, results });
     }
-
-    return fail("usage: oh-my-memory ingest --content <text> ... | oh-my-memory import <file>");
+    if (command === "flush") {
+      return ok(service.flushSession(sessionIdentity(options)));
+    }
+    if (command === "topics") {
+      return ok(service.listTopics(sessionIdentity(options)));
+    }
+    if (command === "recall") {
+      return ok(await service.recall({
+        uid: required(options, "uid"),
+        agentId: required(options, "agent-id"),
+        query: required(options, "query"),
+        externalSessionId: value(options, "external-session-id")
+      }));
+    }
+    return fail(
+      "usage: oh-my-memory ingest|import|flush|topics|recall --uid <uid> --agent-id <agent> --external-session-id <session>"
+    );
   } catch (error) {
     return fail(error instanceof Error ? error.message : "unknown error");
+  } finally {
+    db?.close();
   }
-}
-
-function toScope(input: CreateTurnInput): Omit<CreateTurnInput, "sessionId" | "role" | "content"> {
-  return {
-    uid: input.uid,
-    source: input.source,
-    agent: input.agent,
-    channel: input.channel,
-    metadata: input.metadata
-  };
-}
-
-function sessionFlushKey(input: CreateTurnInput): string {
-  return [input.uid, input.source, input.agent, input.channel, input.sessionId].join("\0");
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
   const result = await runCli(process.argv.slice(2));
-  if (result.stdout) {
-    process.stdout.write(result.stdout);
-  }
-  if (result.stderr) {
-    process.stderr.write(result.stderr);
-  }
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
   process.exitCode = result.exitCode;
 }
 
-interface ParsedOptions {
-  values: Record<string, string>;
-  positionals: string[];
-}
+interface ParsedOptions { values: Record<string, string>; positionals: string[] }
 
 function parseOptions(args: string[]): ParsedOptions {
-  const values: Record<string, string> = {};
-  const positionals: string[] = [];
+  const parsed: ParsedOptions = { values: {}, positionals: [] };
   for (let index = 0; index < args.length; index += 1) {
-    const arg = args[index];
-    if (arg.startsWith("--")) {
-      const key = arg.slice(2);
-      const value = args[index + 1];
-      if (!value || value.startsWith("--")) {
-        throw new Error(`missing value for --${key}`);
-      }
-      values[key] = value;
-      index += 1;
-    } else {
-      positionals.push(arg);
-    }
+    const arg = args[index]!;
+    if (!arg.startsWith("--")) { parsed.positionals.push(arg); continue; }
+    const next = args[index + 1];
+    if (!next || next.startsWith("--")) throw new Error(`missing value for ${arg}`);
+    parsed.values[arg.slice(2)] = next;
+    index += 1;
   }
-  return { values, positionals };
+  return parsed;
 }
 
-function turnFromOptions(options: ParsedOptions): CreateTurnInput {
-  return validateTurn({
-    sessionId: getRequiredOption(options, "session-id"),
-    eventId: getOption(options, "event-id"),
-    role: getOption(options, "role") ?? "user",
-    content: getRequiredOption(options, "content"),
-    uid: getRequiredOption(options, "uid"),
-    source: getRequiredOption(options, "source"),
-    agent: getRequiredOption(options, "agent"),
-    channel: getRequiredOption(options, "channel"),
-    metadata: parseMetadata(getOption(options, "metadata"))
+function turnFromOptions(options: ParsedOptions) {
+  return turnSchema.parse({
+    ...sessionIdentity(options),
+    eventId: required(options, "event-id"),
+    source: required(options, "source"),
+    channel: value(options, "channel"),
+    role: value(options, "role") ?? "user",
+    content: required(options, "content"),
+    metadata: value(options, "metadata") ? JSON.parse(value(options, "metadata")!) : {}
   });
 }
 
-function validateTurn(value: unknown): CreateTurnInput {
-  const input = value as Partial<CreateTurnInput>;
-  if (!input.sessionId || !input.role || !input.content || !input.uid || !input.source || !input.agent || !input.channel) {
-    throw new Error("turn requires sessionId, role, content, uid, source, agent, and channel");
-  }
-  if (!["user", "assistant", "system"].includes(input.role)) {
-    throw new Error(`invalid role: ${input.role}`);
-  }
+function sessionIdentity(options: ParsedOptions) {
   return {
-    sessionId: input.sessionId,
-    eventId: input.eventId,
-    role: input.role as Role,
-    content: input.content,
-    uid: input.uid,
-    source: input.source,
-    agent: input.agent,
-    channel: input.channel,
-    metadata: input.metadata ?? {}
+    uid: required(options, "uid"),
+    agentId: required(options, "agent-id"),
+    externalSessionId: required(options, "external-session-id")
   };
 }
-
-function parseMetadata(raw: string | undefined): Record<string, unknown> {
-  if (!raw) {
-    return {};
-  }
-  const value = JSON.parse(raw) as unknown;
-  if (!value || typeof value !== "object" || Array.isArray(value)) {
-    throw new Error("--metadata must be a JSON object");
-  }
-  return value as Record<string, unknown>;
+function value(options: ParsedOptions, key: string): string | undefined { return options.values[key]; }
+function required(options: ParsedOptions, key: string): string {
+  const result = value(options, key);
+  if (!result) throw new Error(`missing required --${key}`);
+  return result;
 }
-
-function getOption(options: ParsedOptions, key: string): string | undefined {
-  return options.values[key];
-}
-
-function getRequiredOption(options: ParsedOptions, key: string): string {
-  const value = getOption(options, key);
-  if (!value) {
-    throw new Error(`missing required --${key}`);
-  }
-  return value;
-}
-
-function ok(value: unknown): CliResult {
-  return { exitCode: 0, stdout: `${JSON.stringify(value)}\n`, stderr: "" };
-}
-
-function fail(message: string): CliResult {
-  return { exitCode: 1, stdout: "", stderr: `${message}\n` };
-}
+function ok(value: unknown): CliResult { return { exitCode: 0, stdout: `${JSON.stringify(value)}\n`, stderr: "" }; }
+function fail(message: string): CliResult { return { exitCode: 1, stdout: "", stderr: `${message}\n` }; }

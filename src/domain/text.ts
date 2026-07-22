@@ -1,16 +1,22 @@
-export function tokenize(text: string): string[] {
-  return Array.from(new Set(text.toLowerCase().split(/[^\p{L}\p{N}]+/u).filter(Boolean)));
-}
+const LOW_INFORMATION_EXACT = new Set([
+  "你好",
+  "您好",
+  "嗨",
+  "hi",
+  "hello",
+  "谢谢",
+  "感谢",
+  "ok",
+  "okay",
+  "好的",
+  "嗯",
+  "嗯嗯"
+]);
 
-export function jaccard(a: string, b: string): number {
-  const left = tokenize(a);
-  const right = tokenize(b);
-  const union = new Set([...left, ...right]);
-  const intersection = left.filter((token) => right.includes(token));
-  return union.size === 0 ? 0 : intersection.length / union.size;
-}
-
-export function isNoise(content: string): boolean {
-  const trimmed = content.trim();
-  return ["你好", "谢谢", "好的", "ok", "OK"].includes(trimmed) || trimmed.length < 4;
+/**
+ * A deliberately narrow, exact-match guard. It is not a semantic classifier and
+ * must not grow into a replacement for embedding or LLM decisions.
+ */
+export function isHighPrecisionLowInformation(text: string): boolean {
+  return LOW_INFORMATION_EXACT.has(text.trim().toLocaleLowerCase());
 }

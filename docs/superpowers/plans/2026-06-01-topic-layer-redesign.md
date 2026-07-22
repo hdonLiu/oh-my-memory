@@ -2,7 +2,7 @@
 
 Status: Historical implementation plan; superseded as an architecture contract
 
-Current target: [oh-my-memory Architecture v2](../../architecture/oh-my-memory-architecture-v2.md)
+Current target: [`MEMORY_ARCHITECTURE.md`](../../../MEMORY_ARCHITECTURE.md)
 
 The sliding-buffer implementation remains useful history, but online Topic resolution and Project-only L2 assumptions are no longer target behavior.
 

@@ -2,7 +2,7 @@
 
 Status: Superseded historical design
 
-Current target: [oh-my-memory Architecture v2](../../architecture/oh-my-memory-architecture-v2.md)
+Current target: [`MEMORY_ARCHITECTURE.md`](../../../MEMORY_ARCHITECTURE.md)
 
 This document preserves the original MVP design and is not authoritative for new implementation work.
 

@@ -2,7 +2,7 @@
 
 Status: Historical implementation plan
 
-Current target: [oh-my-memory Architecture v2](../../architecture/oh-my-memory-architecture-v2.md)
+Current target: [`MEMORY_ARCHITECTURE.md`](../../../MEMORY_ARCHITECTURE.md)
 
 This plan describes the original MVP implementation and must not be used as the current architecture contract.
 
