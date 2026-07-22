@@ -1,8 +1,12 @@
 # oh-my-memory Production Readiness Backlog
 
-Status: active
+Status: Superseded historical backlog
 
-Proposed canonical target architecture: [oh-my-memory Architecture v2](../architecture/oh-my-memory-architecture-v2.md)
+Current target architecture: [`MEMORY_ARCHITECTURE.md`](../../MEMORY_ARCHITECTURE.md)
+
+Current issue and implementation tracker: [`PROJECT_ISSUES.md`](../../PROJECT_ISSUES.md)
+
+This backlog records the v2 production-readiness plan. Completed items remain implementation history; open work has been re-triaged in the current issue tracker and should not be implemented from this file without reconciling it with the target architecture.
 
 Binding decision: [ADR-0001: Three-Stage Memory Pipeline](../architecture/0001-three-stage-memory-pipeline.md)
 

@@ -1,10 +1,14 @@
 # oh-my-memory 架构方案 v2.1
 
-Status: Accepted; Governance Plane implemented
+Status: Superseded historical architecture; Governance Plane implemented
 
-Role: Canonical target architecture with governance
+Role: Historical governance architecture record
 
 Date: 2026-07-08
+
+Current canonical target: [`MEMORY_ARCHITECTURE.md`](../../MEMORY_ARCHITECTURE.md)
+
+The Governance Plane remains relevant implementation history, but the current target replaces the old Provisional/Canonical L1 pipeline with one revisioned Topic layer.
 
 Binding decisions:
 

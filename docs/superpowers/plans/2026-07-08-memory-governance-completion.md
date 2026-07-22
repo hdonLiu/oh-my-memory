@@ -1,5 +1,11 @@
 # Memory Governance Completion Plan
 
+Status: Historical completed implementation plan
+
+Current target architecture: [`MEMORY_ARCHITECTURE.md`](../../../MEMORY_ARCHITECTURE.md)
+
+This plan is retained to explain the existing governance implementation. Its L1 terminology is not the current target model.
+
 Goal: finish the v1 governance implementation from the approved specification and commit it.
 
 Scope:

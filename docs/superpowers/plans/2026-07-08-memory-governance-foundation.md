@@ -1,5 +1,11 @@
 # Memory Governance Foundation Implementation Plan
 
+Status: Historical completed implementation plan
+
+Current target architecture: [`MEMORY_ARCHITECTURE.md`](../../../MEMORY_ARCHITECTURE.md)
+
+This plan is retained to explain the existing governance implementation. Its L1 terminology is not the current target model.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Build the first independently testable governance foundation from the memory governance spec: schema, correction records, correction API, durable discovery, and Recall freshness.

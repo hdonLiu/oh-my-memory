@@ -1,8 +1,12 @@
 # Memory Governance & Reconciliation v1
 
-Status: Accepted; v1 implemented
+Status: Historical implemented governance specification
 
 Date: 2026-07-07
+
+Current target architecture: [`MEMORY_ARCHITECTURE.md`](../../../MEMORY_ARCHITECTURE.md)
+
+This specification remains the implementation record for the existing correction and reconciliation model. Its separate L1 terminology is superseded by Topic maintenance in the target architecture; immutable Correction evidence, explicit lifecycle state, checkpointing, and Recall freshness remain applicable principles.
 
 Depends on:
 

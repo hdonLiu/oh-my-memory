@@ -1,504 +1,590 @@
 import type Database from "better-sqlite3";
 import { nanoid } from "nanoid";
 import type {
-  ConversationTurn,
-  CreateMemoryInput,
-  CreateProjectBuildRunInput,
-  CreateTopicSegmentInput,
-  CreateTurnInput,
-  Memory,
-  MemoryRelation,
-  MemoryStatus,
-  ProjectBuildRun,
-  ProjectBuildRunStatus,
-  RelationType,
-  Scope,
-  TopicSegment,
-  TopicStatus
+  AppendTurnInput,
+  Correction,
+  L2Aggregate,
+  L2AggregateInput,
+  L3Profile,
+  L3ProfileInput,
+  MemorySpace,
+  RebuildJob,
+  RebuildLayer,
+  ResolveSessionInput,
+  Session,
+  Topic,
+  TopicSnapshotInput,
+  Turn
 } from "../domain/types.js";
-import type { MemoryPatch, MemoryStore } from "./store.js";
-import { LayeredMemoryRepository } from "./layered-repository.js";
 
-type TurnRow = {
-  id: string;
-  event_id: string;
-  session_id: string;
-  role: ConversationTurn["role"];
-  content: string;
-  uid: string;
-  source: string;
-  agent: string;
-  channel: string;
-  metadata: string;
-  created_at: string;
-};
+export class MemoryRepository {
+  constructor(private readonly db: Database.Database) {}
 
-type MemoryRow = {
-  id: string;
-  level: Memory["level"];
-  type: Memory["type"];
-  subject: string;
-  predicate: string;
-  object: string;
-  summary: string;
-  readable_text: string;
-  confidence: number;
-  status: MemoryStatus;
-  supersedes_id: string | null;
-  source_turn_ids: string;
-  uid: string;
-  source: string;
-  agent: string;
-  channel: string;
-  metadata: string;
-  created_at: string;
-  updated_at: string;
-};
-
-type RelationRow = {
-  id: string;
-  from_memory_id: string;
-  to_memory_id: string;
-  relation_type: RelationType;
-  confidence: number;
-  created_at: string;
-};
-
-type TopicSegmentRow = {
-  id: string;
-  session_id: string;
-  title: string;
-  summary: string;
-  status: TopicStatus;
-  confidence: number;
-  turn_ids: string;
-  reason: string;
-  fingerprint: string;
-  project_memory_ids: string;
-  uid: string;
-  source: string;
-  agent: string;
-  channel: string;
-  metadata: string;
-  created_at: string;
-  updated_at: string;
-};
-
-type ProjectBuildRunRow = {
-  id: string;
-  started_at: string;
-  ended_at: string;
-  scopes_run: number;
-  created_or_updated: number;
-  status: ProjectBuildRunStatus;
-  errors: string;
-};
-
-export class MemoryRepository implements MemoryStore {
-  readonly layered: LayeredMemoryRepository;
-
-  constructor(private readonly db: Database.Database) {
-    this.layered = new LayeredMemoryRepository(db);
+  resolveSession(input: ResolveSessionInput): Session {
+    const existing = this.getSessionByExternal(input.uid, input.agentId, input.externalSessionId);
+    const timestamp = now();
+    if (existing) {
+      if (existing.source !== input.source || existing.channel !== (input.channel ?? null)) {
+        this.db
+          .prepare("update sessions set source = ?, channel = ?, updated_at = ? where id = ?")
+          .run(input.source, input.channel ?? null, timestamp, existing.id);
+      }
+      return this.getSessionByExternal(input.uid, input.agentId, input.externalSessionId)!;
+    }
+    const id = nanoid();
+    this.db
+      .prepare(
+        `insert into sessions
+         (id, uid, agent_id, external_session_id, source, channel, created_at, updated_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?)`
+      )
+      .run(id, input.uid, input.agentId, input.externalSessionId, input.source, input.channel ?? null, timestamp, timestamp);
+    this.ensurePrivateSpace(input.uid, input.agentId);
+    return this.getSession(id, input.uid, input.agentId)!;
   }
 
-  createTurn(input: CreateTurnInput): ConversationTurn {
-    const eventId = input.eventId ?? nanoid();
+  getSessionByExternal(uid: string, agentId: string, externalSessionId: string): Session | null {
+    const row = this.db
+      .prepare("select * from sessions where uid = ? and agent_id = ? and external_session_id = ?")
+      .get(uid, agentId, externalSessionId) as SessionRow | undefined;
+    return row ? mapSession(row) : null;
+  }
+
+  getSession(id: string, uid: string, agentId: string): Session | null {
+    const row = this.db
+      .prepare("select * from sessions where id = ? and uid = ? and agent_id = ?")
+      .get(id, uid, agentId) as SessionRow | undefined;
+    return row ? mapSession(row) : null;
+  }
+
+  getSessionForRebuild(id: string): Session | null {
+    const row = this.db.prepare("select * from sessions where id = ?").get(id) as SessionRow | undefined;
+    return row ? mapSession(row) : null;
+  }
+
+  appendTurn(input: AppendTurnInput): Turn {
+    const session = this.getSession(input.sessionId, input.uid, input.agentId);
+    if (!session) throw new Error("Session not found in uid + agentId tenant");
     const existing = this.db
-      .prepare("select * from conversation_turns where uid = ? and source = ? and event_id = ?")
-      .get(input.uid, input.source, eventId) as TurnRow | undefined;
+      .prepare("select * from turns where uid = ? and agent_id = ? and event_id = ?")
+      .get(input.uid, input.agentId, input.eventId) as TurnRow | undefined;
     if (existing) {
       const turn = mapTurn(existing);
       if (
         turn.sessionId !== input.sessionId ||
         turn.role !== input.role ||
         turn.content !== input.content ||
-        turn.agent !== input.agent ||
-        turn.channel !== input.channel
+        JSON.stringify(turn.metadata) !== JSON.stringify(input.metadata ?? {})
       ) {
-        throw new Error(`Idempotency conflict for eventId: ${eventId}`);
+        throw new Error(`Idempotency conflict for eventId: ${input.eventId}`);
       }
       return turn;
     }
-    const turn: ConversationTurn = { ...input, eventId, id: nanoid(), createdAt: now() };
-    this.db
-      .prepare(
-        `insert into conversation_turns
-        (id, event_id, session_id, role, content, uid, source, agent, channel, metadata, created_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        turn.id,
-        turn.eventId,
-        turn.sessionId,
-        turn.role,
-        turn.content,
-        turn.uid,
-        turn.source,
-        turn.agent,
-        turn.channel,
-        JSON.stringify(turn.metadata),
-        turn.createdAt
-      );
-    return turn;
+
+    const insert = this.db.transaction(() => {
+      const next = this.db
+        .prepare("select coalesce(max(sequence), 0) + 1 as value from turns where session_id = ?")
+        .get(input.sessionId) as { value: number };
+      const turn: Turn = {
+        id: nanoid(),
+        eventId: input.eventId,
+        sessionId: input.sessionId,
+        sequence: next.value,
+        uid: input.uid,
+        agentId: input.agentId,
+        role: input.role,
+        content: input.content,
+        metadata: input.metadata ?? {},
+        createdAt: now()
+      };
+      this.db
+        .prepare(
+          `insert into turns
+           (id, event_id, session_id, sequence, uid, agent_id, role, content, metadata, created_at)
+           values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          turn.id,
+          turn.eventId,
+          turn.sessionId,
+          turn.sequence,
+          turn.uid,
+          turn.agentId,
+          turn.role,
+          turn.content,
+          JSON.stringify(turn.metadata),
+          turn.createdAt
+        );
+      return turn;
+    });
+    return insert();
   }
 
-  listTurns(): ConversationTurn[] {
+  listTurns(sessionId: string): Turn[] {
     return this.db
-      .prepare("select * from conversation_turns order by created_at asc")
-      .all()
+      .prepare("select * from turns where session_id = ? order by sequence asc")
+      .all(sessionId)
       .map((row) => mapTurn(row as TurnRow));
   }
 
-  recentTurns(scope: Partial<Scope> & { sessionId?: string }, limit: number): ConversationTurn[] {
-    const rows = this.listTurns()
-      .filter((turn) => matchesScope(turn, scope) && (!scope.sessionId || turn.sessionId === scope.sessionId))
-      .slice(-limit);
-    return rows;
+  getTurn(id: string, uid: string, agentId: string): Turn | null {
+    const row = this.db
+      .prepare("select * from turns where id = ? and uid = ? and agent_id = ?")
+      .get(id, uid, agentId) as TurnRow | undefined;
+    return row ? mapTurn(row) : null;
   }
 
-  createMemory(input: CreateMemoryInput): Memory {
+  createCorrection(input: {
+    uid: string;
+    agentId: string;
+    targetTurnId: string;
+    correctedContent: string | null;
+    reason: string;
+  }): Correction {
+    const turn = this.getTurn(input.targetTurnId, input.uid, input.agentId);
+    if (!turn) throw new Error("Correction target Turn not found in uid + agentId tenant");
+    const correction: Correction = { id: nanoid(), ...input, createdAt: now() };
+    const create = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `insert into corrections(id, uid, agent_id, target_turn_id, corrected_content, reason, created_at)
+           values (?, ?, ?, ?, ?, ?, ?)`
+        )
+        .run(
+          correction.id,
+          correction.uid,
+          correction.agentId,
+          correction.targetTurnId,
+          correction.correctedContent,
+          correction.reason,
+          correction.createdAt
+        );
+      this.setRebuildJob("topic", turn.sessionId, "dirty", "turn_correction_created");
+      for (const space of this.listAuthorizedSpaces(input.uid, input.agentId)) {
+        this.setRebuildJob("L2", space.id, "dirty", "turn_correction_created");
+        this.setRebuildJob("L3", space.id, "dirty", "turn_correction_created");
+      }
+    });
+    create();
+    return correction;
+  }
+
+  listCorrectionsForSession(sessionId: string): Correction[] {
+    return this.db
+      .prepare(
+        `select c.* from corrections c join turns t on t.id = c.target_turn_id
+         where t.session_id = ? order by c.created_at asc, c.id asc`
+      )
+      .all(sessionId)
+      .map((row) => mapCorrection(row as CorrectionRow));
+  }
+
+  getOpenTopic(sessionId: string): Topic | null {
+    const row = this.db
+      .prepare("select * from topics where session_id = ? and status = 'open'")
+      .get(sessionId) as TopicRow | undefined;
+    return row ? mapTopic(row) : null;
+  }
+
+  listTopics(sessionId: string): Topic[] {
+    return this.db
+      .prepare("select * from topics where session_id = ? order by start_sequence asc, id asc")
+      .all(sessionId)
+      .map((row) => mapTopic(row as TopicRow));
+  }
+
+  createOpenTopic(sessionId: string, turn: Turn, includeInRecall: boolean): Topic {
     const timestamp = now();
-    const memory: Memory = {
-      ...input,
-      readableText: input.readableText ?? buildReadableText(input),
-      id: nanoid(),
-      createdAt: timestamp,
-      updatedAt: timestamp
-    };
+    const id = nanoid();
     this.db
       .prepare(
-        `insert into memories
-        (id, level, type, subject, predicate, object, summary, readable_text, confidence, status, supersedes_id,
-         source_turn_ids, uid, source, agent, channel, metadata, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+        `insert into topics
+         (id, session_id, start_sequence, status, turn_ids, title, summary, structured_content, recall_text, created_at, updated_at)
+         values (?, ?, ?, 'open', ?, null, null, null, ?, ?, ?)`
       )
-      .run(
-        memory.id,
-        memory.level,
-        memory.type,
-        memory.subject,
-        memory.predicate,
-        memory.object,
-        memory.summary,
-        memory.readableText,
-        memory.confidence,
-        memory.status,
-        memory.supersedesId,
-        JSON.stringify(memory.sourceTurnIds),
-        memory.uid,
-        memory.source,
-        memory.agent,
-        memory.channel,
-        JSON.stringify(memory.metadata),
-        memory.createdAt,
-        memory.updatedAt
-      );
-    return memory;
+      .run(id, sessionId, turn.sequence, JSON.stringify([turn.id]), includeInRecall ? turn.content : "", timestamp, timestamp);
+    return this.getOpenTopic(sessionId)!;
   }
 
-  updateMemory(id: string, patch: MemoryPatch): Memory {
-    const current = this.getMemory(id);
-    if (!current) {
-      throw new Error(`Memory not found: ${id}`);
-    }
-    const merged = { ...current, ...patch, id, createdAt: current.createdAt, updatedAt: now() };
-    const updated: Memory = {
-      ...merged,
-      readableText: patch.readableText ?? buildReadableText(merged)
-    };
+  appendTurnToTopic(topicId: string, turn: Turn, includeInRecall: boolean): Topic {
+    const row = this.db.prepare("select * from topics where id = ?").get(topicId) as TopicRow | undefined;
+    if (!row) throw new Error(`Topic not found: ${topicId}`);
+    const topic = mapTopic(row);
+    if (topic.status !== "open") throw new Error("Only an open Topic can accept a Turn");
+    if (!topic.turnIds.includes(turn.id)) topic.turnIds.push(turn.id);
+    const recallText = includeInRecall
+      ? [topic.recallText, turn.content].filter((value) => value.length > 0).join("\n")
+      : topic.recallText;
     this.db
-      .prepare(
-        `update memories set
-          level = ?, type = ?, subject = ?, predicate = ?, object = ?, summary = ?, readable_text = ?, confidence = ?,
-          status = ?, supersedes_id = ?, source_turn_ids = ?, uid = ?, source = ?, agent = ?,
-          channel = ?, metadata = ?, updated_at = ?
-        where id = ?`
-      )
-      .run(
-        updated.level,
-        updated.type,
-        updated.subject,
-        updated.predicate,
-        updated.object,
-        updated.summary,
-        updated.readableText,
-        updated.confidence,
-        updated.status,
-        updated.supersedesId,
-        JSON.stringify(updated.sourceTurnIds),
-        updated.uid,
-        updated.source,
-        updated.agent,
-        updated.channel,
-        JSON.stringify(updated.metadata),
-        updated.updatedAt,
-        id
+      .prepare("update topics set turn_ids = ?, recall_text = ?, updated_at = ? where id = ?")
+      .run(JSON.stringify(topic.turnIds), recallText, now(), topic.id);
+    return this.dbTopic(topic.id);
+  }
+
+  splitOpenTopic(sessionId: string, turn: Turn): { pending: Topic; open: Topic } {
+    const split = this.db.transaction(() => {
+      const open = this.getOpenTopic(sessionId);
+      if (!open) throw new Error("Open Topic not found");
+      this.db.prepare("update topics set status = 'pending', updated_at = ? where id = ?").run(now(), open.id);
+      return { pending: this.dbTopic(open.id), open: this.createOpenTopic(sessionId, turn, true) };
+    });
+    return split();
+  }
+
+  closeOpenTopic(sessionId: string): Topic | null {
+    const open = this.getOpenTopic(sessionId);
+    if (!open) return null;
+    if (open.recallText.length === 0) return open;
+    this.db.prepare("update topics set status = 'pending', updated_at = ? where id = ?").run(now(), open.id);
+    return this.dbTopic(open.id);
+  }
+
+  replaceTopics(sessionId: string, topics: TopicSnapshotInput[]): Topic[] {
+    const replace = this.db.transaction(() => {
+      this.db.prepare("delete from topics where session_id = ?").run(sessionId);
+      const timestamp = now();
+      const insert = this.db.prepare(
+        `insert into topics
+         (id, session_id, start_sequence, status, turn_ids, title, summary, structured_content, recall_text, created_at, updated_at)
+         values (?, ?, ?, 'processed', ?, ?, ?, ?, ?, ?, ?)`
       );
-    return updated;
+      for (const topic of topics) {
+        const start = this.db
+          .prepare("select min(sequence) as value from turns where session_id = ? and id in (select value from json_each(?))")
+          .get(sessionId, JSON.stringify(topic.turnIds)) as { value: number };
+        insert.run(
+          topic.id,
+          sessionId,
+          start.value,
+          JSON.stringify(topic.turnIds),
+          topic.title,
+          topic.summary,
+          JSON.stringify(topic.structuredContent),
+          topic.recallText,
+          timestamp,
+          timestamp
+        );
+      }
+      this.setRebuildJob("topic", sessionId, "clean", "topic_snapshot_replaced");
+      return this.listTopics(sessionId);
+    });
+    return replace();
   }
 
-  getMemory(id: string): Memory | null {
-    const row = this.db.prepare("select * from memories where id = ?").get(id) as MemoryRow | undefined;
-    return row ? mapMemory(row) : null;
-  }
-
-  listMemories(scope: Partial<Scope> = {}): Memory[] {
-    return this.db
-      .prepare("select * from memories order by created_at asc")
-      .all()
-      .map((row) => mapMemory(row as MemoryRow))
-      .filter((memory) => matchesScope(memory, scope));
-  }
-
-  createTopicSegment(input: CreateTopicSegmentInput): TopicSegment {
+  ensurePrivateSpace(uid: string, agentId: string): MemorySpace {
+    const existing = this.db
+      .prepare("select * from memory_spaces where uid = ? and owner_agent_id = ? and type = 'private'")
+      .get(uid, agentId) as MemorySpaceRow | undefined;
+    if (existing) return mapMemorySpace(existing);
     const timestamp = now();
-    const topic: TopicSegment = { ...input, id: nanoid(), createdAt: timestamp, updatedAt: timestamp };
-    this.db
-      .prepare(
-        `insert into topic_segments
-        (id, session_id, title, summary, status, confidence, turn_ids, reason, fingerprint, project_memory_ids,
-         uid, source, agent, channel, metadata, created_at, updated_at)
-        values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        topic.id,
-        topic.sessionId,
-        topic.title,
-        topic.summary,
-        topic.status,
-        topic.confidence,
-        JSON.stringify(topic.turnIds),
-        topic.reason,
-        topic.fingerprint,
-        JSON.stringify(topic.projectMemoryIds),
-        topic.uid,
-        topic.source,
-        topic.agent,
-        topic.channel,
-        JSON.stringify(topic.metadata),
-        topic.createdAt,
-        topic.updatedAt
-      );
-    return topic;
+    const id = nanoid();
+    const create = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `insert into memory_spaces(id, uid, type, name, owner_agent_id, created_at, updated_at)
+           values (?, ?, 'private', ?, ?, ?, ?)`
+        )
+        .run(id, uid, `private:${agentId}`, agentId, timestamp, timestamp);
+      this.db
+        .prepare("insert into memory_space_members(memory_space_id, agent_id, created_at) values (?, ?, ?)")
+        .run(id, agentId, timestamp);
+    });
+    create();
+    return this.getMemorySpace(id)!;
   }
 
-  updateTopicSegment(id: string, patch: Partial<Omit<TopicSegment, "id" | "createdAt">>): TopicSegment {
-    const current = this.listTopicSegments().find((topic) => topic.id === id);
-    if (!current) {
-      throw new Error(`Topic segment not found: ${id}`);
+  createSharedSpace(uid: string, name: string, creatorAgentId: string): MemorySpace {
+    const timestamp = now();
+    const id = nanoid();
+    const create = this.db.transaction(() => {
+      this.db
+        .prepare(
+          `insert into memory_spaces(id, uid, type, name, owner_agent_id, created_at, updated_at)
+           values (?, ?, 'shared', ?, null, ?, ?)`
+        )
+        .run(id, uid, name, timestamp, timestamp);
+      this.db
+        .prepare("insert into memory_space_members(memory_space_id, agent_id, created_at) values (?, ?, ?)")
+        .run(id, creatorAgentId, timestamp);
+    });
+    create();
+    return this.getMemorySpace(id)!;
+  }
+
+  addSpaceMember(uid: string, memorySpaceId: string, agentId: string): void {
+    const space = this.getMemorySpace(memorySpaceId);
+    if (!space || space.uid !== uid) throw new Error("MemorySpace member must belong to the same uid");
+    if (space.type !== "shared") throw new Error("Private MemorySpace membership cannot be changed");
+    this.db
+      .prepare("insert or ignore into memory_space_members(memory_space_id, agent_id, created_at) values (?, ?, ?)")
+      .run(memorySpaceId, agentId, now());
+  }
+
+  getMemorySpace(id: string): MemorySpace | null {
+    const row = this.db.prepare("select * from memory_spaces where id = ?").get(id) as MemorySpaceRow | undefined;
+    return row ? mapMemorySpace(row) : null;
+  }
+
+  listSpaceMembers(memorySpaceId: string): string[] {
+    return (this.db
+      .prepare("select agent_id from memory_space_members where memory_space_id = ? order by created_at asc")
+      .all(memorySpaceId) as Array<{ agent_id: string }>).map((row) => row.agent_id);
+  }
+
+  listAuthorizedSpaces(uid: string, agentId: string): MemorySpace[] {
+    this.ensurePrivateSpace(uid, agentId);
+    return this.db
+      .prepare(
+        `select s.* from memory_spaces s
+         join memory_space_members m on m.memory_space_id = s.id
+         where s.uid = ? and m.agent_id = ?
+         order by case s.type when 'private' then 0 else 1 end, s.created_at asc`
+      )
+      .all(uid, agentId)
+      .map((row) => mapMemorySpace(row as MemorySpaceRow));
+  }
+
+  assertSpaceAccess(uid: string, agentId: string, memorySpaceId: string): MemorySpace {
+    const space = this.db
+      .prepare(
+        `select s.* from memory_spaces s
+         join memory_space_members m on m.memory_space_id = s.id
+         where s.id = ? and s.uid = ? and m.agent_id = ?`
+      )
+      .get(memorySpaceId, uid, agentId) as MemorySpaceRow | undefined;
+    if (!space) throw new Error("MemorySpace is not authorized for uid + agentId");
+    return mapMemorySpace(space);
+  }
+
+  markSpacesForAgentDirty(uid: string, agentId: string, reason: string): void {
+    for (const space of this.listAuthorizedSpaces(uid, agentId)) {
+      this.setRebuildJob("L2", space.id, "dirty", reason);
     }
-    const updated: TopicSegment = { ...current, ...patch, id, createdAt: current.createdAt, updatedAt: now() };
+  }
+
+  listProcessedTopicsForSpace(memorySpaceId: string): Topic[] {
+    const space = this.getMemorySpace(memorySpaceId);
+    if (!space) throw new Error("MemorySpace not found");
+    return this.db
+      .prepare(
+        `select distinct t.* from topics t
+         join sessions s on s.id = t.session_id
+         join memory_space_members m on m.memory_space_id = ? and m.agent_id = s.agent_id
+         where s.uid = ? and t.status = 'processed'
+         order by t.created_at asc`
+      )
+      .all(memorySpaceId, space.uid)
+      .map((row) => mapTopic(row as TopicRow));
+  }
+
+  replaceL2Snapshot(memorySpaceId: string, aggregates: L2AggregateInput[]): L2Aggregate[] {
+    const replace = this.db.transaction(() => {
+      const existing = new Map(this.listL2(memorySpaceId).map((item) => [item.id, item]));
+      this.db.prepare("delete from l2_aggregates where memory_space_id = ?").run(memorySpaceId);
+      const insert = this.db.prepare(
+        `insert into l2_aggregates
+         (id, memory_space_id, memory_key, content, kind, evidence_turn_ids, source_agent_ids, confidence, created_at, updated_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      const timestamp = now();
+      for (const item of aggregates) {
+        insert.run(
+          item.id,
+          memorySpaceId,
+          item.key,
+          item.content,
+          item.kind,
+          JSON.stringify(item.evidenceTurnIds),
+          JSON.stringify(item.sourceAgentIds),
+          item.confidence,
+          existing.get(item.id)?.createdAt ?? timestamp,
+          timestamp
+        );
+      }
+      this.setRebuildJob("L2", memorySpaceId, "clean", "l2_snapshot_replaced");
+      this.setRebuildJob("L3", memorySpaceId, "dirty", "l2_snapshot_changed");
+      return this.listL2(memorySpaceId);
+    });
+    return replace();
+  }
+
+  listL2(memorySpaceId: string): L2Aggregate[] {
+    return this.db
+      .prepare("select * from l2_aggregates where memory_space_id = ? order by created_at asc, id asc")
+      .all(memorySpaceId)
+      .map((row) => mapL2(row as L2Row));
+  }
+
+  replaceL3Snapshot(memorySpaceId: string, profiles: L3ProfileInput[]): L3Profile[] {
+    const replace = this.db.transaction(() => {
+      const existing = new Map(this.listL3(memorySpaceId).map((item) => [item.id, item]));
+      this.db.prepare("delete from l3_profiles where memory_space_id = ?").run(memorySpaceId);
+      const insert = this.db.prepare(
+        `insert into l3_profiles
+         (id, memory_space_id, profile_key, content, evidence_l2_ids, confidence, created_at, updated_at)
+         values (?, ?, ?, ?, ?, ?, ?, ?)`
+      );
+      const timestamp = now();
+      for (const item of profiles) {
+        insert.run(
+          item.id,
+          memorySpaceId,
+          item.key,
+          item.content,
+          JSON.stringify(item.evidenceL2Ids),
+          item.confidence,
+          existing.get(item.id)?.createdAt ?? timestamp,
+          timestamp
+        );
+      }
+      this.setRebuildJob("L3", memorySpaceId, "clean", "l3_snapshot_replaced");
+      return this.listL3(memorySpaceId);
+    });
+    return replace();
+  }
+
+  listL3(memorySpaceId: string): L3Profile[] {
+    return this.db
+      .prepare("select * from l3_profiles where memory_space_id = ? order by created_at asc, id asc")
+      .all(memorySpaceId)
+      .map((row) => mapL3(row as L3Row));
+  }
+
+  setRebuildJob(layer: RebuildLayer, scopeId: string, status: RebuildJob["status"], reason: string, error?: string): void {
+    const previous = this.getRebuildJob(layer, scopeId);
     this.db
       .prepare(
-        `update topic_segments set
-          session_id = ?, title = ?, summary = ?, status = ?, confidence = ?, turn_ids = ?, reason = ?, fingerprint = ?,
-          project_memory_ids = ?, uid = ?, source = ?, agent = ?, channel = ?, metadata = ?, updated_at = ?
-        where id = ?`
+        `insert into rebuild_jobs(layer, scope_id, status, reason, last_error, attempts, updated_at)
+         values (?, ?, ?, ?, ?, ?, ?)
+         on conflict(layer, scope_id) do update set
+           status = excluded.status,
+           reason = excluded.reason,
+           last_error = excluded.last_error,
+           attempts = excluded.attempts,
+           updated_at = excluded.updated_at`
       )
       .run(
-        updated.sessionId,
-        updated.title,
-        updated.summary,
-        updated.status,
-        updated.confidence,
-        JSON.stringify(updated.turnIds),
-        updated.reason,
-        updated.fingerprint,
-        JSON.stringify(updated.projectMemoryIds),
-        updated.uid,
-        updated.source,
-        updated.agent,
-        updated.channel,
-        JSON.stringify(updated.metadata),
-        updated.updatedAt,
-        id
+        layer,
+        scopeId,
+        status,
+        reason,
+        error ?? null,
+        status === "dirty" && error ? (previous?.attempts ?? 0) + 1 : previous?.attempts ?? 0,
+        now()
       );
-    return updated;
   }
 
-  getTopicSegmentByFingerprint(fingerprint: string): TopicSegment | null {
-    const row = this.db.prepare("select * from topic_segments where fingerprint = ?").get(fingerprint) as
-      | TopicSegmentRow
-      | undefined;
-    return row ? mapTopicSegment(row) : null;
+  getRebuildJob(layer: RebuildLayer, scopeId: string): RebuildJob | null {
+    const row = this.db
+      .prepare("select * from rebuild_jobs where layer = ? and scope_id = ?")
+      .get(layer, scopeId) as RebuildJobRow | undefined;
+    return row ? mapRebuildJob(row) : null;
   }
 
-  listTopicSegments(scope: Partial<Scope> = {}): TopicSegment[] {
-    return this.db
-      .prepare("select * from topic_segments order by created_at asc")
-      .all()
-      .map((row) => mapTopicSegment(row as TopicSegmentRow))
-      .filter((topic) => matchesScope(topic, scope));
+  listDirtyJobs(layer?: RebuildLayer): RebuildJob[] {
+    const rows = layer
+      ? this.db.prepare("select * from rebuild_jobs where status = 'dirty' and layer = ? order by updated_at asc").all(layer)
+      : this.db
+          .prepare(
+            `select * from rebuild_jobs where status = 'dirty'
+             order by case layer when 'topic' then 0 when 'L2' then 1 else 2 end, updated_at asc`
+          )
+          .all();
+    return rows.map((row) => mapRebuildJob(row as RebuildJobRow));
   }
 
-  createRelation(
-    fromMemoryId: string,
-    toMemoryId: string,
-    relationType: RelationType,
-    confidence: number
-  ): MemoryRelation {
-    const relation: MemoryRelation = {
-      id: nanoid(),
-      fromMemoryId,
-      toMemoryId,
-      relationType,
-      confidence,
-      createdAt: now()
+  listRecallCandidates(uid: string, agentId: string, sessionId?: string) {
+    const topics = sessionId
+      ? this.db
+          .prepare(
+            `select t.* from topics t join sessions s on s.id = t.session_id
+             where t.session_id = ? and s.uid = ? and s.agent_id = ? and t.status in ('pending', 'processed')`
+          )
+          .all(sessionId, uid, agentId)
+          .map((row) => mapTopic(row as TopicRow))
+      : [];
+    const spaces = this.listAuthorizedSpaces(uid, agentId);
+    return {
+      topics,
+      l2: spaces.flatMap((space) => this.listL2(space.id)),
+      l3: spaces.flatMap((space) => this.listL3(space.id))
     };
-    this.db
-      .prepare(
-        `insert into memory_relations
-        (id, from_memory_id, to_memory_id, relation_type, confidence, created_at)
-        values (?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        relation.id,
-        relation.fromMemoryId,
-        relation.toMemoryId,
-        relation.relationType,
-        relation.confidence,
-        relation.createdAt
-      );
-    return relation;
   }
 
-  listRelations(memoryId: string): MemoryRelation[] {
-    return this.db
-      .prepare("select * from memory_relations where from_memory_id = ? or to_memory_id = ? order by created_at asc")
-      .all(memoryId, memoryId)
-      .map((row) => mapRelation(row as RelationRow));
-  }
-
-  createProjectBuildRun(input: CreateProjectBuildRunInput): ProjectBuildRun {
-    const run: ProjectBuildRun = { ...input, id: nanoid() };
-    this.db
-      .prepare(
-        `insert into project_build_runs
-        (id, started_at, ended_at, scopes_run, created_or_updated, status, errors)
-        values (?, ?, ?, ?, ?, ?, ?)`
-      )
-      .run(
-        run.id,
-        run.startedAt,
-        run.endedAt,
-        run.scopesRun,
-        run.createdOrUpdated,
-        run.status,
-        JSON.stringify(run.errors)
-      );
-    return run;
-  }
-
-  listProjectBuildRuns(limit = 20): ProjectBuildRun[] {
-    return this.db
-      .prepare("select * from project_build_runs order by started_at desc limit ?")
-      .all(limit)
-      .map((row) => mapProjectBuildRun(row as ProjectBuildRunRow));
+  private dbTopic(id: string): Topic {
+    const row = this.db.prepare("select * from topics where id = ?").get(id) as TopicRow | undefined;
+    if (!row) throw new Error(`Topic not found: ${id}`);
+    return mapTopic(row);
   }
 }
 
-export function sameScope(left: Scope, right: Partial<Scope>): boolean {
-  return matchesScope(left, right);
-}
+type SessionRow = {
+  id: string; uid: string; agent_id: string; external_session_id: string; source: string; channel: string | null;
+  created_at: string; updated_at: string;
+};
+type TurnRow = {
+  id: string; event_id: string; session_id: string; sequence: number; uid: string; agent_id: string;
+  role: Turn["role"]; content: string; metadata: string; created_at: string;
+};
+type TopicRow = {
+  id: string; session_id: string; start_sequence: number; status: Topic["status"]; turn_ids: string; title: string | null;
+  summary: string | null; structured_content: string | null; recall_text: string; created_at: string; updated_at: string;
+};
+type MemorySpaceRow = {
+  id: string; uid: string; type: MemorySpace["type"]; name: string; owner_agent_id: string | null;
+  created_at: string; updated_at: string;
+};
+type L2Row = {
+  id: string; memory_space_id: string; memory_key: string; content: string; kind: string;
+  evidence_turn_ids: string; source_agent_ids: string; confidence: number; created_at: string; updated_at: string;
+};
+type L3Row = {
+  id: string; memory_space_id: string; profile_key: string; content: string; evidence_l2_ids: string;
+  confidence: number; created_at: string; updated_at: string;
+};
+type RebuildJobRow = {
+  layer: RebuildLayer; scope_id: string; status: RebuildJob["status"]; reason: string; last_error: string | null;
+  attempts: number; updated_at: string;
+};
+type CorrectionRow = {
+  id: string; uid: string; agent_id: string; target_turn_id: string; corrected_content: string | null;
+  reason: string; created_at: string;
+};
 
-function matchesScope(value: Scope, scope: Partial<Scope>): boolean {
-  return (
-    (!scope.uid || value.uid === scope.uid) &&
-    (!scope.source || value.source === scope.source) &&
-    (!scope.agent || value.agent === scope.agent) &&
-    (!scope.channel || value.channel === scope.channel)
-  );
+function mapSession(row: SessionRow): Session {
+  return { id: row.id, uid: row.uid, agentId: row.agent_id, externalSessionId: row.external_session_id,
+    source: row.source, channel: row.channel, createdAt: row.created_at, updatedAt: row.updated_at };
 }
-
-function mapTurn(row: TurnRow): ConversationTurn {
-  return {
-    id: row.id,
-    eventId: row.event_id,
-    sessionId: row.session_id,
-    role: row.role,
-    content: row.content,
-    uid: row.uid,
-    source: row.source,
-    agent: row.agent,
-    channel: row.channel,
-    metadata: JSON.parse(row.metadata) as Record<string, unknown>,
-    createdAt: row.created_at
-  };
+function mapTurn(row: TurnRow): Turn {
+  return { id: row.id, eventId: row.event_id, sessionId: row.session_id, sequence: row.sequence, uid: row.uid,
+    agentId: row.agent_id, role: row.role, content: row.content, metadata: parseObject(row.metadata), createdAt: row.created_at };
 }
-
-function mapMemory(row: MemoryRow): Memory {
-  return {
-    id: row.id,
-    level: row.level,
-    type: row.type,
-    subject: row.subject,
-    predicate: row.predicate,
-    object: row.object,
-    summary: row.summary,
-    readableText: row.readable_text,
-    confidence: row.confidence,
-    status: row.status,
-    supersedesId: row.supersedes_id,
-    sourceTurnIds: JSON.parse(row.source_turn_ids) as string[],
-    uid: row.uid,
-    source: row.source,
-    agent: row.agent,
-    channel: row.channel,
-    metadata: JSON.parse(row.metadata) as Record<string, unknown>,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at
-  };
+function mapTopic(row: TopicRow): Topic {
+  return { id: row.id, sessionId: row.session_id, status: row.status, turnIds: parseArray(row.turn_ids), title: row.title,
+    summary: row.summary, structuredContent: row.structured_content ? parseObject(row.structured_content) : null,
+    recallText: row.recall_text, createdAt: row.created_at, updatedAt: row.updated_at };
 }
-
-function mapTopicSegment(row: TopicSegmentRow): TopicSegment {
-  return {
-    id: row.id,
-    sessionId: row.session_id,
-    title: row.title,
-    summary: row.summary,
-    status: row.status,
-    confidence: row.confidence,
-    turnIds: JSON.parse(row.turn_ids) as string[],
-    reason: row.reason,
-    fingerprint: row.fingerprint,
-    projectMemoryIds: JSON.parse(row.project_memory_ids) as string[],
-    uid: row.uid,
-    source: row.source,
-    agent: row.agent,
-    channel: row.channel,
-    metadata: JSON.parse(row.metadata) as Record<string, unknown>,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at
-  };
+function mapMemorySpace(row: MemorySpaceRow): MemorySpace {
+  return { id: row.id, uid: row.uid, type: row.type, name: row.name, ownerAgentId: row.owner_agent_id,
+    createdAt: row.created_at, updatedAt: row.updated_at };
 }
-
-function mapRelation(row: RelationRow): MemoryRelation {
-  return {
-    id: row.id,
-    fromMemoryId: row.from_memory_id,
-    toMemoryId: row.to_memory_id,
-    relationType: row.relation_type,
-    confidence: row.confidence,
-    createdAt: row.created_at
-  };
+function mapL2(row: L2Row): L2Aggregate {
+  return { id: row.id, memorySpaceId: row.memory_space_id, key: row.memory_key, content: row.content, kind: row.kind,
+    evidenceTurnIds: parseArray(row.evidence_turn_ids), sourceAgentIds: parseArray(row.source_agent_ids),
+    confidence: row.confidence, createdAt: row.created_at, updatedAt: row.updated_at };
 }
-
-function mapProjectBuildRun(row: ProjectBuildRunRow): ProjectBuildRun {
-  return {
-    id: row.id,
-    startedAt: row.started_at,
-    endedAt: row.ended_at,
-    scopesRun: row.scopes_run,
-    createdOrUpdated: row.created_or_updated,
-    status: row.status,
-    errors: JSON.parse(row.errors) as ProjectBuildRun["errors"]
-  };
+function mapL3(row: L3Row): L3Profile {
+  return { id: row.id, memorySpaceId: row.memory_space_id, key: row.profile_key, content: row.content,
+    evidenceL2Ids: parseArray(row.evidence_l2_ids), confidence: row.confidence, createdAt: row.created_at, updatedAt: row.updated_at };
 }
-
-function now(): string {
-  return new Date().toISOString();
+function mapRebuildJob(row: RebuildJobRow): RebuildJob {
+  return { layer: row.layer, scopeId: row.scope_id, status: row.status, reason: row.reason, lastError: row.last_error,
+    attempts: row.attempts, updatedAt: row.updated_at };
 }
-
-export function buildReadableText(memory: Pick<Memory, "level" | "type" | "subject" | "predicate" | "object" | "summary">): string {
-  return `${memory.level} ${memory.type}: ${memory.subject} ${memory.predicate} ${memory.object}\n${memory.summary}`;
+function mapCorrection(row: CorrectionRow): Correction {
+  return { id: row.id, uid: row.uid, agentId: row.agent_id, targetTurnId: row.target_turn_id,
+    correctedContent: row.corrected_content, reason: row.reason, createdAt: row.created_at };
 }
+function parseArray(value: string): string[] { return JSON.parse(value) as string[]; }
+function parseObject(value: string): Record<string, unknown> { return JSON.parse(value) as Record<string, unknown>; }
+function now(): string { return new Date().toISOString(); }

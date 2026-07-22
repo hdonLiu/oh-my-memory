@@ -4,7 +4,7 @@ Status: Superseded historical roadmap
 
 Current roadmap: [Production Readiness Backlog](./2026-06-29-production-readiness.md)
 
-Current target architecture: [oh-my-memory Architecture v2](../architecture/oh-my-memory-architecture-v2.md)
+Current target architecture: [`MEMORY_ARCHITECTURE.md`](../../MEMORY_ARCHITECTURE.md)
 
 This roadmap describes the next implementation phases after the current MVP.
 

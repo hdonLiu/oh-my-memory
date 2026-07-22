@@ -1,529 +1,363 @@
+import { cosineSimilarity, OpenAICompatibleEmbeddingProvider, type EmbeddingProvider } from "../domain/embedding.js";
 import {
-  LlmMemoryCompressor,
-  type DreamingResult,
-  type MemoryCompressor
-} from "../domain/dreaming.js";
-import {
-  OpenAICompatibleEmbeddingProvider,
-  SqliteVectorIndex,
-  type EmbeddingIndex,
-  type EmbeddingProvider
-} from "../domain/embedding.js";
-import { OpenAICompatibleCompletionClient } from "../domain/extractors.js";
-import {
-  LlmProjectMemoryExtractor,
-  ModelProjectMemoryBuilder,
-  type ProjectMemoryBuilder
-} from "../domain/project-memory.js";
-import { LlmMemoryRecallPlanner, type MemoryRecallPlanner, type RecallInput } from "../domain/recall.js";
-import { LlmMemoryResolver, type MemoryResolver } from "../domain/resolver.js";
-import { searchMemories, type SearchInput, type SearchResult } from "../domain/search.js";
-import { LlmTopicBoundaryDetector } from "../domain/topic-boundary.js";
-import { LlmTopicMemoryGenerator, topicMemoryUnitToDraft } from "../domain/topic-memory.js";
-import { SlidingTopicBuilder, type TopicBuilder } from "../domain/topics.js";
-import type {
-  ConversationTurn,
-  CorrectionRecord,
-  CorrectionStatus,
-  CreateMemoryInput,
-  CreateCorrectionInput,
-  CreateTurnInput,
-  GovernanceFreshness,
-  Memory,
-  MemoryStatus,
-  ProjectBuildRun,
-  ProjectBuildRunStatus,
-  Scope,
-  TopicSegment,
-  TopicType
-} from "../domain/types.js";
-import type { MemoryStore } from "../storage/store.js";
-import { loadTopicWindowConfig } from "./topic-config.js";
-import {
-  LayeredMemoryService,
-  LlmCanonicalProfileExtractor,
-  LlmL1MaintenancePlanner,
-  LlmL2MembershipPlanner,
-  LlmL2RevisionSynthesizer,
-  LlmLayeredRecallPlanner,
-  type LayeredRecallResult
-} from "./layered-memory-service.js";
-import type Database from "better-sqlite3";
-
-export interface IngestTurnResult {
-  turn: ConversationTurn;
-  topic: TopicSegment | null;
-  memories: Memory[];
-}
-
-export interface MemoryService {
-  ingestTurn(input: CreateTurnInput): Promise<IngestTurnResult>;
-  flushSessionTopic(scope: Scope, sessionId: string): Promise<{ topic: TopicSegment | null; memories: Memory[] }>;
-  listTopicSegments(scope: Partial<Scope> & { sessionId?: string; status?: TopicSegment["status"] }): { topics: TopicSegment[] };
-  listProjectMemories(
-    scope: Partial<Scope> & { status?: MemoryStatus; projectType?: string; projectKey?: string }
-  ): { projects: Memory[] };
-  recordProjectBuildRun(input: {
-    startedAt: string;
-    endedAt: string;
-    scopesRun: number;
-    createdOrUpdated: number;
-    status: ProjectBuildRunStatus;
-    errors: Array<{ scope: Scope; error: string }>;
-  }): { run: ProjectBuildRun };
-  listProjectBuildRuns(limit?: number): { runs: ProjectBuildRun[] };
-  runProjectBuild(scope: Scope): Promise<{ createdOrUpdated: Memory[] }>;
-  search(input: SearchInput): Promise<{ results: SearchResult[] }>;
-  listMemories(scope: Partial<Scope>): { memories: Memory[] };
-  updateMemory(id: string, patch: { status?: MemoryStatus; summary?: string; confidence?: number }): { memory: Memory };
-  listRelations(memoryId: string): { relations: ReturnType<MemoryStore["listRelations"]> };
-  runDreaming(scope: Scope): DreamingResult | Promise<DreamingResult>;
-  recall(input: RecallInput): Promise<{ shouldUseMemory: boolean; reason: string; memories: Memory[]; promptSnippets: string[] }>;
-  listL1Topics(scope: Partial<Scope> & { sessionId?: string; includeInactive?: boolean }): ReturnType<LayeredMemoryService["listL1Topics"]>;
-  runL1Maintenance(scope: Scope, sessionId: string): ReturnType<LayeredMemoryService["runL1Maintenance"]>;
-  listL1MaintenanceRuns(limit?: number): ReturnType<MemoryStore["layered"]["listL1MaintenanceRuns"]>;
-  listL2Aggregates(uid: string, agent: string, includeInactive?: boolean): ReturnType<MemoryStore["layered"]["listL2AggregateViews"]>;
-  runL2Aggregation(uid: string, agent: string, watermark?: number): ReturnType<LayeredMemoryService["runL2Aggregation"]>;
-  listL2AggregationRuns(limit?: number): ReturnType<MemoryStore["layered"]["listL2AggregationRuns"]>;
-  listL3Profiles(uid: string, agent: string): { profiles: Memory[] };
-  runL3ProfileBuild(uid: string, agent: string): ReturnType<LayeredMemoryService["runL3ProfileBuild"]>;
-  createCorrection(input: CreateCorrectionInput): { correction: CorrectionRecord };
-  getCorrection(uid: string, agent: string, id: string): { correction: CorrectionRecord | null };
-  listCorrections(filter: {
-    uid: string;
-    agent: string;
-    status?: CorrectionStatus;
-    limit?: number;
-  }): { corrections: CorrectionRecord[] };
-  listPendingL1CorrectionSessions(): Array<{ scope: Scope; sessionId: string }>;
-  listReadyL2CorrectionNamespaces(): Array<{ uid: string; agent: string }>;
-  listDueL2Namespaces(): Array<{ uid: string; agent: string }>;
-  listDueL3Namespaces(): Array<{ uid: string; agent: string }>;
-  recallV2(input: { uid: string; agent: string; query: string; limit?: number; sessionId?: string; includeProvisional?: boolean }): Promise<{
-    usagePolicy: "reference_only";
-    shouldUseMemory: boolean;
-    freshness: GovernanceFreshness;
-    reason: string;
-    results: LayeredRecallResult[];
-  }>;
-}
+  LlmAmbiguousTopicModel,
+  LlmL2AggregationModel,
+  LlmL3ProfilingModel,
+  LlmRecallModel,
+  LlmTopicMaintenanceModel,
+  OpenAICompatibleCompletionClient,
+  type AmbiguousTopicModel,
+  type L2AggregationModel,
+  type L3ProfilingModel,
+  type RecallModel,
+  type TopicMaintenanceModel
+} from "../domain/models.js";
+import { isHighPrecisionLowInformation } from "../domain/text.js";
+import type { IngestTurnInput, RecallItem, Session, Topic, Turn } from "../domain/types.js";
+import type { MemoryRepository } from "../storage/repositories.js";
 
 export interface MemoryServiceOptions {
-  resolver?: MemoryResolver;
-  projectMemoryBuilder?: ProjectMemoryBuilder;
-  compressor?: MemoryCompressor;
-  topicBuilder?: TopicBuilder;
   embeddingProvider?: EmbeddingProvider;
-  embeddingIndex?: EmbeddingIndex;
-  recallPlanner?: MemoryRecallPlanner;
-  layeredService?: LayeredMemoryService;
-  legacyCompatibility?: boolean;
+  ambiguousTopicModel?: AmbiguousTopicModel;
+  topicMaintenanceModel?: TopicMaintenanceModel;
+  l2AggregationModel?: L2AggregationModel;
+  l3ProfilingModel?: L3ProfilingModel;
+  recallModel?: RecallModel;
+  topicThresholds?: { join: number; split: number };
+  maxTopicTurns?: number;
 }
 
-export function createRuntimeMemoryService(
-  store: MemoryStore,
-  options: MemoryServiceOptions = {},
-  db?: Database.Database
-): MemoryService {
-  const embedding =
-    options.embeddingProvider || options.embeddingIndex || !db || !isEmbeddingConfigured()
-      ? {}
-      : {
-          embeddingProvider: new OpenAICompatibleEmbeddingProvider(),
-          embeddingIndex: new SqliteVectorIndex(db)
-        };
-  return createMemoryService(store, { ...embedding, ...options });
+export function createRuntimeMemoryService(repository: MemoryRepository) {
+  const client = new OpenAICompatibleCompletionClient();
+  const boundaryClient = new OpenAICompatibleCompletionClient({
+    baseUrl: process.env.TOPIC_BOUNDARY_LLM_BASE_URL ?? process.env.LLM_BASE_URL,
+    apiKey: process.env.TOPIC_BOUNDARY_LLM_API_KEY ?? process.env.LLM_API_KEY,
+    model: process.env.TOPIC_BOUNDARY_LLM_MODEL ?? process.env.LLM_MODEL ?? "gpt-4.1-mini"
+  });
+  return createMemoryService(repository, {
+    embeddingProvider: new OpenAICompatibleEmbeddingProvider(),
+    ambiguousTopicModel: new LlmAmbiguousTopicModel(boundaryClient),
+    topicMaintenanceModel: new LlmTopicMaintenanceModel(client),
+    l2AggregationModel: new LlmL2AggregationModel(client),
+    l3ProfilingModel: new LlmL3ProfilingModel(client),
+    recallModel: new LlmRecallModel(client)
+  });
 }
 
-export function createMemoryService(store: MemoryStore, options: MemoryServiceOptions = {}): MemoryService {
-  const resolver = options.resolver ?? createDefaultMemoryResolver();
-  const projectMemoryBuilder = options.projectMemoryBuilder ?? createDefaultProjectMemoryBuilder(resolver);
-  const compressor = options.compressor ?? createDefaultMemoryCompressor(resolver);
-  const topicBuilder = options.topicBuilder ?? createDefaultTopicBuilder();
-  const embeddingProvider = options.embeddingProvider;
-  const embeddingIndex = options.embeddingIndex;
-  const recallPlanner = options.recallPlanner ?? createDefaultRecallPlanner();
-  const layeredService = options.layeredService ?? (isLlmConfigured() ? createDefaultLayeredService(store) : undefined);
-  const legacyCompatibility = options.legacyCompatibility ?? false;
+export function createMemoryService(repository: MemoryRepository, options: MemoryServiceOptions = {}) {
+  const thresholds = options.topicThresholds ?? { join: 0.82, split: 0.55 };
+  if (!(thresholds.split >= -1 && thresholds.join <= 1 && thresholds.split < thresholds.join)) {
+    throw new Error("Topic thresholds must satisfy -1 <= split < join <= 1");
+  }
+  const maxTopicTurns = options.maxTopicTurns ?? 100;
 
   return {
-    async ingestTurn(input) {
-      const turn = store.createTurn(input);
-      const scope = toScope(input);
-      const topic = await topicBuilder.build(store, scope, turn.sessionId);
-      if (topic) appendProvisionalTopic(store, layeredService, topic);
-      if (!topic || topic.status !== "complete") {
-        return { turn, topic, memories: [] };
+    async ingestTurn(input: IngestTurnInput) {
+      const session = repository.resolveSession(input);
+      const turn = repository.appendTurn({
+        uid: input.uid,
+        agentId: input.agentId,
+        sessionId: session.id,
+        eventId: input.eventId,
+        role: input.role,
+        content: input.content,
+        metadata: input.metadata ?? {}
+      });
+
+      const alreadyDerived = repository.listTopics(session.id).find((topic) => topic.turnIds.includes(turn.id));
+      if (alreadyDerived) {
+        return { session, turn, topic: alreadyDerived, derivation: { status: "applied" as const, reason: "idempotent" } };
       }
-      if (!legacyCompatibility) {
-        return { turn, topic, memories: [] };
+
+      try {
+        const topic = await deriveRealtimeTopic(repository, session, turn, options, thresholds, maxTopicTurns);
+        repository.setRebuildJob("topic", session.id, "dirty", "online_topic_changed");
+        return { session, turn, topic, derivation: { status: "applied" as const, reason: "online_topic" } };
+      } catch (error) {
+        repository.setRebuildJob(
+          "topic",
+          session.id,
+          "dirty",
+          "online_model_deferred",
+          error instanceof Error ? error.message : "unknown error"
+        );
+        return { session, turn, topic: repository.getOpenTopic(session.id), derivation: { status: "deferred" as const, reason: "model_unavailable" } };
       }
-      const topicMemory = store.createMemory(topicToDraftFromSegment(topic));
-      const memories = [topicMemory];
-      if (embeddingProvider && embeddingIndex) {
-        await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
+    },
+
+    flushSession(input: { uid: string; agentId: string; externalSessionId: string }) {
+      const session = requireSession(repository, input);
+      const topic = repository.closeOpenTopic(session.id);
+      if (topic) repository.setRebuildJob("topic", session.id, "dirty", "explicit_flush");
+      return { session, topic };
+    },
+
+    async maintainTopics(input: { uid: string; agentId: string; externalSessionId: string }) {
+      const model = requireModel(options.topicMaintenanceModel, "TopicMaintenanceModel");
+      const session = requireSession(repository, input);
+      const turns = repository.listTurns(session.id);
+      repository.setRebuildJob("topic", session.id, "rebuilding", "topic_maintenance_started");
+      try {
+        const result = await model.rebuild({
+          turns,
+          currentTopics: repository.listTopics(session.id),
+          corrections: repository.listCorrectionsForSession(session.id)
+        });
+        validateTopicSnapshot(turns, result.topics);
+        const topics = repository.replaceTopics(session.id, result.topics);
+        repository.markSpacesForAgentDirty(session.uid, session.agentId, "processed_topics_changed");
+        return { session, topics };
+      } catch (error) {
+        repository.setRebuildJob(
+          "topic",
+          session.id,
+          "dirty",
+          "topic_maintenance_failed",
+          error instanceof Error ? error.message : "unknown error"
+        );
+        throw error;
       }
-      return { turn, topic, memories };
     },
 
-    async flushSessionTopic(scope, sessionId) {
-      const topic = await topicBuilder.flush(store, scope, sessionId);
-      if (topic) appendProvisionalTopic(store, layeredService, topic);
-      if (!topic || topic.status !== "complete") {
-        return { topic, memories: [] };
+    async rebuildL2(input: { uid: string; agentId: string; memorySpaceId: string }) {
+      const model = requireModel(options.l2AggregationModel, "L2AggregationModel");
+      repository.assertSpaceAccess(input.uid, input.agentId, input.memorySpaceId);
+      repository.setRebuildJob("L2", input.memorySpaceId, "rebuilding", "l2_rebuild_started");
+      try {
+        const topics = repository.listProcessedTopicsForSpace(input.memorySpaceId);
+        const current = repository.listL2(input.memorySpaceId);
+        const result = await model.rebuild({ topics, currentAggregates: current });
+        validateL2Snapshot(topics, result.aggregates);
+        return { aggregates: repository.replaceL2Snapshot(input.memorySpaceId, result.aggregates) };
+      } catch (error) {
+        repository.setRebuildJob(
+          "L2",
+          input.memorySpaceId,
+          "dirty",
+          "l2_rebuild_failed",
+          error instanceof Error ? error.message : "unknown error"
+        );
+        throw error;
       }
-      if (!legacyCompatibility) {
-        return { topic, memories: [] };
+    },
+
+    async rebuildL3(input: { uid: string; agentId: string; memorySpaceId: string }) {
+      const model = requireModel(options.l3ProfilingModel, "L3ProfilingModel");
+      repository.assertSpaceAccess(input.uid, input.agentId, input.memorySpaceId);
+      repository.setRebuildJob("L3", input.memorySpaceId, "rebuilding", "l3_rebuild_started");
+      try {
+        const aggregates = repository.listL2(input.memorySpaceId);
+        const current = repository.listL3(input.memorySpaceId);
+        const result = await model.rebuild({ aggregates, currentProfiles: current });
+        validateL3Snapshot(aggregates, result.profiles);
+        return { profiles: repository.replaceL3Snapshot(input.memorySpaceId, result.profiles) };
+      } catch (error) {
+        repository.setRebuildJob(
+          "L3",
+          input.memorySpaceId,
+          "dirty",
+          "l3_rebuild_failed",
+          error instanceof Error ? error.message : "unknown error"
+        );
+        throw error;
       }
-      const topicMemory = store.createMemory(topicToDraftFromSegment(topic));
-      const memories = [topicMemory];
-      if (embeddingProvider && embeddingIndex) {
-        await Promise.all(memories.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
-      }
-      return { topic, memories };
     },
 
-    listTopicSegments(scope) {
-      const { sessionId, status, ...baseScope } = scope;
-      const topics = store
-        .listTopicSegments(baseScope)
-        .filter((topic) => (!sessionId || topic.sessionId === sessionId) && (!status || topic.status === status));
-      return { topics };
+    async recall(input: { uid: string; agentId: string; query: string; externalSessionId?: string }) {
+      const model = requireModel(options.recallModel, "RecallModel");
+      const session = input.externalSessionId
+        ? repository.getSessionByExternal(input.uid, input.agentId, input.externalSessionId)
+        : null;
+      if (input.externalSessionId && !session) throw new Error("Session not found in uid + agentId tenant");
+      const source = repository.listRecallCandidates(input.uid, input.agentId, session?.id);
+      const candidates: RecallItem[] = [
+        ...source.topics.map((topic) => ({
+          id: topic.id,
+          layer: "topic" as const,
+          content: topic.summary || topic.recallText,
+          provenanceTurnIds: topic.turnIds,
+          memorySpaceId: null
+        })),
+        ...source.l2.map((item) => ({
+          id: item.id,
+          layer: "L2" as const,
+          content: item.content,
+          provenanceTurnIds: item.evidenceTurnIds,
+          memorySpaceId: item.memorySpaceId
+        })),
+        ...source.l3.map((item) => ({
+          id: item.id,
+          layer: "L3" as const,
+          content: item.content,
+          provenanceTurnIds: source.l2
+            .filter((l2) => item.evidenceL2Ids.includes(l2.id))
+            .flatMap((l2) => l2.evidenceTurnIds),
+          memorySpaceId: item.memorySpaceId
+        }))
+      ];
+      if (candidates.length === 0) return { items: [], reason: "no_candidates", freshness: freshness(repository, []) };
+      const ranking = await model.rank({ query: input.query, candidates });
+      const allowed = new Set(candidates.map((candidate) => candidate.id));
+      if (ranking.ids.some((id) => !allowed.has(id))) throw new Error("Recall model returned an unauthorized candidate ID");
+      const byId = new Map(candidates.map((candidate) => [candidate.id, candidate]));
+      const items = ranking.ids.map((id) => byId.get(id)).filter((item): item is RecallItem => Boolean(item));
+      return { items, reason: ranking.reason, freshness: freshness(repository, repository.listAuthorizedSpaces(input.uid, input.agentId).map((s) => s.id)) };
     },
 
-    listProjectMemories(scope) {
-      const { status, projectType, projectKey, ...baseScope } = scope;
-      const projects = store
-        .listMemories(baseScope)
-        .filter((memory) => memory.level === "L2" && memory.type === "project")
-        .filter((memory) => !status || memory.status === status)
-        .filter((memory) => !projectType || memory.metadata.projectType === projectType)
-        .filter((memory) => !projectKey || memory.metadata.projectKey === projectKey);
-      return { projects };
+    getSession(input: { uid: string; agentId: string; externalSessionId: string }) {
+      return { session: requireSession(repository, input) };
     },
 
-    recordProjectBuildRun(input) {
-      return { run: store.createProjectBuildRun(input) };
+    listTopics(input: { uid: string; agentId: string; externalSessionId: string }) {
+      const session = requireSession(repository, input);
+      return { session, topics: repository.listTopics(session.id) };
     },
 
-    listProjectBuildRuns(limit) {
-      return { runs: store.listProjectBuildRuns(limit) };
+    listSpaces(input: { uid: string; agentId: string }) {
+      return { spaces: repository.listAuthorizedSpaces(input.uid, input.agentId) };
     },
 
-    async runProjectBuild(scope) {
-      const createdOrUpdated = await projectMemoryBuilder.rebuild(store, scope);
-      if (embeddingProvider && embeddingIndex) {
-        await Promise.all(createdOrUpdated.map((memory) => indexMemory(memory, embeddingProvider, embeddingIndex)));
-      }
-      return { createdOrUpdated };
+    createSharedSpace(input: { uid: string; agentId: string; name: string }) {
+      return { space: repository.createSharedSpace(input.uid, input.name, input.agentId) };
     },
 
-    async search(input) {
-      return { results: await runSearch(store, input, embeddingProvider, embeddingIndex) };
+    addSpaceMember(input: { uid: string; agentId: string; memorySpaceId: string; memberAgentId: string }) {
+      repository.assertSpaceAccess(input.uid, input.agentId, input.memorySpaceId);
+      repository.addSpaceMember(input.uid, input.memorySpaceId, input.memberAgentId);
+      return { space: repository.getMemorySpace(input.memorySpaceId) };
     },
 
-    listMemories(scope) {
-      return { memories: store.listMemories(scope) };
+    listL2(input: { uid: string; agentId: string; memorySpaceId: string }) {
+      repository.assertSpaceAccess(input.uid, input.agentId, input.memorySpaceId);
+      return { aggregates: repository.listL2(input.memorySpaceId) };
     },
 
-    updateMemory(id, patch) {
-      return { memory: store.updateMemory(id, patch) };
+    listL3(input: { uid: string; agentId: string; memorySpaceId: string }) {
+      repository.assertSpaceAccess(input.uid, input.agentId, input.memorySpaceId);
+      return { profiles: repository.listL3(input.memorySpaceId) };
     },
 
-    listRelations(memoryId) {
-      return { relations: store.listRelations(memoryId) };
-    },
-
-    runDreaming(scope) {
-      if (!legacyCompatibility) {
-        return requireLayeredService(layeredService).runL3ProfileBuild(scope.uid, scope.agent);
-      }
-      return compressor.compress(store, scope);
-    },
-
-    async recall(input) {
-      const candidates = (
-        await runSearch(store, { ...input, includeInactive: false }, embeddingProvider, embeddingIndex)
-      ).map((result) => result.memory);
-      const plan = await recallPlanner.plan({ query: input.query, candidates, scope: toScope(input) });
-      const selected = plan.shouldUseMemory
-        ? plan.selectedMemoryIds
-            .map((id) => candidates.find((memory) => memory.id === id))
-            .filter((memory): memory is Memory => Boolean(memory))
-        : [];
-      return {
-        shouldUseMemory: plan.shouldUseMemory && selected.length > 0,
-        reason: plan.reason,
-        memories: selected,
-        promptSnippets: selected.map((memory) => memory.readableText)
-      };
-    },
-
-    listL1Topics(scope) {
-      return store.layered.listL1TopicViews(scope);
-    },
-
-    runL1Maintenance(scope, sessionId) {
-      return requireLayeredService(layeredService).runL1Maintenance(scope, sessionId);
-    },
-
-    listL1MaintenanceRuns(limit) {
-      return store.layered.listL1MaintenanceRuns(limit);
-    },
-
-    listL2Aggregates(uid, agent, includeInactive) {
-      return store.layered.listL2AggregateViews(uid, agent, includeInactive);
-    },
-
-    runL2Aggregation(uid, agent, watermark) {
-      return requireLayeredService(layeredService).runL2Aggregation(uid, agent, watermark);
-    },
-
-    listL2AggregationRuns(limit) {
-      return store.layered.listL2AggregationRuns(limit);
-    },
-
-    listL3Profiles(uid, agent) {
-      return {
-        profiles: store
-          .listMemories({ uid, agent })
-          .filter(
-            (memory) =>
-              memory.level === "L3" &&
-              memory.type === "profile" &&
-              memory.status === "active" &&
-              memory.metadata.canonicalProfile === true
-          )
-      };
-    },
-
-    runL3ProfileBuild(uid, agent) {
-      return requireLayeredService(layeredService).runL3ProfileBuild(uid, agent);
-    },
-
-    createCorrection(input) {
-      return { correction: store.layered.createCorrection(input) };
-    },
-
-    getCorrection(uid, agent, id) {
-      return { correction: store.layered.getCorrection(uid, agent, id) };
-    },
-
-    listCorrections(filter) {
-      return { corrections: store.layered.listCorrections(filter) };
-    },
-
-    listPendingL1CorrectionSessions() {
-      return store.layered.listPendingL1CorrectionSessions();
-    },
-
-    listReadyL2CorrectionNamespaces() {
-      return store.layered.listReadyL2CorrectionNamespaces();
-    },
-
-    listDueL2Namespaces() {
-      return store.layered.listDueL2Namespaces();
-    },
-
-    listDueL3Namespaces() {
-      return store.layered.listDueL3Namespaces();
-    },
-
-    recallV2(input) {
-      return requireLayeredService(layeredService).recall(input);
+    correctTurn(input: {
+      uid: string;
+      agentId: string;
+      targetTurnId: string;
+      correctedContent: string | null;
+      reason: string;
+    }) {
+      return { correction: repository.createCorrection(input) };
     }
   };
 }
 
-function appendProvisionalTopic(store: MemoryStore, service: LayeredMemoryService | undefined, topic: TopicSegment): void {
-  if (service) {
-    service.appendProvisionalTopic(topic);
-    return;
-  }
-  store.layered.appendProvisionalTopic(topic, {
-    promptVersion: "online-topic-v1",
-    schemaVersion: "v2",
-    reason: topic.reason,
-    confidence: topic.confidence
-  });
+export type MemoryService = ReturnType<typeof createMemoryService>;
+
+async function deriveRealtimeTopic(
+  repository: MemoryRepository,
+  session: Session,
+  turn: Turn,
+  options: MemoryServiceOptions,
+  thresholds: { join: number; split: number },
+  maxTopicTurns: number
+): Promise<Topic | null> {
+  const lowInformation = isHighPrecisionLowInformation(turn.content);
+  const open = repository.getOpenTopic(session.id);
+  if (!open) return lowInformation ? null : repository.createOpenTopic(session.id, turn, true);
+  if (lowInformation) return repository.appendTurnToTopic(open.id, turn, false);
+  if (open.turnIds.length >= maxTopicTurns) return repository.splitOpenTopic(session.id, turn).open;
+  if (!open.recallText) return repository.appendTurnToTopic(open.id, turn, true);
+
+  const embedding = requireModel(options.embeddingProvider, "EmbeddingProvider");
+  const [topicVector, turnVector] = await embedding.embedMany([open.recallText, turn.content]);
+  const similarity = cosineSimilarity(topicVector!, turnVector!);
+  if (similarity >= thresholds.join) return repository.appendTurnToTopic(open.id, turn, true);
+  if (similarity <= thresholds.split) return repository.splitOpenTopic(session.id, turn).open;
+
+  const model = requireModel(options.ambiguousTopicModel, "AmbiguousTopicModel");
+  const decision = await model.decide({ topicText: open.recallText, turnText: turn.content });
+  return decision === "continue"
+    ? repository.appendTurnToTopic(open.id, turn, true)
+    : repository.splitOpenTopic(session.id, turn).open;
 }
 
-function requireLayeredService(service: LayeredMemoryService | undefined): LayeredMemoryService {
-  if (!service) throw new Error("LLM configuration is required for layered maintenance and recall");
-  return service;
+function requireSession(repository: MemoryRepository, input: { uid: string; agentId: string; externalSessionId: string }): Session {
+  const session = repository.getSessionByExternal(input.uid, input.agentId, input.externalSessionId);
+  if (!session) throw new Error("Session not found in uid + agentId tenant");
+  return session;
 }
 
-async function runSearch(
-  store: MemoryStore,
-  input: SearchInput,
-  embeddingProvider?: EmbeddingProvider,
-  embeddingIndex?: EmbeddingIndex
-): Promise<SearchResult[]> {
-  const lexicalResults = searchMemories(store, input);
-  if (!embeddingProvider || !embeddingIndex) {
-    return lexicalResults;
-  }
-  const queryVector = await embeddingProvider.embed(input.query);
-  const vectorResults = await embeddingIndex.search(queryVector, {
-    limit: input.limit ?? 10,
-    filter: {
-      uid: input.uid,
-      source: input.source,
-      agent: input.agent,
-      channel: input.channel
+function requireModel<T>(value: T | undefined, name: string): T {
+  if (!value) throw new Error(`${name} is required; no rule-based semantic fallback is available`);
+  return value;
+}
+
+function validateTopicSnapshot(turns: Turn[], topics: Array<{ id: string; turnIds: string[] }>): void {
+  const order = new Map(turns.map((turn) => [turn.id, turn.sequence]));
+  const seenIds = new Set<string>();
+  const seenTurns = new Set<string>();
+  let previousGlobalSequence = 0;
+  for (const topic of topics) {
+    if (seenIds.has(topic.id)) throw new Error(`Duplicate Topic id: ${topic.id}`);
+    if (topic.turnIds.length === 0) throw new Error(`Topic has no Turns: ${topic.id}`);
+    seenIds.add(topic.id);
+    for (const turnId of topic.turnIds) {
+      const sequence = order.get(turnId);
+      if (!sequence) throw new Error(`Topic references a Turn outside the Session: ${turnId}`);
+      if (seenTurns.has(turnId)) throw new Error(`Turn appears in multiple Topics: ${turnId}`);
+      if (sequence <= previousGlobalSequence) throw new Error(`Topic order or Turn interval is invalid: ${topic.id}`);
+      previousGlobalSequence = sequence;
+      seenTurns.add(turnId);
     }
-  });
-  const byId = new Map<string, SearchResult>();
-  for (const result of lexicalResults) {
-    byId.set(result.memory.id, result);
   }
-  for (const vectorResult of vectorResults) {
-    const memory = store.getMemory(vectorResult.id);
-    if (!memory || (!input.includeInactive && memory.status !== "active")) {
-      continue;
+  for (const turn of turns) {
+    if (!isHighPrecisionLowInformation(turn.content) && !seenTurns.has(turn.id)) {
+      throw new Error(`Topic snapshot omitted meaningful Turn: ${turn.id}`);
     }
-    const existing = byId.get(memory.id);
-    byId.set(memory.id, {
-      memory,
-      score: (existing?.score ?? 0) + vectorResult.score
-    });
   }
-  return Array.from(byId.values())
-    .filter((result) => result.score > 0)
-    .sort((left, right) => right.score - left.score)
-    .slice(0, input.limit ?? 10);
 }
 
-async function indexMemory(
-  memory: Memory,
-  embeddingProvider: EmbeddingProvider,
-  embeddingIndex: EmbeddingIndex
-): Promise<void> {
-  const vector = await embeddingProvider.embed(memory.readableText);
-  await embeddingIndex.upsert({
-    id: memory.id,
-    vector,
-    metadata: {
-      level: memory.level,
-      type: memory.type,
-      uid: memory.uid,
-      source: memory.source,
-      agent: memory.agent,
-      channel: memory.channel
+function validateL2Snapshot(
+  topics: Topic[],
+  aggregates: Array<{ id: string; key: string; evidenceTurnIds: string[]; sourceAgentIds: string[]; confidence: number }>
+): void {
+  assertUnique(aggregates.map((item) => item.id), "L2 id");
+  assertUnique(aggregates.map((item) => item.key), "L2 key");
+  const evidence = new Set(topics.flatMap((topic) => topic.turnIds));
+  for (const item of aggregates) {
+    if (item.evidenceTurnIds.length === 0 || item.sourceAgentIds.length === 0) {
+      throw new Error(`L2 aggregate requires direct Turn evidence and source Agent IDs: ${item.id}`);
     }
-  });
-}
-
-function isEmbeddingConfigured(): boolean {
-  return Boolean(process.env.EMBEDDING_API_KEY || process.env.EMBEDDING_BASE_URL || process.env.EMBEDDING_MODEL);
-}
-
-function isLlmConfigured(): boolean {
-  return Boolean(process.env.LLM_BASE_URL && process.env.LLM_API_KEY && process.env.LLM_MODEL);
-}
-
-function toScope(input: Scope): Scope {
-  return {
-    uid: input.uid,
-    source: input.source,
-    agent: input.agent,
-    channel: input.channel,
-    metadata: input.metadata
-  };
-}
-
-function createDefaultMemoryResolver(): MemoryResolver {
-  return new LlmMemoryResolver(createDefaultCompletionClient());
-}
-
-function createDefaultMemoryCompressor(resolver: MemoryResolver): MemoryCompressor {
-  return new LlmMemoryCompressor(createDefaultCompletionClient(), resolver);
-}
-
-function createDefaultRecallPlanner(): MemoryRecallPlanner {
-  return new LlmMemoryRecallPlanner(createDefaultCompletionClient());
-}
-
-function createDefaultProjectMemoryBuilder(resolver: MemoryResolver): ProjectMemoryBuilder {
-  return new ModelProjectMemoryBuilder(
-    new LlmProjectMemoryExtractor(createDefaultCompletionClient()),
-    resolver
-  );
-}
-
-function createDefaultTopicBuilder(): TopicBuilder {
-  const client = createDefaultCompletionClient();
-  return new SlidingTopicBuilder(new LlmTopicBoundaryDetector(client), new LlmTopicMemoryGenerator(client), loadTopicWindowConfig());
-}
-
-function createDefaultCompletionClient(): OpenAICompatibleCompletionClient {
-  const baseUrl = process.env.LLM_BASE_URL;
-  const apiKey = process.env.LLM_API_KEY;
-  const model = process.env.LLM_MODEL;
-  if (!baseUrl || !apiKey || !model) {
-    throw new Error("LLM configuration is required: set LLM_BASE_URL, LLM_API_KEY, and LLM_MODEL");
+    assertConfidence(item.confidence, `L2 aggregate ${item.id}`);
+    for (const turnId of item.evidenceTurnIds) {
+      if (!evidence.has(turnId)) throw new Error(`L2 evidence is not in current processed Topics: ${turnId}`);
+    }
   }
-  return new OpenAICompatibleCompletionClient({ baseUrl, apiKey, model });
 }
 
-function createDefaultLayeredService(store: MemoryStore): LayeredMemoryService {
-  const client = createDefaultCompletionClient();
-  return new LayeredMemoryService(store, {
-    l1Planner: new LlmL1MaintenancePlanner(client),
-    l2Planner: new LlmL2MembershipPlanner(client),
-    l2Synthesizer: new LlmL2RevisionSynthesizer(client),
-    recallPlanner: new LlmLayeredRecallPlanner(client),
-    profileExtractor: new LlmCanonicalProfileExtractor(client),
-    provenance: {
-      provider: "openai-compatible",
-      model: process.env.LLM_MODEL,
-      promptVersion: "v2",
-      schemaVersion: "v2",
-      reason: "runtime",
-      confidence: 1
+function validateL3Snapshot(
+  aggregates: Array<{ id: string }>,
+  profiles: Array<{ id: string; key: string; evidenceL2Ids: string[]; confidence: number }>
+): void {
+  assertUnique(profiles.map((item) => item.id), "L3 id");
+  assertUnique(profiles.map((item) => item.key), "L3 key");
+  const evidence = new Set(aggregates.map((item) => item.id));
+  for (const item of profiles) {
+    if (item.evidenceL2Ids.length === 0) throw new Error(`L3 profile requires current L2 evidence: ${item.id}`);
+    assertConfidence(item.confidence, `L3 profile ${item.id}`);
+    for (const l2Id of item.evidenceL2Ids) {
+      if (!evidence.has(l2Id)) throw new Error(`L3 evidence is not in the current L2 snapshot: ${l2Id}`);
     }
-  });
+  }
 }
 
-function topicToDraftFromSegment(topic: TopicSegment): CreateMemoryInput {
-  return topicMemoryUnitToDraft(
-    {
-      title: topic.title,
-      summary: topic.summary,
-      topicType: toTopicType(topic.metadata.topicType),
-      entities: toStringArray(topic.metadata.entities),
-      decisions: toStringArray(topic.metadata.decisions),
-      tasks: toStringArray(topic.metadata.tasks),
-      preferences: toStringArray(topic.metadata.preferences),
-      confidence: topic.confidence,
-      reason: topic.reason,
-      evidenceTurnIds: topic.turnIds
-    },
-    {
-      sessionId: topic.sessionId,
-      uid: topic.uid,
-      source: topic.source,
-      agent: topic.agent,
-      channel: topic.channel,
-      metadata: topic.metadata
-    }
-  );
+function assertConfidence(value: number, label: string): void {
+  if (!Number.isFinite(value) || value < 0 || value > 1) throw new Error(`${label} confidence must be between 0 and 1`);
 }
 
-function toStringArray(value: unknown): string[] {
-  return Array.isArray(value) ? value.filter((item): item is string => typeof item === "string") : [];
+function assertUnique(values: string[], label: string): void {
+  if (new Set(values).size !== values.length) throw new Error(`Duplicate ${label}`);
 }
 
-function toTopicType(value: unknown): TopicType {
-  const allowed = new Set<TopicType>([
-    "project_work",
-    "product_design",
-    "technical_decision",
-    "workflow",
-    "preference",
-    "personal_context",
-    "research",
-    "other"
-  ]);
-  return typeof value === "string" && allowed.has(value as TopicType) ? (value as TopicType) : "other";
+function freshness(repository: MemoryRepository, spaceIds: string[]) {
+  const jobs = spaceIds.flatMap((id) => [repository.getRebuildJob("L2", id), repository.getRebuildJob("L3", id)]).filter(Boolean);
+  return { stale: jobs.some((job) => job!.status !== "clean"), jobs };
 }

@@ -1,8 +1,12 @@
 # ADR-0002: Governance Plane for Corrections and Reconciliation
 
-Status: Accepted
+Status: Historical ADR; governance principles retained, terminology partially superseded
 
 Date: 2026-07-08
+
+Current canonical target: [`MEMORY_ARCHITECTURE.md`](../../MEMORY_ARCHITECTURE.md)
+
+The orthogonal Governance Plane and immutable Correction principles remain valid. References to separate L1 entities and `pending_l1` naming describe the current implementation and must be translated to Topic maintenance in the target model.
 
 Incorporated by: [oh-my-memory Architecture v2.1](./oh-my-memory-architecture-v2.1.md)
 

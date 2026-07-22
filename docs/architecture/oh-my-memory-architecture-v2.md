@@ -1,10 +1,14 @@
 # oh-my-memory 架构方案 v2
 
-Status: Accepted; v2 Core implemented
+Status: Superseded historical architecture; v2 Core was implemented
 
-Role: Canonical target architecture
+Role: Historical record
 
 Date: 2026-06-30
+
+Current canonical target: [`MEMORY_ARCHITECTURE.md`](../../MEMORY_ARCHITECTURE.md)
+
+The current target no longer models Provisional L1 and Canonical L1 as separate Topic-layer entities. This document is retained to explain the implemented v2 data model and must not be used as the current architecture contract.
 
 Binding decision: [ADR-0001: Three-Stage Memory Pipeline](./0001-three-stage-memory-pipeline.md)
 
